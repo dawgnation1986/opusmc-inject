@@ -138,22 +138,13 @@ function wrapServerSocket(socket) {
 }
 
 // wss 客户端连接包装（连 PHPMC，客户端帧要 mask；自签证书直接信任）
-function connectWss(host, port, path, onOpen, onMessage, onClose) {
+function connectWss(host, port, onOpen, onMessage, onClose) {
   const key = crypto.randomBytes(16).toString('base64');
-  const req = {
-    host, port, path: path || '/', method: 'GET',
-    headers: {
-      Host: `${host}:${port}`,
-      Upgrade: 'websocket', Connection: 'Upgrade',
-      'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13',
-      Origin: 'https://www.bilibili.com',
-    },
-    rejectUnauthorized: false,
-  };
-  const reqObj = tls.connect ? null : null;
-  const r = (MC_SECURE ? tls : net).connect(req, () => {
+  // tls.connect 的 options 里绝不能带 path —— path 会让 Node 误走 Unix socket（EPERM）
+  const sockOpts = { host, port, rejectUnauthorized: false };
+  const r = (MC_SECURE ? tls : net).connect(sockOpts, () => {
     r.write(
-      `GET ${req.path} HTTP/1.1\r\n` +
+      `GET / HTTP/1.1\r\n` +
       `Host: ${host}:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
       `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n` +
       `Origin: https://www.bilibili.com\r\n\r\n`);
