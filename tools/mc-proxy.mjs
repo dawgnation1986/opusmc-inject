@@ -120,6 +120,7 @@ function wsDecode(bufRef) {
 // ws 服务端连接包装（给 OpusMC 客户端）
 function wrapServerSocket(socket) {
   const st = { buf: Buffer.alloc(0), pong: null, handlers: { message: null, close: null } };
+  socket.on('error', () => { }); // 客户端断开/ECONNRESET 不让进程崩
   socket.on('data', (chunk) => {
     st.buf = Buffer.concat([st.buf, chunk]);
     const { payload, closed } = wsDecode(st);
@@ -424,6 +425,7 @@ function clientToMc(o) {
 
 // ============================ 主流程 ============================
 const server = net.createServer((socket) => {
+  socket.on('error', () => { });
   if (client) { try { client.close(); } catch (e) { } } // 单客户端：新的顶掉旧的
   client = wrapServerSocket(socket);
   log('OpusMC 客户端已接入（直接连接）—— 主动连接 PHPMC（proxy 协议：服务端先发 login）');
@@ -446,7 +448,7 @@ function connectMc(name) {
   if (mc) mc.close();
   mcState = 'connecting';
   log(`连接 PHPMC ${MC_SECURE ? 'wss' : 'ws'}://${MC_HOST}:${MC_PORT}（玩家 ${name}）`);
-  mc = connectWss(MC_HOST, MC_PORT, '/', () => {
+  mc = connectWss(MC_HOST, MC_PORT, () => {
     log('wss 通道已建立，发送握手 + 登录');
     toMc(MC.handshake(MC_HOST, MC_PORT));
     toMc(MC.loginStart(name));
