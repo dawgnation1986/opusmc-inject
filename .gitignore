@@ -1,0 +1,20 @@
+# 大体积快照与运行时产物不入库（抓取清单见 README）
+back/
+
+# 音效 51MB 二进制，用 tools/fetch_sounds.py 重新抓取
+probe/sounds/
+
+# PHPMC 运行时/私密/大文件
+PHPMC/certs/*.key
+PHPMC/logs/
+PHPMC/cache/
+PHPMC/world/
+PHPMC/dist/
+PHPMC/data/
+PHPMC/*.log
+
+# 通用
+*.log
+Thumbs.db
+.DS_Store
+源码备份/
