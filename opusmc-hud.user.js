@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpusMC 生存辅助（彗星式客户端）
 // @namespace    https://github.com/bigpixel
-// @version      0.5.2
+// @version      0.5.3
 // @description  网页版 MC 运行时注入：RShift 呼出 Meteor 式 ClickGUI（多列模块 / 左键开关 / 列拖动 / 搜索）。ESP 生物方框（3D 线框）、追踪线、名字血条、物品与投射物 ESP、实体雷达、方位罗盘、夜视、时间与天气。适配 B 站 OpusMC / OpusCraft / 本地离线版。
 // @author       BigPixel
 // @match        https://opuscraft.pages.dev/*
@@ -427,7 +427,9 @@
   function project(v, x, y, z, w_, h_) {
     const m = v.vp;
     const cw = m[3] * x + m[7] * y + m[11] * z + m[15];
-    if (cw <= 0.0001) return null; // 相机后方剔除（cw = -z_eye，后方为负）
+    // 相机后方剔除（cw = -z_eye，后方为负）；贴脸保护：cw 极小时投影坐标爆炸（除以接近
+    // 零的 w），画出横跨整屏的巨大线框 —— 0.1m 内的实体不画（本来就看不见）
+    if (cw <= 0.1) return null;
     const cx = m[0] * x + m[4] * y + m[8] * z + m[12];
     const cy = m[1] * x + m[5] * y + m[9] * z + m[13];
     // 注意：不要用 clip.z 做 [-1,1] 裁剪 —— 透视投影下 clip.z 的范围是 -(far) ~ -(near)
@@ -448,6 +450,14 @@
     }
     const g = state.game, p = state.player;
     if (!g || !p) return;
+    // 标题屏/加载中不画 ESP：game.entities 里是上个世界的残留实体（state: boot/title/loading/play）
+    if (g.state && g.state !== 'play') {
+      ectx.clearRect(0, 0, espCanvas.width, espCanvas.height);
+      rctx.clearRect(0, 0, radar.width, radar.height);
+      cctx.clearRect(0, 0, compass.width, compass.height);
+      updateTimeRow(performance.now());
+      return;
+    }
     const r = g.renderer;
     if (!r || !r.vp || !r.camPos) return;
     // 渲染插值：游戏 20Hz tick 后每帧按 alpha 插值渲染（game.js run(): render(acc/50)），
@@ -504,6 +514,8 @@
           for (let i = 0; i < 8; i++) {
             const pt = project(r, bb[i & 1 ? 3 : 0], bb[i & 2 ? 4 : 1], bb[i & 4 ? 5 : 2], W_, H_);
             if (!pt) { ok = false; break; }
+            // 爆炸坐标保护：角点远超画布（贴脸/极端透视）则整个框不画，防止棱线拉满屏
+            if (pt.x < -W_ * 3 || pt.x > W_ * 4 || pt.y < -H_ * 3 || pt.y > H_ * 4) { ok = false; break; }
             pts.push(pt);
             if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
             if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
