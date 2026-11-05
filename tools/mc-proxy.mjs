@@ -264,11 +264,15 @@ const MC = {
       case 0x1C: { r.varInt(); skipMetadata(r); return; }                             // Entity Metadata
       case 0x1F: { r.f32(); r.varInt(); r.varInt(); return; }                         // Set Experience
       case 0x21: { // Chunk Data —— PHPMC 特例：primaryBitmask 是 short
+        if (!global.__chunkDumped) {
+          global.__chunkDumped = true;
+          log('0x21 原始字节(前24): ' + r.b.subarray(0, 24).toString('hex') + ' | 总长 ' + r.b.length);
+        }
         out.chunk = { cx: r.i32(), cz: r.i32() };
         r.bool();
-        const mask = r.i16();
+        out.chunk.mask = r.i16();
         const size = r.varInt();
-        r.raw(size);
+        out.chunk.data = r.raw(size);   // 保留原始字节供 M2 区块翻译
         out.chunk.size = size;
         return;
       }
@@ -400,7 +404,14 @@ function mcToClient(id, r) {
   if (out.time) toClient({ t: 'time', day: (r_i64_cache.dayTime ?? 1000), rate: 1 });
   if (out.health) toClient({ t: 'health', hp: out.health.hp, food: out.health.food, sat: out.health.sat });
   if (out.posLook) toClient({ t: 'pos', x: out.posLook.x, y: out.posLook.y, z: out.posLook.z, yaw: out.posLook.yaw, pitch: out.posLook.pitch });
-  if (out.chunk) { mcChunks++; if (mcChunks % 25 === 1) log(`PHPMC 区块已收 ${mcChunks}（最新 ${out.chunk.cx},${out.chunk.cz} ${out.chunk.size}B）—— M2 翻译渲染`); }
+  if (out.chunk) {
+    mcChunks++;
+    try {
+      const bin = chunkToOpus(out.chunk.cx, out.chunk.cz, out.chunk.mask, out.chunk.data);
+      if (client) client.sendBinary(bin);
+      if (mcChunks % 25 === 1) log(`区块已翻译下发 ${mcChunks}（${out.chunk.cx},${out.chunk.cz} ${bin.length}B）`);
+    } catch (e) { log(`区块翻译失败 ${out.chunk.cx},${out.chunk.cz}: ${e.message}`); }
+  }
   if (out.kick) { toClient({ t: 'kick', reason: flattenChat(safeJson(out.kick)) }); log('PHPMC 断开: ' + out.kick); }
 }
 let r_i64_cache = { dayTime: 1000 };
@@ -458,7 +469,10 @@ function connectMc(name) {
   mcState = 'connecting';
   log(`连接 PHPMC ${MC_SECURE ? 'wss' : 'ws'}://${MC_HOST}:${MC_PORT}（玩家 ${name}）`);
   mc = connectWss(MC_HOST, MC_PORT, () => {
-    log('wss 通道已建立，发送握手 + 登录');
+    // 先把方块状态表（4096 项）与群系表发给客户端——客户端 mapVanillaStateNear 自己映射
+    toClient({ t: 'states', list: BLOCK_NAMES });
+    toClient({ t: 'biomes', list: BIOME_NAMES });
+    log('wss 通道已建立，发送 states/biomes + 握手 + 登录');
     toMc(MC.handshake(MC_HOST, MC_PORT));
     toMc(MC.loginStart(name));
     mcState = 'login';
@@ -499,7 +513,10 @@ function drainMc() {
       }
       if (mcState === 'play') {
         const out = {};
-        mcToClient(id, r);
+        const before = r.left;
+        try { mcToClient(id, r); } finally {
+          if (r.left !== 0) log(`⚠ 包 0x${id.toString(16)} 解码后剩余 ${r.left}/${before + 1} 字节（应为 0）—— 字段表有误，后续流将错位`);
+        }
         // Time Update 的 dayTime 缓存（login 消息需要）
         if (id === 0x03) { /* 已在 decode 消费；dayTime 从 PHPMC 的 time 包取 */ }
       }
@@ -511,3 +528,116 @@ function drainMc() {
   }
 }
 
+
+// ============================ M2：1.8 区块 → OpusMC chunk type 1 ============================
+// 客户端（net.js onBinary）：[u8 type=1][i32 cx LE][i32 cz LE][u8 n] 每段：
+//   [u16 paletteLen LE][u16 raw...]（raw = states 消息 list 的下标 = (id<<4)|meta，客户端 map[raw]，palette[0] 应为空气）
+//   [u8 索引×4096 或 u16×4096（paletteLen>256 时）]
+//   [u8 flags（bit0 有 sky / bit1 有 block）][sky 2048 nibble][block 2048 nibble]
+// 最后 [u8 biomes × 256]
+const WOOL = ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
+  'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black'];
+const WOODS = ['oak', 'spruce', 'birch', 'jungle', 'acacia', 'dark_oak'];
+// 1.8 方块 id → vanilla 名（states 消息的 4096 项表，下标 = (id<<4)|meta）
+const BLOCK_NAMES = (() => {
+  const a = new Array(4096).fill('minecraft:air');
+  const base = {
+    1: 'stone', 2: 'grass_block', 3: 'dirt', 4: 'cobblestone', 5: 'oak_planks', 7: 'bedrock',
+    8: 'water', 9: 'water', 10: 'lava', 11: 'lava', 12: 'sand', 13: 'gravel',
+    14: 'gold_ore', 15: 'iron_ore', 16: 'coal_ore', 17: 'oak_log', 18: 'oak_leaves',
+    20: 'glass', 24: 'sandstone', 35: 'white_wool', 41: 'gold_block', 42: 'iron_block',
+    45: 'bricks', 46: 'tnt', 47: 'bookshelf', 48: 'mossy_cobblestone', 49: 'obsidian',
+    50: 'torch', 53: 'oak_stairs', 54: 'chest', 56: 'diamond_ore', 57: 'diamond_block',
+    58: 'crafting_table', 61: 'furnace', 65: 'ladder', 66: 'rail', 67: 'cobblestone_stairs',
+    73: 'redstone_ore', 79: 'ice', 80: 'snow_block', 81: 'cactus', 82: 'clay',
+    85: 'oak_fence', 86: 'pumpkin', 87: 'netherrack', 88: 'soul_sand', 89: 'glowstone',
+    98: 'stone_bricks', 101: 'iron_bars', 102: 'glass_pane', 103: 'melon', 106: 'vine',
+    110: 'mycelium', 112: 'nether_bricks', 121: 'end_stone', 129: 'emerald_ore',
+    133: 'emerald_block', 152: 'quartz_ore', 155: 'quartz_block', 159: 'white_stained_glass',
+    161: 'oak_leaves', 162: 'oak_log', 165: 'slime_block', 168: 'prismarine',
+    169: 'sea_lantern', 170: 'hay_block', 172: 'terracotta', 173: 'coal_block',
+    174: 'packed_ice', 179: 'red_sandstone', 201: 'purpur_block', 206: 'end_stone_bricks',
+    55: 'redstone_wire', 59: 'wheat', 60: 'farmland', 71: 'iron_door', 64: 'oak_door',
+    74: 'redstone_ore', 75: 'redstone_torch', 76: 'redstone_torch', 78: 'snow',
+    83: 'sugar_cane', 84: 'jukebox', 90: 'nether_portal', 91: 'jack_o_lantern', 96: 'oak_trapdoor',
+    97: 'infested_stone', 99: 'brown_mushroom_block', 100: 'red_mushroom_block',
+    107: 'oak_fence_gate', 108: 'brick_stairs', 109: 'stone_brick_stairs', 111: 'lily_pad',
+    113: 'nether_brick_fence', 114: 'nether_brick_stairs', 115: 'nether_wart',
+    116: 'enchanting_table', 117: 'brewing_stand', 118: 'cauldron', 119: 'end_portal',
+    120: 'end_portal_frame', 122: 'dragon_egg', 123: 'redstone_lamp', 124: 'redstone_lamp',
+    126: 'oak_slab', 128: 'sandstone_stairs', 130: 'ender_chest', 131: 'tripwire_hook',
+    132: 'tripwire', 134: 'spruce_stairs', 135: 'birch_stairs', 136: 'jungle_stairs',
+    138: 'beacon', 139: 'cobblestone_wall', 140: 'flower_pot', 141: 'carrots', 142: 'potatoes',
+    143: 'oak_button', 145: 'anvil', 146: 'trapped_chest', 147: 'light_weighted_pressure_plate',
+    148: 'heavy_weighted_pressure_plate', 149: 'comparator', 151: 'redstone_block',
+    153: 'hopper', 154: 'quartz_block', 156: 'activator_rail', 157: 'dropper',
+    166: 'barrier', 167: 'iron_trapdoor', 175: 'sunflower', 176: 'white_banner',
+    177: 'white_wall_banner', 180: 'red_sandstone_stairs', 182: 'red_sandstone_slab',
+    183: 'spruce_fence_gate', 184: 'birch_fence_gate', 185: 'jungle_fence_gate',
+    186: 'dark_oak_fence_gate', 187: 'acacia_fence_gate', 188: 'spruce_fence',
+    189: 'birch_fence', 190: 'jungle_fence', 191: 'dark_oak_fence', 192: 'acacia_fence',
+    193: 'spruce_door', 194: 'birch_door', 195: 'jungle_door', 196: 'acacia_door',
+    197: 'dark_oak_door', 198: 'end_rod', 199: 'chorus_plant', 200: 'chorus_flower',
+    202: 'purpur_pillar', 203: 'purpur_stairs', 204: 'purpur_slab', 205: 'purpur_slab',
+    207: 'beetroots', 208: 'dirt_path', 209: 'end_gateway', 210: 'repeating_command_block',
+    211: 'chain_command_block', 212: 'frosted_ice', 213: 'magenta_glazed_terracotta',
+    214: 'white_glazed_terracotta', 215: 'orange_glazed_terracotta',
+    216: 'yellow_glazed_terracotta', 217: 'lime_glazed_terracotta',
+    218: 'pink_glazed_terracotta', 219: 'gray_glazed_terracotta',
+    220: 'light_gray_glazed_terracotta', 221: 'cyan_glazed_terracotta',
+    222: 'purple_glazed_terracotta', 223: 'blue_glazed_terracotta',
+    224: 'brown_glazed_terracotta', 225: 'green_glazed_terracotta',
+    226: 'red_glazed_terracotta', 227: 'black_glazed_terracotta',
+    228: 'white_concrete', 229: 'white_concrete_powder', 230: 'white_stained_glass',
+    231: 'white_stained_glass_pane',
+  };
+  for (const [id, name] of Object.entries(base)) a[(+id) << 4] = 'minecraft:' + name;
+  for (let m = 0; m < 16; m++) {
+    a[(35 << 4) | m] = 'minecraft:' + WOOL[m] + '_wool';
+    a[(95 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass';
+    a[(160 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass_pane';
+    a[(171 << 4) | m] = 'minecraft:' + WOOL[m] + '_carpet';
+  }
+  for (let m = 0; m < 6; m++) {
+    a[(5 << 4) | m] = 'minecraft:' + WOODS[m] + '_planks';
+    a[(17 << 4) | m] = 'minecraft:' + WOODS[Math.min(m, 3)] + '_log';
+    a[(162 << 4) | m] = m === 0 ? 'minecraft:acacia_log' : m === 1 ? 'minecraft:dark_oak_log' : 'minecraft:oak_log';
+    a[(126 << 4) | m] = 'minecraft:' + WOODS[m] + '_slab';
+  }
+  return a;
+})();
+// 群系：全平原（M2 简化，地形颜色统一草原绿；1.8 群系细分后续加）
+const BIOME_NAMES = new Array(256).fill('minecraft:plains');
+
+// 1.8 区块（PHPMC：4096×u16 LE (id<<4)|meta，逐段 + 块光2048 + 天光2048，最后群系 256）
+function chunkToOpus(cx, cz, mask, data) {
+  const out = [Buffer.from([1, 0, 0, 0, 0, 0, 0, 0, 0, 0])];
+  out[0].writeInt32LE(cx, 1); out[0].writeInt32LE(cz, 5);
+  const sections = [];
+  let p = 0;
+  for (let s = 0; s < 16; s++) {
+    if (!(mask & (1 << s))) continue;
+    const palette = [0]; const palIdx = new Map(); const cells = new Uint8Array(4096);
+    for (let j = 0; j < 4096; j++) {
+      const v = data.readUInt16LE(p); p += 2;
+      const raw = (v >> 4 << 4) | (v & 15); // (id << 4) | meta —— v 本身就是这个编码
+      let ix = palIdx.get(v);
+      if (ix === undefined) { ix = palette.length; palette.push(v); palIdx.set(v, ix); }
+      cells[j] = ix;
+    }
+    const blockLight = data.subarray(p, p + 2048); p += 2048;
+    const skyLight = data.subarray(p, p + 2048); p += 2048;
+    sections.push({ palette, cells, blockLight, skyLight });
+  }
+  const biomes = data.subarray(p, p + 256);
+  out[0][9] = sections.length;
+  for (const sec of sections) {
+    if (sec.palette.length > 256) continue; // 罕见超调色板段跳过（M2 简化）
+    const len = Buffer.alloc(2); len.writeUInt16LE(sec.palette.length);
+    const pal = Buffer.alloc(sec.palette.length * 2);
+    for (let i = 0; i < sec.palette.length; i++) pal.writeUInt16LE(sec.palette[i], i * 2);
+    out.push(len, pal, Buffer.from(sec.cells), Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
+  }
+  out.push(biomes.length === 256 ? Buffer.from(biomes) : Buffer.alloc(256));
+  return Buffer.concat(out);
+}

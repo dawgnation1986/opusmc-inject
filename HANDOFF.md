@@ -103,3 +103,32 @@ opusmc-inject/
 - ESP 类辅助**仅限单人/自用服务器**，多人公开房间别开（脚本 GUI 页脚有提示）。
 - 不往 C 盘写任何东西（用户硬约定）。
 - 每次改 userscript 递增版本号并推 mods 发布源；改游戏源码/工具提交主仓库。
+
+## 八、最新诊断（2026-11-05 21:20 收尾时）
+
+**已修复**：JoinGame 补读 reducedDebug bool（提交 b156af8）；tls path 参数（EPERM）；
+wss 客户端 HTTP 头重复拼接（假 closed）；KeepAlive 自答；M2 区块翻译框架已写
+（states/biomes 消息 + 1.8→OpusMC chunk 转换，`chunkToOpus`）。
+
+**当前卡点（接手第一任务）**：中转日志显示 `⚠ 包 0x21 解码后剩余 -12/207 字节`——
+0x21（ChunkData）的 payload 只有 **207 字节**，但 hex dump 显示其内部结构完全正确：
+
+```
+21 | fffffffd (cx=-3 大端) | fffffffd (cz=-3) | 01 (groundUp) | 001f (mask=5段)
+   | 80 e2 03 (varInt = 61696 = 5段×12288+256 ≈ data 大小) | 70007000...
+```
+
+**矛盾**：mask=5 段 → 数据应 61700 字节，包总长应 ~61715，但 drainMc 读到的包长是 207。
+**下一步诊断方向**（按顺序试）：
+1. 在 drainMc 读包长前 dump `mcBuf` 前 3 字节（hex），确认它读到的 VarInt 是 61715 的
+   正确编码 [0x8f,0xe2,0x03] 还是错位的 [0xcf,0x01]——如果错位，说明**前一个包
+   （JoinGame）的包长或字段长度有偏差**（断言 left=0 只能证明「长度恰好凑满」，不能
+   证明**分界正确**——JoinGame 的 level string 长度若读错，恰好会把 0x21 的开头吃进去）。
+2. 对比 PHPMC `Server.php:700` 的 JoinGame 发送与 `Frame::encode`（VarInt 长度=整个
+   包 ID+body 的长度）。
+3. PHPMC 的 `Connection::send` 一帧一包（`WebSocket::frame(Frame::encode(...))`），
+   flush 部分写只是 TCP 层续写——**不存在应用层分片**，不要在分片方向上找。
+4. 断言机制已内置（`drainMc` 里 decode 后检查 r.left），会打印第一个错位的包 id。
+
+**给用户的形态**：登录/聊天/移动协议全通（PHPMC 日志有 WebPlayer 登录记录），
+M1 实战验证过；差区块流对齐这最后一步，对齐后 OpusMC 就能看到 PHPMC 的世界。
