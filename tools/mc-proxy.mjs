@@ -435,13 +435,12 @@ function clientToMc(o) {
 const server = net.createServer((socket) => {
   if (client) { try { client.close(); } catch (e) { } } // 单客户端：新的顶掉旧的
   client = wrapServerSocket(socket);
-  log('OpusMC 客户端已接入（直接连接）');
-  let mcLinked = false;
+  log('OpusMC 客户端已接入（直接连接）—— 主动连接 PHPMC（proxy 协议：服务端先发 login）');
+  connectMc('WebPlayer');
   client.onMessage((payload) => {
-    // proxy 协议：JSON 文本消息
+    // proxy 协议：JSON 文本消息（客户端连上后等 proxy 先发 states/login —— 服务端先说话）
     let m;
     try { m = JSON.parse(payload.toString('utf8')); } catch (e) { return; }
-    if (!mcLinked) { mcLinked = true; connectMc('WebPlayer'); } // 首条消息时才连 PHPMC（懒连接）
     if (m.t === 'tick') { lastTick = m; clientToMc(m); return; }
     clientToMc(m);
   });
