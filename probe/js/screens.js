@@ -95,7 +95,7 @@ class TitleScreen extends MenuScreen {
     const u = this.game.ui, cx = u.w / 2, l = Math.floor(u.h / 4 + 48), g = this.game;
     this.widgets = [
       { x: cx - 100, y: l, w: 200, h: 20, label: '单人游戏', onClick: () => singleGate(g, () => g.ui.open(new WorldListScreen(g)), this) },
-      { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', onClick: () => onlineGate(g, () => g.ui.open(new MultiplayerScreen(g, this)), this), tip: ['加入公开房间、用邀请码加入朋友的房间，或者自己开一个（4–10 人）'] },
+      { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', onClick: () => g.ui.open(new MultiplayerScreen(g, this)), tip: ['加入公开房间、用邀请码加入朋友的房间，或者自己开一个（4–10 人）', '本地版：多人界面里有「直接连接（局域网）」入口', '房间功能需要登录（识别码），本地登录会被服务端来源校验拒绝'] },
       { x: cx - 100, y: l + 48, w: 98, h: 20, label: '皮肤和装饰', gold: true, tip: ['换皮肤（也可以用正版玩家的皮肤）、穿上原创披风、帽子和宠物'], onClick: () => g.ui.open(new WardrobeScreen(g, this)) },
       { x: cx + 2, y: l + 48, w: 98, h: 20, label: '反馈问题', tip: ['遇到 bug、卡顿，或者有建议，发给我们'], onClick: () => g.ui.open(new FeedbackScreen(g, this, null)) },
       { x: cx - 124, y: l + 84, w: 20, h: 20, icon: 'icon_language', tip: ['游戏说明'], onClick: () => g.ui.open(new HelpScreen(g, this)) },
