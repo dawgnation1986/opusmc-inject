@@ -1267,7 +1267,8 @@ class CreateRoomScreen extends FormScreen {
       // (a room whose save didn't arrive is not kept)
       if (code) RoomService.api('/api/rooms/' + code + '/delete', { key: RoomService.key() }).catch(() => { });
       this.busy = false; this.say(e.message, true); this.loadCap(); this.layout();
-      if (e.gate) this.game.ui.open(Account.loggedIn ? new UnlockScreen(this.game, this, e.message, () => this.game.ui.open(this)) : new LoginScreen(this.game, () => this.game.ui.open(this)));
+      // [本地离线版] gate 错误不再弹登录屏（本地来源被服务端拒，弹屏只会死循环），改为显示错误
+      if (e.gate) this.say('服务端拒绝了本地页面的请求（来源白名单）—— 联机请用在线版', true);
     }
   }
   drawExtra(ui) {
