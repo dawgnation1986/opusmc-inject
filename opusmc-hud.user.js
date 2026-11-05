@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpusMC 生存辅助（彗星式客户端）
 // @namespace    https://github.com/bigpixel
-// @version      0.5.3
+// @version      0.5.4
 // @description  网页版 MC 运行时注入：RShift 呼出 Meteor 式 ClickGUI（多列模块 / 左键开关 / 列拖动 / 搜索）。ESP 生物方框（3D 线框）、追踪线、名字血条、物品与投射物 ESP、实体雷达、方位罗盘、夜视、时间与天气。适配 B 站 OpusMC / OpusCraft / 本地离线版。
 // @author       BigPixel
 // @match        https://opuscraft.pages.dev/*
@@ -393,7 +393,7 @@
 
   const compass = document.createElement('canvas');
   compass.id = '__opus_compass';
-  compass.width = 440; compass.height = 26;
+  compass.width = 460; compass.height = 30;
   const cctx = compass.getContext('2d');
 
   // 敌对生物 fallback（首选 e.T.hostile 原生标记）
@@ -653,29 +653,36 @@
     if (!p) return;
     const deg = yawDeg(num(p, 'yaw')) ?? 0;
     const pxPerDeg = 6;
-    c.fillStyle = 'rgba(12,14,16,0.6)';
+    c.fillStyle = 'rgba(8,10,13,0.88)';
     c.beginPath();
     if (c.roundRect) c.roundRect(0, 0, w, h, 7); else c.rect(0, 0, w, h);
     c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.25)';
+    c.stroke();
     c.textAlign = 'center'; c.textBaseline = 'middle';
     for (let a = 0; a < 360; a += 15) {
       const diff = ((a - deg + 180) % 360 + 360) % 360 - 180;
       const x = w / 2 + diff * pxPerDeg;
       if (x < 6 || x > w - 6) continue;
       const big = a % 90 === 0;
-      c.strokeStyle = big ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.22)';
+      c.strokeStyle = big ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.25)';
       c.beginPath();
-      c.moveTo(x, h - (big ? 11 : 7)); c.lineTo(x, h - 3);
+      c.moveTo(x, h - (big ? 13 : 8)); c.lineTo(x, h - 3);
       c.stroke();
       if (big) {
-        c.fillStyle = 'rgba(255,255,255,0.92)';
-        c.font = 'bold 12px "Microsoft YaHei", sans-serif';
-        c.fillText({ 0: '南', 90: '西', 180: '北', 270: '东' }[a], x, 9);
+        c.fillStyle = 'rgba(255,255,255,0.95)';
+        c.font = 'bold 13px "Microsoft YaHei", sans-serif';
+        c.fillText({ 0: '南', 90: '西', 180: '北', 270: '东' }[a], x, 10);
       }
     }
-    // 中心指针
+    // 中心指针 + 当前朝向度数
     c.fillStyle = '#7fd48a';
-    c.fillRect(w / 2 - 1, h - 12, 2, 10);
+    c.fillRect(w / 2 - 1.5, h - 14, 3, 12);
+    c.fillStyle = 'rgba(255,255,255,0.65)';
+    c.font = '11px Consolas, monospace';
+    c.textAlign = 'left';
+    c.fillText(Math.round(((deg % 360) + 360) % 360) + '°', w - 30, 10);
+    c.textAlign = 'start';
   }
 
   // ---------- 模块定义（ClickGUI） ----------
