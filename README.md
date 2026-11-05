@@ -88,6 +88,19 @@
   **世界桥接**（1.8 方块 id ↔ OpusMC 方块 id 映射、区块注入 OpusMC 世界、位置/动作
   同步）——那是真正的「网页客户端进真服务器」，工程量大，按里程碑推进。
 
+## v0.5.2 关键修复 + Git 仓库（2026-11-05）
+
+- **ESP 全灭根因修复**：v0.5.0 全量重写时把 `let renderHooked = false;` 声明弄丢了——
+  严格模式下 espFrame 第一行读未声明变量直接抛 ReferenceError，渲染挂钩里的
+  try/catch 把异常静默吞掉，rAF 回调自己也抛在第一行——**ESP/雷达/罗盘/标签无声全灭**，
+  且控制台无任何报错。已补回声明（v0.5.2）。
+- **Git 仓库**：`opusmc-inject/` 已建仓（main 分支，单提交 8baaa6f，217 文件）。
+  - `.gitignore` 排除：back/、源码备份/、probe/sounds/（51MB 音效）、
+    PHPMC 私钥/logs/cache/world/dist/data；
+  - 音效二进制不入库，用 `tools/fetch_sounds.py`（固化了抓取脚本）重新拉取；
+  - 推远端：`git remote add origin <你的仓库地址> && git push -u origin main`
+    （GitHub/Gitee 均可，或告诉我地址我来推）。
+
 ## v0.5.1 多房间服务器支持（2026-11-05）
 
 - **背景**：多人联机的房间服务是作者自建的（`NET_CONFIG.rooms` =
