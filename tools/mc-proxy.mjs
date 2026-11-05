@@ -166,8 +166,12 @@ function connectWss(host, port, onOpen, onMessage, onClose) {
         onClose('握手失败：' + header.split('\r\n')[0]); return;
       }
       upgraded = true;
-      buf = buf.subarray(idx + 4);
+      // HTTP 头之后的剩余字节才是 WS 数据流的开头；去掉头之后绝不能再把整个 chunk 重复拼接
+      // （否则重复的 HTTP 头被 wsDecode 当帧读，首字节 'H'=0x48 低 4 位=8 正好命中 close 帧 → 假断开）
+      chunk = buf.subarray(idx + 4);
+      buf = Buffer.alloc(0);
       onOpen();
+      if (chunk.length === 0) return;
     }
     buf = Buffer.concat([buf, chunk]);
     const st = { buf };
@@ -199,8 +203,10 @@ const MC = {
   decode(id, r, out) {
     switch (id) {
       case 0x00: out.keepAlive = r.varInt(); return;                                  // Keep Alive
-      case 0x01: { // Join Game：int eid + uByte gm + byte dim + uByte diff + uByte max + string level
+      case 0x01: { // Join Game：int eid + uByte gm + byte dim + uByte diff + uByte max + string level + bool reducedDebug
+        // PHPMC 比标准 1.8 多发一个 bool（reduced debug info）——少读它会导致整个流错位 1 字节
         out.join = { eid: r.i32(), gm: r.u8(), dim: r.i8(), diff: r.u8(), max: r.u8(), level: r.string() };
+        r.u8();
         return;
       }
       case 0x02: { // Chat：string json + byte pos
