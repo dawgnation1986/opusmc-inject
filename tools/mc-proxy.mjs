@@ -398,6 +398,9 @@ function mcToClient(id, r) {
   if (out.kick) { toClient({ t: 'kick', reason: flattenChat(safeJson(out.kick)) }); log('PHPMC 断开: ' + out.kick); }
 }
 let r_i64_cache = { dayTime: 1000 };
+setInterval(() => {
+  if (mc || statTickIn) log(`运行统计: 客户端tick=${statTickIn} 转发PosLook=${statPosOut} MC字节=${statMcBytes} MC帧=${statFrames} mcState=${mcState}`);
+}, 10000);
 let mcChunks = 0;
 function flattenChat(j) {
   let s = j.text || '';
@@ -411,9 +414,9 @@ function clientToMc(o) {
   if (!mc) return;
   switch (o.t) {
     case 'tick': {
-      // pos: [x, y(世界), z, yawDeg, pitchDeg, onGround, collidedH] → 0x06 Pos & Look
+      statTickIn++;
       const p = o.pos || [];
-      if (p.length >= 6) toMc(MC.posLook(p[0], p[1], p[2], p[3], p[4], !!p[5]));
+      if (p.length >= 6) { toMc(MC.posLook(p[0], p[1], p[2], p[3], p[4], !!p[5])); statPosOut++; }
       break;
     }
     case 'chat': toMc(MC.chat(String(o.text || '').slice(0, 256))); break;
@@ -458,13 +461,14 @@ function connectMc(name) {
     mcBuf = Buffer.concat([mcBuf, payload]);
     drainMc();
   }, (why) => {
-    log('PHPMC 连接断开: ' + why);
+    log(`PHPMC 连接断开(${why}) — 统计: 客户端tick=${statTickIn} 转发PosLook=${statPosOut} MC字节=${statMcBytes} MC帧=${statFrames}`);
     mcState = 'idle';
     toClient({ t: 'kick', reason: '与 PHPMC 的连接断开：' + why });
     mc = null;
   });
 }
 let mcBuf = Buffer.alloc(0);
+let statTickIn = 0, statPosOut = 0, statMcBytes = 0, statFrames = 0;
 function drainMc() {
   for (;;) {
     const b = mcBuf;
