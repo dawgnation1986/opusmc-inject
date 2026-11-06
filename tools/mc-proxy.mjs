@@ -265,9 +265,15 @@ const MC = {
       }
       case 0x0A: { r.varInt(); r.i64(); return; }                                     // Use Bed
       case 0x0B: { r.varInt(); r.u8(); return; }                                      // Animation
-      case 0x0C: { // Spawn Player：eid + uuid16 + int×3 + yaw/pitch + held(short) + metadata
-        r.varInt(); r.raw(16); r.i32(); r.i32(); r.i32(); r.u8(); r.u8(); r.i16();
+      case 0x0C: { // Spawn Player：eid + uuid16 + int×3(×32) + yaw/pitch + held(short) + metadata
+        const eid = r.varInt();
+        const uuid = r.raw(16);
+        const x = r.i32() / 32, y = r.i32() / 32, z = r.i32() / 32;
+        const yaw = r.u8() * 360 / 256, pitch = r.u8() * 360 / 256;
+        r.i16();
         skipMetadata(r);
+        entPos.set(eid, { x, y, z, yawDeg: yaw, pitchDeg: pitch });
+        out.spawn = { type: 'player', id: eid, uuid: uuidHex(uuid), x, y, z, yaw, pitch, name: playerNames.get(uuidHex(uuid)) };
         return;
       }
       case 0x0D: { r.varInt(); r.varInt(); return; }                                  // Collect Item
@@ -277,20 +283,64 @@ const MC = {
         if (data > 0) { r.i16(); r.i16(); r.i16(); }
         return;
       }
-      case 0x0F: { // Spawn Mob：eid + uByte type + int×3 + yaw/pitch/head + vel×3 + metadata
-        r.varInt(); r.u8(); r.i32(); r.i32(); r.i32(); r.u8(); r.u8(); r.u8();
+      case 0x0F: { // Spawn Mob：eid + uByte type + int×3(×32) + yaw/pitch/head + vel×3 + metadata
+        const eid = r.varInt();
+        const type = r.u8();
+        const x = r.i32() / 32, y = r.i32() / 32, z = r.i32() / 32;
+        const yaw = r.u8() * 360 / 256, pitch = r.u8() * 360 / 256;
+        r.u8();
         r.i16(); r.i16(); r.i16();
         skipMetadata(r);
+        const name = MC_MOBS[type];
+        if (name) {
+          entPos.set(eid, { x, y, z, yawDeg: yaw, pitchDeg: pitch });
+          out.spawn = { type: name, id: eid, x, y, z, yaw, pitch };
+        }
         return;
       }
       case 0x11: { r.varInt(); r.i32(); r.i32(); r.i32(); r.i16(); return; }          // Spawn XP Orb
       case 0x12: { r.varInt(); r.i16(); r.i16(); r.i16(); return; }                   // Entity Velocity
-      case 0x13: { const n = r.varInt(); for (let i = 0; i < n; i++) r.varInt(); return; } // Destroy
-      case 0x15: { r.varInt(); r.i8(); r.i8(); r.i8(); r.bool(); return; }            // Entity Move（1.8 带 onGround）
-      case 0x16: { r.varInt(); r.u8(); r.u8(); r.bool(); return; }                    // Entity Look
-      case 0x17: { r.varInt(); r.i8(); r.i8(); r.i8(); r.u8(); r.u8(); r.bool(); return; } // Move&Look
-      case 0x18: { r.varInt(); r.i32(); r.i32(); r.i32(); r.u8(); r.u8(); r.bool(); return; } // Teleport
-      case 0x19: { r.varInt(); r.u8(); return; }                                      // Head Look
+      case 0x13: { // Destroy Entities
+        const n = r.varInt(); const ids = [];
+        for (let i = 0; i < n; i++) { const eid = r.varInt(); ids.push(eid); entPos.delete(eid); }
+        if (ids.length) out.remove = ids;
+        return;
+      }
+      case 0x15: { // Entity Relative Move：delta i8（×32），在位置表上累计后发绝对 move
+        const eid = r.varInt();
+        const dx = r.i8() / 32, dy = r.i8() / 32, dz = r.i8() / 32;
+        r.bool();
+        const e = entPos.get(eid);
+        if (e) { e.x += dx; e.y += dy; e.z += dz; out.move = { id: eid, x: e.x, y: e.y, z: e.z }; }
+        return;
+      }
+      case 0x16: { // Entity Look（yaw/pitch 是 0-255 圈）
+        const eid = r.varInt();
+        const yaw = r.u8() * 360 / 256, pitch = r.u8() * 360 / 256;
+        r.bool();
+        const e = entPos.get(eid);
+        if (e) { e.yawDeg = yaw; e.pitchDeg = pitch; out.move = { id: eid, yaw, pitch }; }
+        return;
+      }
+      case 0x17: { // Entity Move & Look：delta i8（×32）+ yaw/pitch
+        const eid = r.varInt();
+        const dx = r.i8() / 32, dy = r.i8() / 32, dz = r.i8() / 32;
+        const yaw = r.u8() * 360 / 256, pitch = r.u8() * 360 / 256;
+        r.bool();
+        const e = entPos.get(eid);
+        if (e) { e.x += dx; e.y += dy; e.z += dz; e.yawDeg = yaw; e.pitchDeg = pitch; out.move = { id: eid, x: e.x, y: e.y, z: e.z, yaw, pitch }; }
+        return;
+      }
+      case 0x18: { // Entity Teleport：绝对 int×32
+        const eid = r.varInt();
+        const x = r.i32() / 32, y = r.i32() / 32, z = r.i32() / 32;
+        const yaw = r.u8() * 360 / 256, pitch = r.u8() * 360 / 256;
+        r.bool();
+        entPos.set(eid, { x, y, z, yawDeg: yaw, pitchDeg: pitch });
+        out.move = { id: eid, x, y, z, yaw, pitch, tp: true };
+        return;
+      }
+      case 0x19: { const eid = r.varInt(); out.head = { id: eid, yaw: r.u8() * 360 / 256 }; return; } // Head Look
       case 0x1A: { r.i32(); r.u8(); return; }                                         // Entity Status
       case 0x1B: { r.i32(); r.i32(); r.bool(); return; }                              // Attach Entity
       case 0x1C: { r.varInt(); skipMetadata(r); return; }                             // Entity Metadata
@@ -344,23 +394,27 @@ const MC = {
       case 0x31: { r.u8(); r.i16(); r.i16(); return; }                                // Window Property
       case 0x32: { r.u8(); r.i16(); r.bool(); return; }                               // Confirm Transaction
       case 0x33: { r.i64(); r.string(); r.string(); r.string(); r.string(); return; } // Update Sign
-      case 0x35: { // Update Tile Entity：packedPos(long) + uByte action + NBT
+      case 0x35: { // Update Tile Entity：packedPos(long) + uByte action + NBT blob（1.8 无 present 字节）
         r.i64(); r.u8();
-        if (r.u8() === 1) skipNbt(r);
+        skipNbt(r);
         return;
       }
       case 0x36: { r.i64(); return; }                                                 // Sign Editor Open
-      case 0x38: { // Player List：varInt action + varInt count + entries
+      case 0x38: { // Player List：action=0 的 uuid+name 是头顶名牌唯一来源（文档 §5.2）
         const action = r.varInt(), n = r.varInt();
+        const list = [];
         for (let i = 0; i < n; i++) {
-          r.raw(16);
+          const uuid = r.raw(16);
           if (action === 0) {
-            r.string();
+            const name = r.string();
             const props = r.varInt();
-            for (let p = 0; p < props; p++) { r.string(); r.string(); if (r.bool()) r.string(); }
+            for (let pp = 0; pp < props; pp++) { r.string(); r.string(); if (r.bool()) r.string(); }
             r.varInt(); r.varInt(); r.bool();
+            playerNames.set(uuidHex(uuid), name);
+            list.push({ uuid: uuidHex(uuid), name });
           } else if (action === 1 || action === 2 || action === 3) { r.varInt(); }
         }
+        if (action === 0 && list.length) out.players = list;
         return;
       }
       case 0x39: { out.abilities = { flags: r.u8() }; r.f32(); r.f32(); return; }     // Abilities
@@ -375,7 +429,7 @@ const MC = {
 function skipMetadata(r) {
   for (;;) {
     const h = r.u8();
-    if (h === 0) return;
+    if (h === 0x7F) return; // 1.8 结束符（文档 §4.0）；0x00 是 index0/type0 的合法条目
     const type = (h >> 5) & 7;
     switch (type) {
       case 0: r.i8(); break;
@@ -421,6 +475,18 @@ let mcState = 'idle';
 let mcEid = -1;
 let chatLines = [];
 
+// ---- 实体状态（0x38 名字表 + 实体绝对位置表，0x15/0x17 相对移动在上面累计）----
+const entPos = new Map();      // eid -> {x, y, z, yawDeg, pitchDeg}
+const playerNames = new Map(); // uuidHex -> name（0x38 action=0）
+function uuidHex(buf) { return buf.toString('hex'); }
+// MC 实体 type id（1.8）-> OpusMC NET_MOBS 名字；不在表里的 spawn 客户端会自动忽略
+const MC_MOBS = {
+  90: 'pig', 91: 'sheep', 92: 'cow', 93: 'chicken', 54: 'zombie', 51: 'skeleton',
+  50: 'creeper', 52: 'spider', 58: 'enderman', 61: 'blaze', 56: 'ghast',
+  57: 'zombified_piglin', 62: 'magma_cube', 120: 'villager', 99: 'iron_golem',
+  95: 'wolf', 96: 'cat', 98: 'ocelot', 100: 'horse', 31: 'horse',
+};
+
 function toClient(o) { if (client) client.sendText(o); }
 function toMc(buf) { if (mc) mc.sendBinary(buf); }
 
@@ -449,6 +515,11 @@ function mcToClient(id, r) {
   if (out.time) { r_i64_cache.dayTime = ((out.time.dayTime % 24000) + 24000) % 24000; toClient({ t: 'time', day: r_i64_cache.dayTime, rate: 1 }); }
   if (out.block) toClient({ t: 'block', x: out.block.x, y: out.block.y, z: out.block.z, s: out.block.s });
   if (out.abilities) toClient({ t: 'abilities', flags: out.abilities.flags });
+  if (out.players) toClient({ t: 'players', list: out.players });
+  if (out.spawn) toClient(Object.assign({ t: 'spawn' }, out.spawn));
+  if (out.remove) toClient({ t: 'remove', ids: out.remove });
+  if (out.move) toClient(Object.assign({ t: 'move' }, out.move));
+  if (out.head) toClient({ t: 'head', id: out.head.id, yaw: out.head.yaw });
   if (out.respawn) { toClient({ t: 'respawn', dim: out.respawn.dim, minY: 0, mode: mcModeName }); log('维度切换：' + out.respawn.dim); }
   if (out.health) toClient({ t: 'health', hp: out.health.hp, food: out.health.food, sat: out.health.sat });
   if (out.posLook) toClient({ t: 'pos', x: out.posLook.x, y: out.posLook.y, z: out.posLook.z, yaw: out.posLook.yaw, pitch: out.posLook.pitch });
@@ -550,6 +621,7 @@ function connectMc(name = 'WebPlayer') {
   }, (why) => {
     log(`PHPMC 连接断开(${why}) — 统计: 客户端tick=${statTickIn} 转发PosLook=${statPosOut} MC字节=${statMcBytes} MC帧=${statFrames}`);
     mcState = 'idle';
+    entPos.clear(); playerNames.clear();
     toClient({ t: 'kick', reason: '与 PHPMC 的连接断开：' + why });
     mc = null;
   });
@@ -710,11 +782,19 @@ function chunkToOpus(cx, cz, mask, data) {
   const biomes = data.subarray(p, p + 256);
   out[0][9] = sections.length;
   for (const sec of sections) {
-    if (sec.palette.length > 256) continue; // 罕见超调色板段跳过（M2 简化）
     const len = Buffer.alloc(2); len.writeUInt16LE(sec.palette.length);
     const pal = Buffer.alloc(sec.palette.length * 2);
     for (let i = 0; i < sec.palette.length; i++) pal.writeUInt16LE(sec.palette[i], i * 2);
-    out.push(len, pal, Buffer.from(sec.cells), Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
+    // OpusMC 格式（net.js onBinary）：palette=1 的段不写索引数组（全段同方块）；>256 用 u16 索引
+    if (sec.palette.length === 1) {
+      out.push(len, pal, Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
+    } else if (sec.palette.length <= 256) {
+      out.push(len, pal, Buffer.from(sec.cells), Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
+    } else {
+      const wide = Buffer.alloc(4096 * 2);
+      for (let j = 0; j < 4096; j++) wide.writeUInt16LE(sec.cells[j], j * 2);
+      out.push(len, pal, wide, Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
+    }
   }
   out.push(biomes.length === 256 ? Buffer.from(biomes) : Buffer.alloc(256));
   return Buffer.concat(out);
