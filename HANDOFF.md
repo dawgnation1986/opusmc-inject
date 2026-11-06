@@ -104,31 +104,25 @@ opusmc-inject/
 - 不往 C 盘写任何东西（用户硬约定）。
 - 每次改 userscript 递增版本号并推 mods 发布源；改游戏源码/工具提交主仓库。
 
-## 八、最新诊断（2026-11-05 21:20 收尾时）
+## 八、0x21 卡点已破 + 客户端侧大修（2026-11-06 23:40 收官）
 
-**已修复**：JoinGame 补读 reducedDebug bool（提交 b156af8）；tls path 参数（EPERM）；
-wss 客户端 HTTP 头重复拼接（假 closed）；KeepAlive 自答；M2 区块翻译框架已写
-（states/biomes 消息 + 1.8→OpusMC chunk 转换，`chunkToOpus`）。
+**根因（一坑两处）**：VarInt 解码位移 bug——（每轮+1位）应为 。
+单字节 VarInt 不受影响（M1 登录全通的原因），首个 ≥128 字节的包（0x21 区块 61711B）
+立刻错位成 207。drainMc 读包长与 Reader.varInt 两处同修。
 
-**当前卡点（接手第一任务）**：中转日志显示 `⚠ 包 0x21 解码后剩余 -12/207 字节`——
-0x21（ChunkData）的 payload 只有 **207 字节**，但 hex dump 显示其内部结构完全正确：
+**客户端侧三大补丁**（此前 OpusMC 真客户端从未握上手）：
+1. wrapServerSocket 补 HTTP 升级（浏览器 WS 先发 GET 等 101）
+2. hello 握手：等客户端 {t:'hello',name} 才 connectMc(name)，替换固定 WebPlayer
+3. wsDecode 多帧拼接会砸坏 JSON —— 客户端侧改逐帧分派（PHPMC 侧字节流保持拼接语义）
 
-```
-21 | fffffffd (cx=-3 大端) | fffffffd (cz=-3) | 01 (groundUp) | 001f (mask=5段)
-   | 80 e2 03 (varInt = 61696 = 5段×12288+256 ≈ data 大小) | 70007000...
-```
+**实测（模拟客户端 test-opusclient.mjs）**：states 4096 项、biomes 256、login、
+chat、49 区块 1.7MB 零异常、abilities/health/time 全通。
 
-**矛盾**：mask=5 段 → 数据应 61700 字节，包总长应 ~61715，但 drainMc 读到的包长是 207。
-**下一步诊断方向**（按顺序试）：
-1. 在 drainMc 读包长前 dump `mcBuf` 前 3 字节（hex），确认它读到的 VarInt 是 61715 的
-   正确编码 [0x8f,0xe2,0x03] 还是错位的 [0xcf,0x01]——如果错位，说明**前一个包
-   （JoinGame）的包长或字段长度有偏差**（断言 left=0 只能证明「长度恰好凑满」，不能
-   证明**分界正确**——JoinGame 的 level string 长度若读错，恰好会把 0x21 的开头吃进去）。
-2. 对比 PHPMC `Server.php:700` 的 JoinGame 发送与 `Frame::encode`（VarInt 长度=整个
-   包 ID+body 的长度）。
-3. PHPMC 的 `Connection::send` 一帧一包（`WebSocket::frame(Frame::encode(...))`），
-   flush 部分写只是 TCP 层续写——**不存在应用层分片**，不要在分片方向上找。
-4. 断言机制已内置（`drainMc` 里 decode 后检查 r.left），会打印第一个错位的包 id。
+**按《服务端-客户端协议清单.md》对齐**：0x21 mask i16→u16、0x15 补 onGround bool、
+0x29 双占用断言、dig/drop→0x07、block/respawn/abilities/time 下发、BLOCK_NAMES 补
+16 色系与杂项。PHPMC C→S 以 Server.php handlePlay 为准（0x05=Look 0x06=PosLook，
+与 wiki 相反，勿改）。
 
-**给用户的形态**：登录/聊天/移动协议全通（PHPMC 日志有 WebPlayer 登录记录），
-M1 实战验证过；差区块流对齐这最后一步，对齐后 OpusMC 就能看到 PHPMC 的世界。
+**一键启动**：launch-play.bat（PHPMC→mc-proxy→静态服→Edge），游戏内
+多人→直接连接→默认 ws://localhost:8780 回车即进。
+观察工具：mc-observe.mjs（TCP/wss 双模式看真实包流）。

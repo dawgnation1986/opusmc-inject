@@ -38,7 +38,8 @@ class Reader {
       const b = this.b[this.o++];
       v |= (b & 0x7F) << shift;
       if (!(b & 0x80)) break;
-      if (++shift > 5) throw new Error('varInt 太长');
+      shift += 7;
+      if (shift > 28) throw new Error('varInt 太长');
     }
     return v;
   }
@@ -119,14 +120,39 @@ function wsDecode(bufRef) {
 
 // ws 服务端连接包装（给 OpusMC 客户端）
 function wrapServerSocket(socket) {
-  const st = { buf: Buffer.alloc(0), pong: null, handlers: { message: null, close: null } };
+  const st = { buf: Buffer.alloc(0), pong: null, upgraded: false, handlers: { message: null, close: null } };
   socket.on('error', () => { }); // 客户端断开/ECONNRESET 不让进程崩
   socket.on('data', (chunk) => {
+    if (process.env.MCPROXY_DEBUG) console.log('[dbg] data ' + chunk.length + 'B upgraded=' + st.upgraded + ' head=' + chunk.subarray(0, 8).toString('hex'));
     st.buf = Buffer.concat([st.buf, chunk]);
-    const { payload, closed } = wsDecode(st);
+    // HTTP 升级：浏览器 WebSocket 的第一步。回 101 + Sec-WebSocket-Accept，剩余字节进 ws 流
+    if (!st.upgraded) {
+      const i = st.buf.indexOf('\r\n\r\n');
+      if (i === -1) return; // 头还没收全
+      const head = st.buf.subarray(0, i).toString('utf8');
+      const m = /Sec-WebSocket-Key:\s*(\S+)/i.exec(head);
+      if (!/^GET /m.test(head) || !m) return; // 不是升级请求，按旧路走
+      const accept = crypto.createHash('sha1').update(m[1] + WS_MAGIC).digest('base64');
+      socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+      st.upgraded = true;
+      const rest = st.buf.subarray(i + 4);
+      st.buf = Buffer.alloc(0);
+      if (rest.length) { st.buf = Buffer.concat([st.buf, rest]); }
+      return; // 升级帧本身不带消息
+    }
+    // 客户端消息是 JSON 文本帧 —— 必须逐帧分派（wsDecode 会把同 chunk 的多帧拼成一个
+    // payload，两个 JSON 拼在一起 parse 必炸；只有 MC 字节流才是拼接语义）
+    let closed = false;
+    const frames = [];
+    for (;;) {
+      const r = wsDecode(st);
+      if (r.closed) { closed = true; break; }
+      if (r.payload.length) frames.push(r.payload);
+      if (st.buf.length === 0) break; // wsDecode 已把未完成的留在 buf；防死循环
+    }
     if (st.pong) { socket.write(st.pong); st.pong = null; }
     if (closed) { socket.end(); st.handlers.close && st.handlers.close(); return; }
-    if (payload.length && st.handlers.message) st.handlers.message(payload);
+    for (const f of frames) if (st.handlers.message) st.handlers.message(f);
   });
   socket.on('close', () => st.handlers.close && st.handlers.close());
   return {
@@ -196,6 +222,11 @@ const MC = {
   loginStart(name) { return framePacket(0x00, new Writer().string(name).build()); },
   keepAlive(id) { return framePacket(0x00, new Writer().varInt(id).build()); },
   chat(text) { return framePacket(0x01, new Writer().string(text).build()); },
+  posGround(onGround) { return framePacket(0x03, new Writer().bool(onGround).build()); },
+  dig(status, x, y, z, face) { // 0x07：u8 status + long packedPos + u8 face
+    const packed = ((BigInt(x | 0) & 0x3FFFFFFn) << 38n) | ((BigInt(z | 0) & 0x3FFFFFFn) << 12n) | (BigInt(y | 0) & 0xFFFn);
+    return framePacket(0x07, new Writer().bytes((() => { const b = Buffer.alloc(8); b.writeBigInt64BE(BigInt.asIntN(64, packed)); return b; })()).u8(status).u8(face).build());
+  },
   posLook(x, y, z, yaw, pitch, onGround) {
     return framePacket(0x06, new Writer().f64(x).f64(y).f64(z).f32(yaw).f32(pitch).bool(onGround).build());
   },
@@ -216,14 +247,15 @@ const MC = {
         out.chatPos = pos;
         return;
       }
-      case 0x03: r.i64(); r.i64(); return;                                            // Time Update
+      case 0x03: { const age = r.i64(); out.time = { worldAge: age, dayTime: r.i64() }; return; } // Time Update
       case 0x05: r.i64(); return;                                                     // Spawn Position
       case 0x06: { // Update Health：float + varInt + float
         out.health = { hp: r.f32(), food: r.varInt(), sat: r.f32() };
         return;
       }
-      case 0x07: { // Respawn：int + uByte + uByte + string
-        r.i32(); r.u8(); r.u8(); r.string();
+      case 0x07: { // Respawn（文档 §5.1：维度靠坐标带切，以此为准）
+        const dimId = r.i32(); r.u8(); r.u8(); r.string();
+        out.respawn = { dim: dimId === -1 ? 'nether' : dimId === 1 ? 'the_end' : 'overworld' };
         return;
       }
       case 0x08: { // Position & Look：double×3 + float×2 + byte flags
@@ -254,7 +286,7 @@ const MC = {
       case 0x11: { r.varInt(); r.i32(); r.i32(); r.i32(); r.i16(); return; }          // Spawn XP Orb
       case 0x12: { r.varInt(); r.i16(); r.i16(); r.i16(); return; }                   // Entity Velocity
       case 0x13: { const n = r.varInt(); for (let i = 0; i < n; i++) r.varInt(); return; } // Destroy
-      case 0x15: { r.varInt(); r.i8(); r.i8(); r.i8(); return; }                      // Entity Move
+      case 0x15: { r.varInt(); r.i8(); r.i8(); r.i8(); r.bool(); return; }            // Entity Move（1.8 带 onGround）
       case 0x16: { r.varInt(); r.u8(); r.u8(); r.bool(); return; }                    // Entity Look
       case 0x17: { r.varInt(); r.i8(); r.i8(); r.i8(); r.u8(); r.u8(); r.bool(); return; } // Move&Look
       case 0x18: { r.varInt(); r.i32(); r.i32(); r.i32(); r.u8(); r.u8(); r.bool(); return; } // Teleport
@@ -270,14 +302,26 @@ const MC = {
         }
         out.chunk = { cx: r.i32(), cz: r.i32() };
         r.bool();
-        out.chunk.mask = r.i16();
+        out.chunk.mask = r.u16();   // 协议清单 §3：primaryBitMask 是 ushort
         const size = r.varInt();
         out.chunk.data = r.raw(size);   // 保留原始字节供 M2 区块翻译
         out.chunk.size = size;
         return;
       }
-      case 0x23: { r.i64(); r.varInt(); return; }                                     // Block Change
-      case 0x29: { r.varInt(); r.string(); r.i64(); r.u8(); return; }                 // Spawn Painting
+      case 0x23: { // Block Change：packedPos(long) + varInt blockId（=(id<<4)|meta 的 raw state）
+        const packed = r.i64();
+        const bx = Number(BigInt.asIntN(26, BigInt(packed) >> 38n));
+        const bz = Number(BigInt.asIntN(26, (BigInt(packed) << 26n) >> 38n));
+        const by = Number((BigInt(packed) >> 26n) & 0xFFFn);
+        out.block = { x: bx, y: by, z: bz, s: r.varInt() };
+        return;
+      }
+      case 0x29: { // Spawn Painting（文档 §5.3：0x29 与 Sound Effect 双占用；PHPMC 已关音效，恒为画）
+        const before = r.left;
+        r.varInt(); r.string(); r.i64(); r.u8();
+        if (r.left !== 0) throw new Error('0x29 解码后剩 ' + r.left + 'B（可能是音效包，按 §5.3 处理）');
+        return;
+      }
       case 0x2B: { r.u8(); r.f32(); return; }                                         // Change Game State
       case 0x2D: { // Open Window：uByte id + string type + string title + uByte slots (+bool horse)
         r.u8(); r.string(); r.string(); r.u8();
@@ -319,7 +363,7 @@ const MC = {
         }
         return;
       }
-      case 0x39: { r.u8(); r.f32(); r.f32(); return; }                                // Abilities
+      case 0x39: { out.abilities = { flags: r.u8() }; r.f32(); r.f32(); return; }     // Abilities
       case 0x40: { out.kick = r.string(); return; }                                   // Disconnect
       default:
         throw new Error('未收录的 PHPMC 包 0x' + id.toString(16) + '（剩余 ' + r.left + 'B）—— 流错位，需要重连/补表');
@@ -388,6 +432,7 @@ function mcToClient(id, r) {
   if (out.keepAlive !== undefined) { toMc(MC.keepAlive(out.keepAlive)); return; }
   if (out.join) {
     mcEid = out.join.eid;
+    mcModeName = out.join.gm === 1 ? 'creative' : 'survival';
     toClient({
       t: 'login', eid: out.join.eid, dim: 'overworld', minY: 0,
       mode: out.join.gm === 1 ? 'creative' : 'survival',
@@ -401,7 +446,10 @@ function mcToClient(id, r) {
     toClient({ t: 'chat', text, color: '#FFFFFF' });
     log('[聊天] ' + text);
   }
-  if (out.time) toClient({ t: 'time', day: (r_i64_cache.dayTime ?? 1000), rate: 1 });
+  if (out.time) { r_i64_cache.dayTime = ((out.time.dayTime % 24000) + 24000) % 24000; toClient({ t: 'time', day: r_i64_cache.dayTime, rate: 1 }); }
+  if (out.block) toClient({ t: 'block', x: out.block.x, y: out.block.y, z: out.block.z, s: out.block.s });
+  if (out.abilities) toClient({ t: 'abilities', flags: out.abilities.flags });
+  if (out.respawn) { toClient({ t: 'respawn', dim: out.respawn.dim, minY: 0, mode: mcModeName }); log('维度切换：' + out.respawn.dim); }
   if (out.health) toClient({ t: 'health', hp: out.health.hp, food: out.health.food, sat: out.health.sat });
   if (out.posLook) toClient({ t: 'pos', x: out.posLook.x, y: out.posLook.y, z: out.posLook.z, yaw: out.posLook.yaw, pitch: out.posLook.pitch });
   if (out.chunk) {
@@ -419,6 +467,7 @@ setInterval(() => {
   if (mc || statTickIn) log(`运行统计: 客户端tick=${statTickIn} 转发PosLook=${statPosOut} MC字节=${statMcBytes} MC帧=${statFrames} mcState=${mcState}`);
 }, 10000);
 let mcChunks = 0;
+let mcModeName = 'survival';
 function flattenChat(j) {
   let s = j.text || '';
   if (Array.isArray(j.extra)) for (const ex of j.extra) s += flattenChat(ex);
@@ -433,13 +482,26 @@ function clientToMc(o) {
     case 'tick': {
       statTickIn++;
       const p = o.pos || [];
-      if (p.length >= 6) { toMc(MC.posLook(p[0], p[1], p[2], p[3], p[4], !!p[5])); statPosOut++; }
+      if (p.length >= 6) {
+        // PHPMC handlePlay：0x06 = Position And Look（f64×3 + f32×2 + bool）
+        toMc(MC.posLook(p[0], p[1], p[2], p[3], p[4], !!p[5])); statPosOut++;
+      } else {
+        toMc(MC.posGround(true)); // 站着不动也要报 onGround，防位置流断
+      }
       break;
     }
-    case 'chat': toMc(MC.chat(String(o.text || '').slice(0, 256))); break;
-    case 'tpok': break;                         // 1.8 无 teleport confirm，丢弃
-    case 'error': break;                        // 客户端内部错误，忽略
-    default: break;                             // dig/place/held 等 M3
+    case 'chat': toMc(MC.chat(String(o.text || '').slice(0, 100))); break;   // PHPMC readString(100)
+    case 'dig': { // 0=start 1=abort 2=finish → 直通 0x07（PHPMC 同义）
+      toMc(MC.dig(o.status | 0, o.x, o.y, o.z, o.face | 0));
+      break;
+    }
+    case 'drop': toMc(MC.dig(o.all ? 3 : 4, 0, 0, 0, 0)); break;             // 丢物品：status 3 整组 / 4 单个
+    case 'held': break;   // PHPMC 无 0x09（服务端自行记账），跳过
+    case 'settings': break; // rd 视距，M3 用于限制区块请求范围
+    case 'tpok': break;     // 1.8 无 teleport confirm
+    case 'click': case 'creative': case 'trade': case 'sign': break;         // 容器/创造/交易：M3
+    case 'error': break;
+    default: break;
   }
 }
 
@@ -448,12 +510,17 @@ const server = net.createServer((socket) => {
   socket.on('error', () => { });
   if (client) { try { client.close(); } catch (e) { } } // 单客户端：新的顶掉旧的
   client = wrapServerSocket(socket);
-  log('OpusMC 客户端已接入（直接连接）—— 主动连接 PHPMC（proxy 协议：服务端先发 login）');
-  connectMc('WebPlayer');
+  let playerName = 'WebPlayer';
+  log('OpusMC 客户端已接入（HTTP 升级完成）—— 等待 hello 握手');
   client.onMessage((payload) => {
-    // proxy 协议：JSON 文本消息（客户端连上后等 proxy 先发 states/login —— 服务端先说话）
     let m;
     try { m = JSON.parse(payload.toString('utf8')); } catch (e) { return; }
+    if (m.t === 'hello') {
+      playerName = String(m.name || 'WebPlayer').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16) || 'WebPlayer';
+      log(`hello：玩家 ${playerName}（proto=${m.proto || '?'} rd=${m.rd || '?'}）—— 连接 PHPMC`);
+      connectMc(playerName);
+      return;
+    }
     if (m.t === 'tick') { lastTick = m; clientToMc(m); return; }
     clientToMc(m);
   });
@@ -464,7 +531,7 @@ let lastTick = null;
 server.listen(CLIENT_PORT, () => log(`中转就绪：OpusMC「直接连接」填 ws://localhost:${CLIENT_PORT} → PHPMC ${MC_SECURE ? 'wss' : 'ws'}://${MC_HOST}:${MC_PORT}`));
 
 // 连接 PHPMC（登录链路：握手 → LoginStart → Play）
-function connectMc(name) {
+function connectMc(name = 'WebPlayer') {
   if (mc) mc.close();
   mcState = 'connecting';
   log(`连接 PHPMC ${MC_SECURE ? 'wss' : 'ws'}://${MC_HOST}:${MC_PORT}（玩家 ${name}）`);
@@ -497,7 +564,8 @@ function drainMc() {
       const byte = b[o++];
       len |= (byte & 0x7F) << shift;
       if (!(byte & 0x80)) { ok = true; break; }
-      if (++shift > 5) break;
+      shift += 7;
+      if (shift > 28) break;
     }
     if (!ok || o + len > b.length) break;
     const payload = b.subarray(o, o + len);
@@ -557,7 +625,14 @@ const BLOCK_NAMES = (() => {
     161: 'oak_leaves', 162: 'oak_log', 165: 'slime_block', 168: 'prismarine',
     169: 'sea_lantern', 170: 'hay_block', 172: 'terracotta', 173: 'coal_block',
     174: 'packed_ice', 179: 'red_sandstone', 201: 'purpur_block', 206: 'end_stone_bricks',
-    55: 'redstone_wire', 59: 'wheat', 60: 'farmland', 71: 'iron_door', 64: 'oak_door',
+    26: 'bed', 30: 'cobweb', 31: 'short_grass', 32: 'dead_bush', 37: 'dandelion',
+    38: 'poppy', 39: 'brown_mushroom', 40: 'red_mushroom', 51: 'fire', 52: 'spawner',
+    55: 'redstone_wire', 59: 'wheat', 60: 'farmland', 63: 'oak_sign', 68: 'oak_wall_sign',
+    70: 'stone_button', 71: 'iron_door', 64: 'oak_door', 72: 'stone_button', 77: 'oak_button',
+    92: 'cake', 93: 'repeater', 94: 'repeater', 104: 'pumpkin_stem', 105: 'melon_stem',
+    125: 'oak_slab', 127: 'cocoa', 137: 'command_block', 144: 'skeleton_skull',
+    158: 'powered_rail', 27: 'powered_rail', 28: 'detector_rail',
+    178: 'comparator',
     74: 'redstone_ore', 75: 'redstone_torch', 76: 'redstone_torch', 78: 'snow',
     83: 'sugar_cane', 84: 'jukebox', 90: 'nether_portal', 91: 'jack_o_lantern', 96: 'oak_trapdoor',
     97: 'infested_stone', 99: 'brown_mushroom_block', 100: 'red_mushroom_block',
@@ -588,8 +663,6 @@ const BLOCK_NAMES = (() => {
     222: 'purple_glazed_terracotta', 223: 'blue_glazed_terracotta',
     224: 'brown_glazed_terracotta', 225: 'green_glazed_terracotta',
     226: 'red_glazed_terracotta', 227: 'black_glazed_terracotta',
-    228: 'white_concrete', 229: 'white_concrete_powder', 230: 'white_stained_glass',
-    231: 'white_stained_glass_pane',
   };
   for (const [id, name] of Object.entries(base)) a[(+id) << 4] = 'minecraft:' + name;
   for (let m = 0; m < 16; m++) {
@@ -597,6 +670,11 @@ const BLOCK_NAMES = (() => {
     a[(95 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass';
     a[(160 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass_pane';
     a[(171 << 4) | m] = 'minecraft:' + WOOL[m] + '_carpet';
+    a[(159 << 4) | m] = 'minecraft:' + WOOL[m] + '_terracotta';       // 1.8 染色陶瓦
+    a[(228 << 4) | m] = 'minecraft:' + WOOL[m] + '_concrete';
+    a[(229 << 4) | m] = 'minecraft:' + WOOL[m] + '_concrete_powder';
+    a[(230 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass';    // 230/231 旧表误置，覆盖为玻璃
+    a[(231 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass_pane';
   }
   for (let m = 0; m < 6; m++) {
     a[(5 << 4) | m] = 'minecraft:' + WOODS[m] + '_planks';
