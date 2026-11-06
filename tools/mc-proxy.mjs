@@ -404,6 +404,10 @@ const MC = {
       case 0x32: { r.u8(); r.i16(); r.bool(); return; }                               // Confirm Transaction
       case 0x33: { r.i64(); r.string(); r.string(); r.string(); r.string(); return; } // Update Sign
       case 0x35: { // Update Tile Entity：packedPos(long) + uByte action + NBT blob（1.8 无 present 字节）
+        if (!global.__teDumped) {
+          global.__teDumped = true;
+          log('0x35 hex(前40): ' + r.b.subarray(0, 40).toString('hex') + ' 总长 ' + r.b.length);
+        }
         r.i64(); r.u8();
         skipNbt(r);
         return;
