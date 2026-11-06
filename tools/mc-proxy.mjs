@@ -264,7 +264,7 @@ const MC = {
         return;
       }
       case 0x0A: { r.varInt(); r.i64(); return; }                                     // Use Bed
-      case 0x0B: { r.varInt(); r.u8(); return; }                                      // Animation
+      case 0x0B: { const eid = r.varInt(); out.anim = { id: eid, a: r.u8() }; return; } // Animation（挥手）
       case 0x0C: { // Spawn Player：eid + uuid16 + int×3(×32) + yaw/pitch + held(short) + metadata
         const eid = r.varInt();
         const uuid = r.raw(16);
@@ -342,7 +342,11 @@ const MC = {
         return;
       }
       case 0x19: { const eid = r.varInt(); out.head = { id: eid, yaw: r.u8() * 360 / 256 }; return; } // Head Look
-      case 0x1A: { r.i32(); r.u8(); return; }                                         // Entity Status
+      case 0x1A: { // Entity Status：2=受伤（红闪+音效），3=死亡
+        const eid = r.i32(); const st = r.u8();
+        if (st === 2) out.hurt = { id: eid };
+        return;
+      }
       case 0x1B: { r.i32(); r.i32(); r.bool(); return; }                              // Attach Entity
       case 0x1C: { r.varInt(); skipMetadata(r); return; }                             // Entity Metadata
       case 0x1F: { r.f32(); r.varInt(); r.varInt(); return; }                         // Set Experience
@@ -373,7 +377,11 @@ const MC = {
         if (r.left !== 0) throw new Error('0x29 解码后剩 ' + r.left + 'B（可能是音效包，按 §5.3 处理）');
         return;
       }
-      case 0x2B: { r.u8(); r.f32(); return; }                                         // Change Game State
+      case 0x2B: { // Change Game State：reason 1=开始下雨 2=停
+        const reason = r.u8(); r.f32();
+        if (reason === 1 || reason === 2) out.rain = { on: reason === 1 };
+        return;
+      }
       case 0x2D: { // Open Window：uByte id + string type + string title + uByte slots (+bool horse)
         r.u8(); r.string(); r.string(); r.u8();
         return;
@@ -445,9 +453,10 @@ function skipMetadata(r) {
     }
   }
 }
-// NBT 跳过（PHPMC src/Nbt 标准格式）
+// NBT 跳过（PHPMC Nbt::write：named root = type + u16 名长 + 名字 + entries + 0x00）
 function skipNbt(r) {
   const t = r.u8();
+  r.o += r.u16(); // 跳过根标签的名字
   skipNbtPayload(r, t);
 }
 function skipNbtPayload(r, typeId) {
@@ -522,6 +531,9 @@ function mcToClient(id, r) {
   if (out.remove) toClient({ t: 'remove', ids: out.remove });
   if (out.move) toClient(Object.assign({ t: 'move' }, out.move));
   if (out.head) toClient({ t: 'head', id: out.head.id, yaw: out.head.yaw });
+  if (out.hurt) toClient({ t: 'hurt', id: out.hurt.id });
+  if (out.anim) toClient({ t: 'anim', id: out.anim.id, a: out.anim.a });
+  if (out.rain) toClient({ t: 'rain', on: out.rain.on });
   if (out.respawn) { toClient({ t: 'respawn', dim: out.respawn.dim, minY: 0, mode: mcModeName }); log('维度切换：' + out.respawn.dim); }
   if (out.health) toClient({ t: 'health', hp: out.health.hp, food: out.health.food, sat: out.health.sat });
   if (out.posLook) toClient({ t: 'pos', x: out.posLook.x, y: out.posLook.y, z: out.posLook.z, yaw: out.posLook.yaw, pitch: out.posLook.pitch });
