@@ -22,8 +22,10 @@ const Companion = {
   // (whether it shows at all: the service says - not released to everyone yet)
   get shown() { return !COMPANION_OFF && !!(this.status && this.status.on); },
   async load() {
-    if (COMPANION_OFF || !Account.loggedIn) { this.status = null; return null; }
-    try { this.status = await Account.api('/api/ai/status', {}); } catch (e) { }
+    if (COMPANION_OFF || !Account.loggedIn) { this.status = null; if (!COMPANION_OFF && typeof alert === 'function' && !window.__aiDiagShown) { window.__aiDiagShown = 1; alert('[AI 诊断] 未登录（Account.loggedIn=false），跳过 status 拉取——先去标题屏登录'); } return null; }
+    try { this.status = await Account.api('/api/ai/status', {}); }
+    catch (e) { this.status = null; alert('[AI 诊断] status 拉取失败: ' + (e && e.message) + ' (HTTP ' + (e && e.status) + ')'); }
+    if (this.status && !this.status.on) alert('[AI 诊断] 服务端 on=false: ' + JSON.stringify(this.status).slice(0, 200));
     return this.status;
   },
   // ---- what is going on (plain words for the model) ----

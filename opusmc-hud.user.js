@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpusMC 生存辅助（彗星 Comet 客户端）
 // @namespace    https://github.com/bigpixel
-// @version      1.2.1
-// @description  网页版 MC 运行时注入：还原彗星客户端（Comet Client）的 ClickGUI —— 400x250 双栏面板、分类侧栏、搜索、模块设置面板、收藏 / 键位绑定，以及彗星式 HUD（Watermark / Info / TargetHud / ArrayList / 通知）。功能：Aura（可自选攻击生物）、TriggerBot、AutoSprint、AutoRespawn、ESP、Tracers、Nametags、ItemESP、TargetESP、FullBright、Ambience、飞行 / 加速、快速破坏 / 瞬间破坏、雷达、罗盘。适配 OpusMC / OpusCraft / 本地离线版。
+// @version      1.3.1
+// @description  网页版 MC 运行时注入：还原彗星客户端（Comet Client）的 ClickGUI —— 400x250 双栏面板、分类侧栏、搜索、模块设置面板、收藏 / 键位绑定，以及彗星式 HUD（Watermark / Info / TargetHud / ArrayList / 通知）。功能：Aura（可自选攻击生物）、TriggerBot、刀刀暴击、AutoSprint、AutoRespawn、ESP、Tracers、Nametags、ItemESP、TargetESP、FullBright、Ambience、飞行（双击空格）/ 加速 / 自动跳跃、快速破坏 / 瞬间破坏 / 自动进食 / 水下呼吸、雷达、罗盘。适配 OpusMC / OpusCraft / 本地离线版。
 // @author       BigPixel
 // @match        https://opuscraft.pages.dev/*
 // @match        https://www.bilibilitoy.com/*
@@ -29,7 +29,7 @@
   }
   W.__cometInstalled = true;
 
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const REF_POLL_MS = 800;
   const REF_POLL_MAX_TRIES = 375;
 
@@ -79,6 +79,19 @@
         const acc = W.localStorage.getItem(KEY);
         if (acc && acc.indexOf('"token":"') !== -1) GM_setValue('cometAccountSync', acc);
       } else if (onLocal) {
+        // [诊断] 油猴直发一次伪装请求，验证 GM 通道与服务端白名单是否放行（3 秒后弹结果）
+        setTimeout(function () {
+          if (typeof GM_xmlhttpRequest !== 'function') { alert('[伪装测试] GM_xmlhttpRequest 不可用（脚本权限丢了）'); return; }
+          GM_xmlhttpRequest({
+            method: 'POST',
+            url: 'https://xz.honghemc.cn:8443/api/ai/status',
+            headers: { Origin: 'https://www.bilibili.com', Referer: 'https://www.bilibili.com/' },
+            data: '{}',
+            timeout: 15000,
+            onload: function (r) { alert('[伪装测试] HTTP ' + r.status + '：' + String(r.responseText).slice(0, 160)); },
+            onerror: function () { alert('[伪装测试] 请求直接失败——扩展权限问题（Edge 扩展页把 Tampermonkey 的开发者模式打开）'); },
+          });
+        }, 3000);
         const cur = W.localStorage.getItem(KEY);
         const hasToken = cur && cur.indexOf('"token":"') !== -1;
         if (!hasToken && typeof GM_getValue === 'function') {
@@ -210,6 +223,16 @@
   }
   function itemName(id) {
     if (typeof id === 'undefined' || id === null) return null;
+    // 游戏里的 itemDef(id) 是顶层函数声明，挂在 window 上，能覆盖所有运行时分配的 id
+    // （工具 / 木棍等不在 ITEM_DATA 固定 id 表里的物品，只能这样拿到名字）
+    try {
+      const fn = W.itemDef;
+      if (typeof fn === 'function') {
+        const d = fn(id);
+        const nm = d && (d.cn || d.name || d.key);
+        if (nm) return nm;
+      }
+    } catch (err) { /* noop */ }
     try {
       const it = W.ITEMS && W.ITEMS[id];
       if (it && (it.cn || it.name || it.key)) return it.cn || it.name || it.key;
@@ -228,7 +251,8 @@
       }
       const T = e.T || (e.type && W.ENTITY_DATA && W.ENTITY_DATA.types ? W.ENTITY_DATA.types[e.type] : null);
       let n = (T && T.cn) || e.type || null;
-      if (!n) return (e.constructor && e.constructor.name) || '?';
+      // 没有 type / 中文名时退回类名，但类名也要过一遍中文表（经验球 / 箭 …）
+      if (!n) n = (e.constructor && e.constructor.name) || '?';
       if (e.baby) n = '幼年' + n;
       return CN_NAMES[n] || n;
     } catch (err) {
@@ -293,13 +317,19 @@
       ],
     },
     {
+      id: 'crit', name: 'Criticals', cn: '刀刀暴击', cat: 'combat', desc: '每次攻击都判定为暴击（伤害 ×1.5）',
+    },
+    {
       id: 'autosprint', name: 'AutoSprint', cn: '自动疾跑', cat: 'movement', desc: '自动保持疾跑',
       settings: [
         { id: 'onlyforward', name: 'Only Forward', cn: '仅前进', type: 'checkbox', value: true, desc: '仅前进时疾跑' },
       ],
     },
     {
-      id: 'fly', name: 'Fly', cn: '飞行', cat: 'movement', desc: '自由飞行（空格上升 / Shift 下降）',
+      id: 'fly', name: 'Fly', cn: '飞行', cat: 'movement', desc: '双击空格开启 / 关闭飞行；飞行时空格上升、Shift 下降',
+    },
+    {
+      id: 'autojump', name: 'AutoJump', cn: '自动跳跃', cat: 'movement', desc: '前进被方块挡住时自动起跳',
     },
     {
       id: 'speed', name: 'Speed', cn: '加速', cat: 'movement', desc: '提高移动速度',
@@ -324,6 +354,15 @@
     },
     {
       id: 'instantbreak', name: 'InstantBreak', cn: '瞬间破坏', cat: 'player', desc: '开始挖掘立即破坏方块',
+    },
+    {
+      id: 'autoeat', name: 'AutoEat', cn: '自动进食', cat: 'player', desc: '饥饿时自动吃手里的食物',
+      settings: [
+        { id: 'threshold', name: 'Threshold', cn: '触发饥饿值', type: 'slider', min: 6, max: 19, step: 1, value: 16 },
+      ],
+    },
+    {
+      id: 'waterbreath', name: 'WaterBreath', cn: '水下呼吸', cat: 'player', desc: '在水下不会消耗氧气',
     },
     {
       id: 'esp', name: 'ESP', cn: '生物ESP', cat: 'render', desc: '生物 3D 线框',
@@ -571,6 +610,33 @@
     } catch (e) { return false; }
   }
 
+  // 进入/切换世界（含进服、死亡复活、切维度）时，游戏会重建 Player 实例并替换
+  // game.player；标题界面拿到的是预览玩家，坐标与朝向永远不动。若一直用最初的
+  // 引用，坐标/罗盘就会"卡死"，光环按错误距离判定而不攻击，飞行/加速等写入也
+  // 全落在废对象上。这里每帧重新对齐游戏与玩家实例。
+  function syncRefs() {
+    try {
+      const g = W.game;
+      if (g && typeof g === 'object' && g.player) {
+        if (state.game !== g) {
+          state.game = g;
+          hookRender();
+          console.log('[Comet] 游戏实例已更新');
+        }
+        if (state.player !== g.player) {
+          state.player = g.player;
+          refreshHud();
+          console.log('[Comet] 玩家实例已更新（进入/切换世界）');
+        }
+        return;
+      }
+      if (state.game && state.game.player && state.game.player !== state.player) {
+        state.player = state.game.player;
+        refreshHud();
+      }
+    } catch (e) { /* noop */ }
+  }
+
   function pollRef(tries) {
     if (state.player) return;
     const found = tryGlobalMount() || scanWindow();
@@ -611,12 +677,22 @@
   let lastTargetAt = 0;
   let respawnAt = 0;
 
+  const AURA_TARGET_COUNT = (() => {
+    const m = MODULES.find((x) => x.id === 'aura');
+    const s = m && m.settings.find((x) => x.id === 'targets');
+    return s && Array.isArray(s.options) ? s.options.length : 0;
+  })();
+
   function isCombatTarget(e) {
     try {
       const sel = getS('aura', 'targets');
-      const cls = (e.constructor && e.constructor.name) || '';
-      const key = e.type === 'player' ? '玩家' : ((e.T && e.T.cn) || cnName(e));
-      if (Array.isArray(sel) && sel.length) return sel.indexOf(key) !== -1 || sel.indexOf(cls) !== -1;
+      if (Array.isArray(sel) && sel.length) {
+        // 全选 = 所有生物（含清单外的铁傀儡等）
+        if (AURA_TARGET_COUNT && sel.length >= AURA_TARGET_COUNT) return true;
+        const cls = (e.constructor && e.constructor.name) || '';
+        const key = e.type === 'player' ? '玩家' : ((e.T && e.T.cn) || cnName(e));
+        return sel.indexOf(key) !== -1 || sel.indexOf(cls) !== -1;
+      }
       if (e.type === 'player') return getS('aura', 'players') !== false;
       if (e.T) return !!e.T.hostile;
     } catch (err) { /* noop */ }
@@ -704,6 +780,38 @@
   }
 
   // ---------- 移动类模块：飞行 / 加速 / 上台阶 / 免摔伤 ----------
+  let flyTapAt = 0;
+  function installFlyKeys() {
+    if (W.__cometFlyKeys) return;
+    W.__cometFlyKeys = true;
+    W.addEventListener('keydown', (e) => {
+      try {
+        if (!modOn('fly')) return;
+        if (e.code !== 'Space' && e.keyCode !== 32) return;
+        if (e.repeat) return;
+        const g = state.game, p = state.player;
+        if (!g || !p) return;
+        // 创造 / 旁观模式游戏本身就支持双击空格，交给原版处理，避免互相抵消
+        if (g.mode === 'creative' || g.mode === 'spectator') return;
+        // 聊天 / 背包 / 面板打开时不抢空格
+        if (g.ui && g.ui.screen) return;
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+        const now = performance.now();
+        if (now - flyTapAt < 300) {
+          // 原版创造飞行：双击空格切换；关闭时自然下坠
+          p.flying = !p.flying;
+          if (p.vel) p.vel[1] = 0;
+          p.gliding = false;
+          p.fallDist = 0;
+          flyTapAt = 0;
+        } else {
+          flyTapAt = now;
+        }
+      } catch (err) { /* noop */ }
+    }, true);
+  }
+
   function ensureFlyHook(p) {
     if (p.__cometFlyHook) return;
     try {
@@ -711,10 +819,28 @@
       while (o && !d) { d = Object.getOwnPropertyDescriptor(o, 'creative'); o = Object.getPrototypeOf(o); }
       if (!d || typeof d.get !== 'function') return;
       const orig = d.get;
-      // 物理层的飞行需要 creative；这里只对本地玩家实例放开，不动全局模式
+
+      // 飞行物理需要 creative，但 HUD 的血条 / 饥饿值只在 !creative 时绘制。
+      // 所以只在 Player.tick 执行期间把 creative 当 true 用，tick 之外照常按真实模式，
+      // 这样开着飞行也不会把血条和物品栏吃掉。
+      let proto = Object.getPrototypeOf(p);
+      while (proto && !Object.getOwnPropertyDescriptor(proto, 'tick')) proto = Object.getPrototypeOf(proto);
+      if (proto && !proto.__cometTickFly) {
+        const ot = proto.tick;
+        if (typeof ot === 'function') {
+          proto.tick = function (input) {
+            let on = false;
+            try { on = modOn('fly'); } catch (e) { /* noop */ }
+            if (on) this.__cometTick = true;
+            try { return ot.call(this, input); } finally { if (on) this.__cometTick = false; }
+          };
+          proto.__cometTickFly = true;
+        }
+      }
+
       Object.defineProperty(p, 'creative', {
         configurable: true,
-        get() { try { if (modOn('fly')) return true; } catch (e) { /* noop */ } return orig.call(this); },
+        get() { try { if (this.__cometTick) return true; } catch (e) { /* noop */ } return orig.call(this); },
       });
       p.__cometFlyHook = true;
     } catch (e) { /* noop */ }
@@ -723,12 +849,11 @@
   function tickMovement(g, p) {
     if (modOn('fly')) {
       ensureFlyHook(p);
-      p.flying = true;
-      p.__cometFlyForced = true;
-      p.fallDist = 0;
-      p.gliding = false;
-    } else if (p.__cometFlyForced) {
-      p.__cometFlyForced = false;
+      installFlyKeys();
+      p.__cometFlyOn = true;
+      if (p.flying) { p.fallDist = 0; p.gliding = false; }
+    } else if (p.__cometFlyOn) {
+      p.__cometFlyOn = false;
       p.flying = false;
     }
 
@@ -757,7 +882,55 @@
     }
   }
 
+  // 刀刀暴击：攻击瞬间伪造“下落中 + 未落地 + 蓄力拉满”，让游戏判定暴击（伤害 ×1.5）
+  function ensureCritHook(g) {
+    if (g.__cometCritHook || typeof g.attack !== 'function') return;
+    const oa = g.attack;
+    g.attack = function () {
+      const p = state.player;
+      if (!modOn('crit') || this !== state.game || !p) return oa.apply(this, arguments);
+      const s = { og: p.onGround, iw: p.inWater, vy: p.vel ? p.vel[1] : 0 };
+      p.onGround = false;
+      p.inWater = false;
+      if (p.vel) p.vel[1] = -0.1;
+      p.attackT = 1e3; // attackStrength 拉满，str = 1
+      try {
+        return oa.apply(this, arguments);
+      } finally {
+        p.onGround = s.og;
+        p.inWater = s.iw;
+        if (p.vel) p.vel[1] = s.vy;
+        if ((p.attackT || 0) > 100) p.attackT = 0;
+      }
+    };
+    g.__cometCritHook = true;
+  }
+
+  // 自动进食：饥饿值低于阈值且手持食物时，替玩家按住"右键"
+  function tickAutoEat(g, p) {
+    try {
+      const keep = p.__cometEat;
+      const threshold = getS('autoeat', 'threshold') ?? 16;
+      const held = p.inv && p.inv.held;
+      let isFood = false;
+      if (held && typeof W.itemDef === 'function') {
+        const d = W.itemDef(held.id);
+        isFood = !!(d && d.food);
+      }
+      const hungry = typeof p.food === 'number' && p.food < threshold;
+      if (modOn('autoeat') && hungry && isFood) {
+        if (!keep) p.__cometEat = { prev: !!(g.mouseBtn && g.mouseBtn[2]) };
+        if (g.mouseBtn) g.mouseBtn[2] = true;
+        if (typeof g.useCd === 'number') g.useCd = 0;
+      } else if (keep) {
+        if (g.mouseBtn) g.mouseBtn[2] = !!keep.prev;
+        p.__cometEat = null;
+      }
+    } catch (e) { /* noop */ }
+  }
+
   function tickModules() {
+    syncRefs();
     const g = state.game, p = state.player;
     if (!g || !p) return;
     if (g.state && g.state !== 'play') return;
@@ -771,6 +944,19 @@
     }
 
     tickMovement(g, p);
+
+    if (modOn('crit')) ensureCritHook(g);
+    if (modOn('autojump')) {
+      try {
+        if (!p.__cometAutoJump) p.__cometAutoJump = { v: !!(g.settings && g.settings.autoJump) };
+        if (g.settings) g.settings.autoJump = true;
+      } catch (e) { /* noop */ }
+    } else if (p.__cometAutoJump) {
+      try { if (g.settings) g.settings.autoJump = p.__cometAutoJump.v; } catch (e) { /* noop */ }
+      p.__cometAutoJump = null;
+    }
+    tickAutoEat(g, p);
+    if (modOn('waterbreath') && p.air > 0 && (p.inWater || p.eyeInWater)) p.air = 300;
 
     // 破坏类：快速破坏（加速挖掘进度）/ 瞬间破坏（开始挖就炸掉）
     if (modOn('fastbreak') || modOn('instantbreak')) {
@@ -1911,7 +2097,7 @@
     if (s.type === 'multi') {
       const cur = Array.isArray(getS(m.id, s.id)) ? getS(m.id, s.id) : [];
       const box = mk('div', 'cm-select');
-      box.append(mk('span', 'cm-sk', cur.length ? cur.length + ' 项' : '全部'));
+      box.append(mk('span', 'cm-sk', cur.length ? (cur.length >= opts.length ? '全部' : cur.length + ' 项') : '默认'));
       box.append(mk('span', 'cm-arrow', '▾'));
       row.append(box);
       box.addEventListener('mousedown', (ev) => {
