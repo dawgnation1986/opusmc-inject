@@ -7,7 +7,7 @@ const Sound = {
   ctx: null, master: null, sfx: null, noiseBuf: null,
   volume: 0.8, listener: { x: 0, y: 0, z: 0, yaw: 0 },
   init() {
-    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    if (this.ctx) { if (this.idle) this.wake(); else if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
     // iPhones: web audio follows the ring / silent switch unless the page says it plays media (iOS 16.4+), or plays
     // through an <audio> element once (older) - with the switch on silent the game had no sound while videos did
     try {
@@ -28,6 +28,7 @@ const Sound = {
     const d = this.noiseBuf.getChannelData(0);
     for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
     if (this.packReady && this.predecode) this.predecode();
+    this.watch();
   },
   setVolume(v) { this.volume = v; if (this.sfx) this.sfx.gain.value = v; },
   // spatial output node
@@ -51,7 +52,7 @@ const Sound = {
     return g;
   },
   noise(pos, { dur = 0.15, vol = 0.5, type = 'bandpass', freq = 1000, q = 1, freqEnd, attack = 0.005, delay = 0 }) {
-    if (!this.ctx) return;
+    if (!this.ctx || this.idle) return;
     const c = this.ctx, o = this.out(pos, vol); if (!o) return;
     const t = c.currentTime + delay;
     const src = c.createBufferSource(); src.buffer = this.noiseBuf;
@@ -63,7 +64,7 @@ const Sound = {
     src.start(t, Math.random() * 1.5); src.stop(t + dur + 0.05);
   },
   tone(pos, { freq = 440, freqEnd, dur = 0.2, vol = 0.3, type = 'sine', attack = 0.01, delay = 0, dest }) {
-    if (!this.ctx) return;
+    if (!this.ctx || this.idle) return;
     const c = this.ctx, o = dest || this.out(pos, vol); if (!o) return;
     const t = c.currentTime + delay;
     const osc = c.createOscillator(); osc.type = type; osc.frequency.setValueAtTime(freq, t);
@@ -211,6 +212,7 @@ Object.assign(Sound, {
     if (!this.ctx || !this.packReady) return false;
     const list = SOUNDS.events[event];
     if (!list || !list.length) return false;
+    if (this.idle) return true; // (asleep: dropped, not queued - Sound.sleep)
     if (this.onPlay) this.onPlay(event, pos, vol); // (subtitles)
     let total = 0; for (const s of list) total += s.weight || 1;
     let r = Math.random() * total, pick = list[0];
@@ -266,7 +268,7 @@ Sound.loops = new Set();
 Sound.loop = function (event) {
   const S = this, h = { update() {}, stop() {} };
   const list = window.SOUNDS && SOUNDS.events[event];
-  if (!S.ctx || !S.packReady || !list || !list.length) return h;
+  if (!S.ctx || !S.packReady || !list || !list.length || S.idle) return h;
   const pick = list[0], c = S.ctx, g = c.createGain(), pan = c.createStereoPanner ? c.createStereoPanner() : null;
   g.gain.value = 0;
   if (pan) { g.connect(pan); pan.connect(S.sfx); } else g.connect(S.sfx);
@@ -292,9 +294,28 @@ Sound.loop = function (event) {
   h.stop = () => { if (dead) return; dead = true; h.live = false; S.loops.delete(h); if (src) try { src.stop(); } catch (e) { } g.disconnect(); };
   h.stale = () => performance.now() - last > 500;
   S.loops.add(h);
-  if (!S.loopSweep) S.loopSweep = setInterval(() => { for (const l of S.loops) if (l.stale()) l.stop(); }, 250);
+  // (the sweep runs only while there are loops: it went on 4 times a second for good after the first minecart ride)
+  if (!S.loopSweep) S.loopSweep = setInterval(() => { for (const l of S.loops) if (l.stale()) l.stop(); if (!S.loops.size) { clearInterval(S.loopSweep); S.loopSweep = 0; } }, 250);
   return h;
 };
+
+// ---- the audio device asleep while nothing can be heard: the page hidden, or a pausing screen over a frozen world
+// (single player) for 5 s with no loop playing. A running AudioContext keeps the audio output and its thread going,
+// silent or not - battery on a phone. One-shot sounds meanwhile are dropped (they would all come at once on waking);
+// a tap or key (Sound.init: a menu button's click plays), the world going on or the page shown again wake it ----
+Object.assign(Sound, {
+  idle: null, pauseT: 0,
+  sleep(why) { if (this.idle || !this.ctx) return; this.idle = why; try { this.ctx.suspend().catch(() => { }); } catch (e) { } },
+  wake() { if (!this.idle) return; this.idle = null; this.pauseT = performance.now(); try { this.ctx.resume().catch(() => { }); } catch (e) { } },
+  watch() {
+    document.addEventListener('visibilitychange', () => { if (document.hidden) this.sleep('hidden'); else if (this.idle === 'hidden') this.wake(); });
+    setInterval(() => {
+      const g = typeof game !== 'undefined' && game, sc = g && g.ui && g.ui.screen, now = performance.now();
+      if (!(g && g.state === 'play' && sc && sc.pauses && !g.net && !g.p2pHost && !g.p2pGuest)) { this.pauseT = now; if (this.idle === 'pause') this.wake(); return; }
+      if (!this.idle && !this.loops.size && now - this.pauseT > 5000) this.sleep('pause');
+    }, 1000);
+  },
+});
 
 (() => {
   const S = Sound, wrap = (name, fn) => { const orig = S[name]; S[name] = function (...a) { if (fn.apply(this, a) !== false) return; return orig.apply(this, a); }; };

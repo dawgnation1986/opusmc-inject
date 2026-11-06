@@ -74,7 +74,7 @@ class ItemFrame extends Hanging {
   // comparators behind a frame read its rotation
   get comparator() { return this.item ? this.rot + 1 : 0; }
   drawSelf(g, ip, a, env, l) {
-    const r = g.renderer, isMap = this.item && ITEMS[this.item.id].key === 'filled_map', glow = this.type === 'glow_item_frame';
+    const r = g.renderer, isMap = !!this.item && !!ITEMS[this.item.id] && ITEMS[this.item.id].key === 'filled_map', glow = this.type === 'glow_item_frame';
     const D = DIRS[this.face], [bx, by, bz] = this.block;
     const m = M4.create(); M4.translate(m, bx + 0.5, by + 0.5, bz + 0.5); faceRot(m, this.face);
     const lt = glow ? [1, 1] : l;
@@ -147,8 +147,9 @@ class ArmorStand extends Entity {
   interact(p, held) {
     const g = this.game;
     if (held) {
-      const ar = ITEMS[held.id].armor;
-      const slot = ar ? 3 - ar.slot : /_(head|skull)$|^carved_pumpkin$/.test(ITEMS[held.id].key) ? 3 : this.arms ? 4 : -1;
+      const d = ITEMS[held.id]; if (!d) return false; // (an id not in ITEMS: nothing, instead of throwing)
+      const ar = d.armor;
+      const slot = ar ? 3 - ar.slot : /_(head|skull)$|^carved_pumpkin$/.test(d.key) ? 3 : this.arms ? 4 : -1;
       if (slot < 0) return false;
       const old = this.gear[slot];
       this.gear[slot] = { ...held, count: 1 }; useOne(g, p);
@@ -203,7 +204,7 @@ class ArmorStand extends Entity {
   };
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
-    const p = this.player, w = this.world, held = p.inv.held, t = this.target, k = held && ITEMS[held.id].key;
+    const p = this.player, w = this.world, held = p.inv.held, t = this.target, k = held && ITEMS[held.id] && ITEMS[held.id].key;
     if (t && !this.targetEntity && (k === 'item_frame' || k === 'glow_item_frame' || k === 'painting' || k === 'armor_stand')) {
       const D = DIRS[t.face], x = t.pos[0] + D[0], y = t.pos[1] + D[1], z = t.pos[2] + D[2];
       if (k === 'armor_stand') {
@@ -371,7 +372,8 @@ if (typeof WORKSTATIONS !== 'undefined') { WORKSTATIONS.loom = (g, pos, b) => ne
   UI.prototype.itemLines = function (st) {
     const lines = _il.call(this, st);
     if (st && st.patterns && st.patterns.length) for (const [p, c] of st.patterns) lines.splice(1, 0, { text: patternName(p, c), color: '#AAAAAA' });
-    if (st && ITEMS[st.id].key === 'painting' && st.pv) { const v = PAINTINGS.find(q => q.key === st.pv); if (v) lines.push({ text: v.title, color: '#FFFF55' }, { text: v.author, color: '#AAAAAA' }); }
+    // (an id not in ITEMS - telemetry 11-02/03 - has no painting line, instead of throwing)
+    if (st && st.pv && ITEMS[st.id] && ITEMS[st.id].key === 'painting') { const v = PAINTINGS.find(q => q.key === st.pv); if (v) lines.push({ text: v.title, color: '#FFFF55' }, { text: v.author, color: '#AAAAAA' }); }
     return lines;
   };
 })();
@@ -429,8 +431,9 @@ class SignScreen {
 (() => {
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
-    const p = this.player, t = this.target, held = p.inv.held, k = held && ITEMS[held.id].key;
-    if (t && !this.targetEntity && !p.sneaking && /sign$/.test(BLOCKS[t.id].key) && !this.net) {
+    // (a held id not in ITEMS, a block id not in BLOCKS - a server's: nothing of this, instead of throwing)
+    const p = this.player, t = this.target, held = p.inv.held, k = held && ITEMS[held.id] && ITEMS[held.id].key;
+    if (t && !this.targetEntity && !p.sneaking && BLOCKS[t.id] && /sign$/.test(BLOCKS[t.id].key) && !this.net) {
       const [x, y, z] = t.pos, s = this.signAt(x, y, z), side = s[signSideKey(this, x, y, z)];
       const pos = [x + 0.5, y + 0.5, z + 0.5];
       if (s.wax) { Sound.ev('block.sign.waxed_interact_fail', pos, 1, 1); p.swing(); return; }

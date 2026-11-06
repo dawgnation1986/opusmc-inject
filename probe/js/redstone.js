@@ -164,7 +164,7 @@ RS.process = function (g) {
 };
 
 // ---- dust ----
-function isDotMeta(id, m) { const s = BLOCKS[id].states[m]; return !!s && s.north === 'none' && s.south === 'none' && s.east === 'none' && s.west === 'none'; }
+function isDotMeta(id, m) { const s = BLOCKS[id] && BLOCKS[id].states && BLOCKS[id].states[m]; return !!s && s.north === 'none' && s.south === 'none' && s.east === 'none' && s.west === 'none'; }
 // what dust turns toward (vanilla shouldConnectTo)
 function connectsTo(g, x, y, z, dir) {
   const w = g.world, id = w.getBlock(x, y, z), k = rsk(id), m = w.getMeta(x, y, z);
@@ -947,7 +947,10 @@ const RS_USE = {
   },
   // dust: a cross becomes a dot and back (only while nothing joins it)
   wire(g, x, y, z) {
-    const w = g.world, id = w.getBlock(x, y, z), m = w.getMeta(x, y, z), st = BLOCKS[id].states[m];
+    // (game.js picks the use by the target's remembered block, t.id: dust gone from there since - washed away, broken
+    // by the same tick's update - left air, and air's missing states threw 'reading 0', telemetry 11-02/03)
+    const w = g.world, id = w.getBlock(x, y, z), m = w.getMeta(x, y, z), st = isWire(id) && BLOCKS[id].states && BLOCKS[id].states[m];
+    if (!st) return false;
     const cross = RS_H.every(d => st[d] === 'side'), dot = isDotMeta(id, m);
     if (!cross && !dot) return false;
     const side = {}; for (const d of RS_H) side[d] = cross ? 'none' : 'side';

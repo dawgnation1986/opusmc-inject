@@ -582,13 +582,42 @@ Game.prototype.drawVMob = function (e, ip, a, env, l) {
   };
 })();
 
-// a mob drawn into a small picture for a screen (the horse's inventory), turned toward the mouse like vanilla's
+// a mob drawn into a small picture for a screen (the horse's inventory), turned toward the mouse like vanilla's.
+// Read back like main.js's playerPreview: into a pixel buffer, fenced, copied out once the GPU is past it (the first
+// picture at once) - a plain readPixels made the CPU wait for the whole frame, the world behind the screen included,
+// each time the mouse moved. The key: what changes the picture (JSON of saveData each frame took in a donkey's whole
+// chest, and breedCd, counting down every tick, drew the horse again each tick)
+const mobLookKey = (e) => {
+  const st = (s) => s ? s.id + ':' + (s.color ?? '') : '';
+  return [e.type, e.variant, e.baby ? 1 : 0, e.saddled ? 1 : 0, e.rider ? 1 : 0, st(e.armorItem), e.chest ? 1 : 0, st(e.carpet), e.sit ? 1 : 0, e.sitting ? 1 : 0, e.cvar ?? '', e.sheared ? 1 : 0].join('/');
+};
 Renderer.prototype.mobPreview = function (game, e, ui, x, y, w, h) {
   const gl = this.gl, S = Math.max(2, ui.scale), W = w * S, H = h * S;
-  const key = e.id + ',' + Math.round(ui.mouse.x / 2) + ',' + Math.round(ui.mouse.y / 2) + ',' + W + ',' + H + ',' + JSON.stringify(e.saveData ? e.saveData() : 0);
+  const key = e.id + ',' + Math.round(ui.mouse.x / 2) + ',' + Math.round(ui.mouse.y / 2) + ',' + W + ',' + H + ',' + mobLookKey(e);
+  // (asked for every frame while its screen is open: a gap means the screen was opened again)
+  const now = performance.now(), gap = this.mpv ? now - (this.mpv.at || 0) : 1e9;
+  if (this.mpv) this.mpv.at = now;
+  if (this.mpv && this.mpv.sync && this.mpv.W === W && this.mpv.H === H) {
+    const pv = this.mpv;
+    if (pv.eid !== e.id) { gl.deleteSync(pv.sync); pv.sync = null; pv.key = null; } // (another mob's picture on its way: not wanted)
+    else {
+      if (gl.getSyncParameter(pv.sync, gl.SYNC_STATUS) !== gl.SIGNALED) return pv.cv;
+      gl.deleteSync(pv.sync); pv.sync = null;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pv.pbo);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, pv.px);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      for (let r = 0; r < H; r++) pv.img.data.set(pv.px.subarray((H - 1 - r) * W * 4, (H - r) * W * 4), r * W * 4);
+      pv.ctx.putImageData(pv.img, 0, 0);
+      pv.key = pv.pendingKey;
+    }
+  }
   if (this.mpv && this.mpv.key === key) return this.mpv.cv;
   if (!this.mpv || this.mpv.W !== W || this.mpv.H !== H) {
-    if (this.mpv) { gl.deleteFramebuffer(this.mpv.fb); gl.deleteTexture(this.mpv.tex); gl.deleteRenderbuffer(this.mpv.rb); }
+    if (this.mpv) {
+      gl.deleteFramebuffer(this.mpv.fb); gl.deleteTexture(this.mpv.tex); gl.deleteRenderbuffer(this.mpv.rb);
+      if (this.mpv.pbo) gl.deleteBuffer(this.mpv.pbo);
+      if (this.mpv.sync) gl.deleteSync(this.mpv.sync);
+    }
     const fb = gl.createFramebuffer(), tex = gl.createTexture(), rb = gl.createRenderbuffer();
     gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, W, H);
@@ -596,7 +625,9 @@ Renderer.prototype.mobPreview = function (game, e, ui, x, y, w, h) {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
     const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
-    this.mpv = { fb, tex, rb, W, H, cv, ctx: cv.getContext('2d'), px: new Uint8Array(W * H * 4), img: cv.getContext('2d').createImageData(W, H) };
+    const pbo = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo); gl.bufferData(gl.PIXEL_PACK_BUFFER, W * H * 4, gl.STREAM_READ); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    this.mpv = { fb, tex, rb, pbo, W, H, cv, ctx: cv.getContext('2d'), px: new Uint8Array(W * H * 4), img: cv.getContext('2d').createImageData(W, H), first: true };
   }
   const pv = this.mpv;
   gl.bindFramebuffer(gl.FRAMEBUFFER, pv.fb);
@@ -614,12 +645,25 @@ Renderer.prototype.mobPreview = function (game, e, ui, x, y, w, h) {
   try { e.drawVM(game, this, m, 1, env, [1, 0], null); } catch (err) { }
   e.headYaw = hy; e.pitch = pt; e.limbAmt = la;
   this.vp = savedVP; this.camPos = savedCam;
-  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, pv.px);
-  for (let r = 0; r < H; r++) pv.img.data.set(pv.px.subarray((H - 1 - r) * W * 4, (H - r) * W * 4), r * W * 4);
-  pv.ctx.putImageData(pv.img, 0, 0);
+  const done = e.texKey && e.texKey(this) ? key : null; // (drawn again once its texture has loaded)
+  if (pv.first || pv.eid !== e.id || gap > 500) {
+    // the first picture of a screen (another mob, or opened again) is read at once: never a frame of the last one
+    pv.first = false;
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, pv.px);
+    for (let r = 0; r < H; r++) pv.img.data.set(pv.px.subarray((H - 1 - r) * W * 4, (H - r) * W * 4), r * W * 4);
+    pv.ctx.putImageData(pv.img, 0, 0);
+    pv.key = done;
+  } else {
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pv.pbo);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    pv.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    pv.pendingKey = done;
+  }
+  pv.eid = e.id; pv.at = now;
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-  pv.key = e.texKey && e.texKey(this) ? key : null; // drawn again once its texture has loaded
   return pv.cv;
 };
 

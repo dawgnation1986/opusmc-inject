@@ -798,7 +798,15 @@ class Armadillo extends VMob {
     const p = this.game.player;
     if (this.lastHurtT && this.age - this.lastHurtT < 100) return true;
     if (!p.creative && this.distTo(p) < 7 && (p.sprinting || p.vehicle || p.flying)) return true;
-    return this.game.entities.some(e => e !== this && e instanceof Mob && (ENTITY_TAGS.undead.includes(e.type)) && e.distTo(this) < 7);
+    // (the distance before the list of undead, squared and in a plain loop: each tick it ran the 17-name list for every
+    // mob of the world - with a few armadillos among ~120 mobs 2-3% of the game tick, 2026-11-04)
+    const x = this.pos[0], y = this.pos[1], z = this.pos[2];
+    for (const e of this.game.entities) {
+      if (e === this || !(e instanceof Mob)) continue;
+      const dx = e.pos[0] - x, dy = e.pos[1] - y, dz = e.pos[2] - z;
+      if (dx * dx + dy * dy + dz * dz < 49 && ENTITY_TAGS.undead.includes(e.type)) return true;
+    }
+    return false;
   }
   roll(st) { this.st = st; this.stT = 0; this.anims = { [st]: this.age }; }
   think(c) {

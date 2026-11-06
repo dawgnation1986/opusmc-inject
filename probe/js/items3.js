@@ -42,7 +42,7 @@ function bundleTake(b) { if (!b.bundle || !b.bundle.length) return null; const s
     const lines = _il.call(this, st);
     if (isBundle(st)) {
       const c = st.bundle || [];
-      for (const x of c.slice(0, 8)) lines.push({ text: ITEMS[x.id].cn + ' x' + x.count, color: '#AAAAAA' });
+      for (const x of c.slice(0, 8)) lines.push({ text: (ITEMS[x.id] ? ITEMS[x.id].cn : '未知物品') + ' x' + x.count, color: '#AAAAAA' }); // (an id not in ITEMS: no throw)
       if (c.length > 8) lines.push({ text: '以及 ' + (c.length - 8) + ' 个物品…', color: '#AAAAAA' });
       const f = Math.round(bundleFill(st));
       lines.push({ text: c.length ? f + '/64' : '空', color: f >= 64 ? '#FF5555' : '#AAAAAA' });

@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------------------
 Renderer.prototype.initModels2 = function () {
   const M = this.models;
-  const P = (tw, th, parts) => { for (const p of parts) p.mesh = this.makeModelPart(p.boxes, tw, th); return { parts }; };
+  const P = (tw, th, parts) => ({ parts: this.packParts(parts, tw, th) }); // (one VAO a model: render.js packParts)
   M.enderman = P(64, 32, [
     { name: 'head', pivot: [0, 38, 0], boxes: [[0, 0, -4, 0, -4, 8, 8, 8]] },
     { name: 'jaw', pivot: [0, 38, 0], boxes: [[0, 16, -4, 0, -4, 8, 8, 8, -0.5]] },
@@ -68,28 +68,16 @@ Renderer.prototype.initModels2 = function () {
   this.spriteGL = this.makeDynamic();
 };
 
-// draw one model mesh with the entity program
+// draw one model mesh with the entity program (its uniforms through entBegin's cache, render.js ufState: setting them
+// here behind its back left the cache believing in values the program no longer had)
 Renderer.prototype.drawPart = function (mesh, texName, model, light, env, opts = {}) {
-  const gl = this.gl, E = this.fxOn ? this.fx.pEnt : this.progEnt;
-  gl.useProgram(E.p);
-  gl.uniformMatrix4fv(E.u.u_vp, false, opts.vp || this.vp);
-  gl.uniform3fv(E.u.u_cam, this.camPos);
-  gl.uniform2f(E.u.u_light, light[0], light[1]);
-  gl.uniform1f(E.u.u_day, env.day);
-  gl.uniform4fv(E.u.u_overlay, opts.overlay || [0, 0, 0, 0]);
-  gl.uniform3fv(E.u.u_tint, opts.tint || [1, 1, 1]);
-  gl.uniform3fv(E.u.u_fogColor, env.fogColor); gl.uniform2f(E.u.u_fog, env.fogNear, env.fogFar);
-  gl.uniform1f(E.u.u_gamma, this.gamma); gl.uniform3fv(E.u.u_nightTint, env.nightTint);
-  gl.uniform3fv(E.u.u_ambient, env.ambient || [0.08, 0.08, 0.08]); gl.uniform1f(E.u.u_bright, opts.bright ? 1 : 0); if (E.u.u_fade) gl.uniform1f(E.u.u_fade, 0);
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, this.entityTex[texName]);
-  gl.uniform1i(E.u.u_tex, 1);
-  if (E.u.u_lightmap) { gl.uniform1i(E.u.u_lightmap, 8); gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_2D, this.lightmapTex()); gl.activeTexture(gl.TEXTURE1); }
+  const gl = this.gl, E = this.entBegin(texName, light, env, opts);
   gl.uniformMatrix4fv(E.u.u_model, false, model);
   gl.bindVertexArray(mesh.vao);
-  if (this.shRec && !opts.vp) this.shRec.push({ vao: mesh.vao, n: mesh.n, m: new Float32Array(model), tex: this.entityTex[texName] });
-  if (!this.shRecOnly) gl.drawElements(gl.TRIANGLES, mesh.n * 1.5, gl.UNSIGNED_INT, 0);
-  gl.activeTexture(gl.TEXTURE0);
+  const off = mesh.off || 0; // (a part of a packed model: from its first quad)
+  if (this.shRec && !opts.vp) this.shRec.push({ vao: mesh.vao, n: mesh.n, off, m: new Float32Array(model), tex: this.entityTex[texName] });
+  if (!this.shRecOnly) gl.drawElements(gl.TRIANGLES, mesh.n * 1.5, gl.UNSIGNED_INT, off);
+  this.unit0();
 };
 
 // textured beam between two points (crystal healing, end gateway, beacons); added on, or blended ('alpha')

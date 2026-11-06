@@ -7,10 +7,12 @@
 
 // ---- frame pacing --------------------------------------------------------------------------------------
 // Vanilla's options: with VSync frames follow the display (requestAnimationFrame) and a limit below its rate
-// skips refreshes; without VSync frames are started back to back (MessageChannel, which browsers do not
-// throttle like timers), held to the limit by time, or not held at all (无限制). The browser still shows at
-// most one frame per refresh unless it was started with --disable-gpu-vsync --disable-frame-rate-limit; the
-// extra frames then only lower the input latency.
+// skips refreshes; without VSync frames sleep on a timer until they are due, held to the limit by time, or are
+// started back to back (无限制: MessageChannel, which browsers do not throttle like timers). The browser still
+// shows at most one frame per refresh unless it was started with --disable-gpu-vsync --disable-frame-rate-limit;
+// the extra frames then only lower the input latency. Phones and tablets always follow the display.
+// Vanilla's InactivityFpsLimiter (1.21.2+, "reduce FPS when: AFK", its default) on top: no input in play for a
+// minute -> at most 30, for ten minutes -> 10; and here a pausing screen over a frozen world -> at most 30.
 class FramePacer {
   constructor(game, frame) {
     this.g = game; this.frame = frame;
@@ -20,26 +22,80 @@ class FramePacer {
     this.rest = 2;              // the frame's main-thread time besides chunk work (EMA, ms)
     this.backoff = 1;           // < 1 for a while after frames that came late
     this.chunkMs = 0;           // chunk work done in the current frame
+    this.touch = typeof TouchDevice !== 'undefined' && (TouchDevice.kind === 'phone' || TouchDevice.kind === 'tablet');
     this.mc = new MessageChannel();
     this.mc.port1.onmessage = () => { this.mcWait = false; this.run(performance.now()); };
     this.rafCb = (t) => { this.rafWait = false; this.onRaf(t); };
-    this.timer = 0;
+    this.timer = 0; this.timerCb = () => { this.timer = 0; this.schedule(); };
+    this.due = 0; this.tdue = 0;  // when the next frame is due (VSync skipping refreshes / the timer without VSync)
+    // input, for the inactivity limit (vanilla counts keys, mouse buttons, the wheel and mouse moves; a finger or a key
+    // held down - the joystick held forward, flying with W - counts all the time it is down)
+    this.lastInput = performance.now(); this.keys = new Set(); this.buttons = 0; this.touches = 0;
+    this.capOn = false; this.cappedFrame = false; this.prevCapped = false; this.cappedT = -1e9; this.afkOn = false;
+    const opt = { capture: true, passive: true }, mark = () => this.input();
+    for (const t of ['mousemove', 'wheel', 'touchmove']) addEventListener(t, mark, opt);
+    addEventListener('keydown', (e) => { this.keys.add(e.code); mark(); }, opt);
+    addEventListener('keyup', (e) => { this.keys.delete(e.code); mark(); }, opt);
+    for (const t of ['mousedown', 'mouseup']) addEventListener(t, (e) => { this.buttons = e.buttons | 0; mark(); }, opt);
+    for (const t of ['touchstart', 'touchend', 'touchcancel']) addEventListener(t, (e) => { this.touches = e.touches ? e.touches.length : 0; mark(); }, opt);
+    addEventListener('blur', () => { this.keys.clear(); this.buttons = 0; this.touches = 0; });
   }
-  // frames per second the player asked for: 0 = unlimited (with VSync: the display's rate; a fixed 120 on a
-  // 165 Hz display would alternate 1 and 2 refreshes). Like vanilla, the title, loading and dimension
-  // screens run at most at 60
+  // (any input: keys, mouse, touches)
+  input() {
+    this.lastInput = performance.now();
+    // back from the inactivity limit at once: not waiting out the 33 / 100 ms frame interval that was running
+    if (this.afkOn) { this.afkOn = false; this.due = this.tdue = 0; if (this.timer) { clearTimeout(this.timer); this.timer = 0; this.schedule(); } }
+  }
+  // the inactivity stage: 0, 1 (a minute without input in play), 2 (ten minutes)
+  get afk() {
+    if (this.g.state !== 'play' || this.keys.size || this.buttons || this.touches) return 0;
+    const idle = performance.now() - this.lastInput;
+    return idle > 600000 ? 2 : idle > 60000 ? 1 : 0;
+  }
+  // a pausing screen over a world that stands still (single player: a room's world, or a local room's, goes on under
+  // it - net.js / p2p.js tick on). Not the end credits (dims.js): a pausing screen, but a scroll that has to stay smooth
+  frozen() {
+    const g = this.g, sc = g.ui && g.ui.screen;
+    return !!(sc && sc.pauses && !g.net && !g.p2pHost && !g.p2pGuest && !(typeof CreditsScreen === 'function' && sc instanceof CreditsScreen));
+  }
+  get hz() { return Math.round(1000 / this.refresh); }
+  // a phone or tablet whose display is faster than ~65 Hz: 60 unless the player chose more (the user, 11-03: 90/120 Hz
+  // ran the battery down and heated the phones, for frames the 3D world can rarely keep up with anyway)
+  get auto60() { return this.touch && this.refresh < 1000 / 65; }
+  // the limit in play (settings.maxFps): above 0 that limit; 0 (the default) the display's rate, 60 where auto60;
+  // -1 跟随屏幕 chosen: the display's rate on any device. 0 here = no limit (with VSync: the display's rate; a fixed
+  // 120 on a 165 Hz display would alternate 1 and 2 refreshes)
+  get playLimit() { const v = this.g.settings.maxFps; return v > 0 ? v : v !== -1 && this.auto60 ? 60 : 0; }
+  // the limit now: like vanilla the title, loading and dimension screens run at most at 60; in play the inactivity
+  // limit and a pausing screen over a frozen world lower it (capOn: one of them did)
   get limit() {
-    const v = this.g.settings.maxFps, lim = v === undefined ? 0 : v, st = this.g.state;
-    return st === 'play' ? lim : lim ? Math.min(lim, 60) : 60;
+    const lim = this.playLimit;
+    // (the frame-rate test, onboard.js FpsTestScreen: the display's own rate while it is the screen open)
+    if (this.g.state !== 'play') { this.capOn = this.afkOn = false; if (this.free && this.g.ui && this.g.ui.screen === this.free) return 0; return lim ? Math.min(lim, 60) : 60; }
+    const a = this.afk, cap = a === 2 ? 10 : a === 1 || this.frozen() ? 30 : 0;
+    this.afkOn = a > 0; this.capOn = !!cap && (!lim || lim > cap);
+    return this.capOn ? cap : lim;
   }
-  get vsync() { return this.g.settings.vsync !== false; }
+  get vsync() { return this.g.settings.vsync !== false || this.touch; }
   start() { this.schedule(); }
   schedule() {
-    if (this.vsync || document.hidden) { if (!this.rafWait) { this.rafWait = true; requestAnimationFrame(this.rafCb); } return; }
-    if (this.mcWait || this.timer) return;
-    const wait = this.limit ? this.last + 1000 / this.limit - performance.now() : 0;
-    // long waits sleep on a timer (it can fire up to ~1 ms late), the rest goes through the message loop
-    if (wait > 2) this.timer = setTimeout(() => { this.timer = 0; this.schedule(); }, wait - 1.5);
+    if (this.timer) return;
+    if (this.vsync || document.hidden) {
+      if (this.rafWait) return;
+      // a frame three refreshes or more away (the limits above) sleeps on a timer until a refresh and a half before
+      // it is due, instead of waking for every refresh it skips
+      // (the refresh is not measured across the sleep: those 22 / 89 ms gaps were a third of the samples at 180 Hz,
+      // 11-04, and a timer firing a little late leaves one rAF a frame - all gaps: a 120 Hz phone would read as 30 Hz)
+      const wait = this.due && !document.hidden ? this.due - performance.now() - this.refresh * 1.5 : 0;
+      if (wait > this.refresh * 1.5) { this.timer = setTimeout(this.timerCb, wait); this.lastRaf = 0; return; }
+      this.rafWait = true; requestAnimationFrame(this.rafCb); return;
+    }
+    if (this.mcWait) return;
+    // without VSync: a timer until ~0.5 ms before the frame is due, then one message (it ends the timers' nesting,
+    // which browsers stretch to 4 ms). Messages used to be posted back to back for the last 2 ms of each frame: a busy
+    // main thread, 88 ms a second at a limit of 60 and 158 at 144 (only 126 fps came), measured 11-03
+    const wait = this.tdue ? this.tdue - performance.now() - 0.5 : 0;
+    if (wait > 0) this.timer = setTimeout(this.timerCb, wait);
     else { this.mcWait = true; this.mc.port2.postMessage(0); }
   }
   onRaf(t) {
@@ -63,10 +119,17 @@ class FramePacer {
     this.run(t);
   }
   run(now) {
-    if (!this.vsync && this.limit && this.last && now - this.last < 1000 / this.limit - 0.25) { this.schedule(); return; }
+    const lim = this.limit;
+    if (!this.vsync && lim && this.tdue && now < this.tdue - 0.5) { this.schedule(); return; } // (woke early)
+    // the next frame's due time advances by the interval, so a timer firing a little late doesn't lower the rate
+    if (!this.vsync) { const iv = lim ? 1000 / lim : 0; this.tdue = !iv ? 0 : this.tdue && now - this.tdue < iv ? this.tdue + iv : now + iv; }
+    // a frame under a limit (or just after one: its interval was the limit's): the frame-time statistics, dynamic
+    // resolution, the heat fallback and the automatic quality leave it out
+    const capped = this.capOn; this.cappedFrame = capped || this.prevCapped; this.prevCapped = capped;
+    if (this.cappedFrame) this.cappedT = now;
     const dt = this.last ? now - this.last : 1000 / 60, target = this.target();
     // a frame that came late while chunk work was running: give chunk work less time for a while
-    if (this.last && dt > target * 1.5 && this.prevChunk > 0.3 && (this.vsync || this.limit)) this.backoff = Math.max(0.25, this.backoff * 0.7);
+    if (this.last && dt > target * 1.5 && this.prevChunk > 0.3 && (this.vsync || lim) && !this.cappedFrame) this.backoff = Math.max(0.25, this.backoff * 0.7);
     else this.backoff = Math.min(1, this.backoff + 0.01);
     this.last = now; this.chunkMs = 0;
     const t0 = performance.now();
@@ -105,19 +168,26 @@ const PerfMon = {
     DynRes.frame(g, dt, cpu);
   },
   // GPU time of whole frames (EXT_disjoint_timer_query_webgl2) while the overlay is open or a report runs
+  // (a lost context makes no queries - createQuery gives null and beginQuery threw on it, every frame - and the ones
+  // asked before never answer: dropped)
   gpuBegin(gl) {
     if (!this.gpuOn) return;
+    if (gl.isContextLost()) { this.queries.length = 0; this.cur = null; return; }
     const ext = this.ext !== undefined ? this.ext : (this.ext = gl.getExtension('EXT_disjoint_timer_query_webgl2'));
     if (!ext || this.queries.length > 4) return;
-    const q = gl.createQuery(); gl.beginQuery(ext.TIME_ELAPSED_EXT, q);
+    const q = gl.createQuery(); if (!q) return;
+    gl.beginQuery(ext.TIME_ELAPSED_EXT, q);
     this.cur = { q, i: this.i, gl };
   },
   gpuEnd() {
     if (!this.cur) return;
-    const gl = this.cur.gl; gl.endQuery(this.ext.TIME_ELAPSED_EXT);
+    const gl = this.cur.gl;
+    if (gl.isContextLost()) { this.cur = null; return; }
+    gl.endQuery(this.ext.TIME_ELAPSED_EXT);
     this.queries.push(this.cur); this.cur = null;
   },
   pollGpu() {
+    if (this.queries.length && this.queries[0].gl.isContextLost()) { this.queries.length = 0; return; }
     while (this.queries.length) {
       const c = this.queries[0], gl = c.gl;
       if (!gl.getQueryParameter(c.q, gl.QUERY_RESULT_AVAILABLE)) break;
@@ -238,7 +308,7 @@ const PerfMon = {
       `浏览器：${navigator.userAgent}`,
       `运行方式：${location.protocol === 'file:' ? '直接打开文件（file://，没有后台线程）' : '本地服务器 ' + location.host}；区块线程 ${g.chunkWorker && g.chunkWorker.ready && !g.chunkWorker.failed ? '可用' : '不可用'}，地形生成 ${typeof GenPool !== 'undefined' && GenPool.inline ? '在页面内' : (g.genPool ? g.genPool.workers.length : 0) + ' 个线程'}`,
       `画面：${r.canvas.width}x${r.canvas.height}，缩放 ${Math.round(r.resScale * 100)}%，设备像素比 ${devicePixelRatio}`,
-      `设置：画质 ${PRESET_NAMES[st.preset] || '自定义'}，渲染距离 ${st.renderDist}，光影 ${FX_NAMES[st.shaders || 0]}，图形 ${st.graphics === 'fast' ? '流畅' : '高品质'}，${P.vsync ? '垂直同步' : '无垂直同步'}，最大帧率 ${P.limit || '无限制'}`,
+      `设置：画质 ${PRESET_NAMES[st.preset] || '自定义'}，渲染距离 ${st.renderDist}，光影 ${FX_NAMES[st.shaders || 0]}，图形 ${st.graphics === 'fast' ? '流畅' : '高品质'}，${P.vsync ? '垂直同步' : '无垂直同步'}，最大帧率 ${P.playLimit || '无限制'}${st.maxFps > 0 ? '' : st.maxFps === -1 ? '（跟随屏幕）' : P.auto60 ? '（自动）' : ''}${P.afk ? '，无操作限制中' : ''}`,
       `状态：${g.state}，维度 ${g.dim}，已加载区块 ${g.world ? g.world.chunks.size : 0}，区段 ${r.sections.size}，可见 ${(r.visSections || []).length}`,
       ``,
       `统计 ${ms ? (ms / 1000).toFixed(0) + ' 秒' : '最近 ' + (s ? s.frames : 0) + ' 帧'}：${s ? s.frames : 0} 帧，平均 ${s ? s.fps.toFixed(1) : '-'} fps`,
@@ -284,42 +354,59 @@ const MemMon = {
 
 // ---- dynamic resolution ------------------------------------------------------------------------------
 // When frames come late but the main thread is not what holds them up, the GPU is: render fewer pixels
-// (down to 50 %), and give them back once frames are on time again. Judged a 1.5 s window at a time by the
-// window's median frame (one stutter or a little jitter decides nothing):
-// - late: the median frame over 1.15x the target while the median main-thread time is under 0.6x of it (with
-//   GPU timing, the overlay open: the GPU's own time over 0.9x). Two late windows in a row: 10 % fewer pixels;
-// - on time: the median within 1.05x. Two on-time windows in a row: 10 % more. A raise that is followed straight
-//   away by a drop is not tried again for 30 s (no see-sawing between two steps);
+// (down to 50 %), and give them back once frames are on time again. Judged a 1.5 s window at a time:
+// - slow: the window's mean frame over 1.12x the target, or over 15 % of its frames missed (over 1.5x). The median
+//   it used to go by hid a phone alternating one and two refreshes (half its frames late, the median on time);
+// - late (fewer pixels can help): slow while the mean main-thread time is under 0.8x of the target (with GPU
+//   timing, the overlay open: the GPU's own time over 0.9x). Two late windows in a row: 10 % fewer pixels. Slow but
+//   not late: cpuBound - the automatic quality (extras.js) then sees less far instead;
+// - a drop on trial: if the next two windows are not 7 % quicker the pixels were not it - the scale goes back, no
+//   drops for 60 s, cpuBound (a phone held up by its CPU went down to 50 % and stayed blurry for nothing);
+// - on time: the mean within 1.05x and under 5 % missed. Two on-time windows in a row: 10 % more. A raise that is
+//   followed straight away by a drop is not tried again for 30 s (no see-sawing between two steps);
 // - the target is the display's refresh (or the frame limit): with VSync off and no limit there's no frame
-//   rate to keep, so the display's rate stands in - 144 fps with no limit is not "slow";
+//   rate to keep, so the display's rate stands in - 144 fps with no limit is not "slow". Phones and tablets on the
+//   default limit never trade pixels for more than 60;
 // - a stall (a frame over 4x the target: a huge explosion, loading, the window hidden) drops the window it is in
-//   and the one after. It used to need 97 % of frames on time to come back up, which jitter alone kept from
-//   happening: after a stall (7000 TNT going off) the picture stayed blurry, and got blurrier while walking.
+//   and the one after; frames under a pausing screen or the inactivity limit (FramePacer.cappedFrame) don't count.
+//   It used to need 97 % of frames on time to come back up, which jitter alone kept from happening: after a stall
+//   (7000 TNT going off) the picture stayed blurry, and got blurrier while walking.
 const DynRes = {
-  scale: 1, t: 0, frames: 0, dts: [], cpus: [], slow: 0, good: 0, skip: 0, lastRaise: 0, noRaiseUntil: 0,
+  scale: 1, t: 0, n: 0, sum: 0, cpuSum: 0, miss: 0, slow: 0, good: 0, skip: 0, lastRaise: 0, noRaiseUntil: 0, noDropUntil: 0, cpuBound: false, trial: null,
   target(g) {
-    const P = g.pacer, lim = P.limit;
-    return P.vsync ? P.target() : lim ? 1000 / lim : P.refresh;
+    const P = g.pacer, lim = P.limit, v = g.settings.maxFps;
+    const T = P.vsync ? P.target() : lim ? 1000 / lim : P.refresh;
+    return P.touch && !(v > 0) && v !== -1 ? Math.max(T, 1000 / 60) : T;
   },
-  reset(g) { this.dts.length = this.cpus.length = 0; this.slow = this.good = 0; this.skip = 1; this.t = performance.now(); if (this.scale !== 1) this.set(g, 1); },
+  clear() { this.n = this.sum = this.cpuSum = this.miss = 0; this.t = performance.now(); },
+  reset(g) { this.clear(); this.slow = this.good = 0; this.skip = 1; this.trial = null; this.cpuBound = false; this.noDropUntil = 0; if (this.scale !== 1) this.set(g, 1); },
   frame(g, dt, cpu) {
-    if (!g.settings.dynRes || g.state !== 'play' || (g.ui.screen && g.ui.screen.pauses)) { if (this.scale !== 1 && !g.settings.dynRes) this.set(g, 1); this.t = performance.now(); this.dts.length = this.cpus.length = 0; return; }
+    if (!g.settings.dynRes || g.state !== 'play' || (g.ui.screen && g.ui.screen.pauses) || (g.pacer && g.pacer.cappedFrame)) { if (this.scale !== 1 && !g.settings.dynRes) this.set(g, 1); this.clear(); return; }
     const T = this.target(g);
-    if (dt > T * 4) { this.skip = 2; this.dts.length = this.cpus.length = 0; this.t = performance.now(); return; }
-    this.dts.push(dt); this.cpus.push(cpu);
+    if (dt > T * 4) { this.skip = 2; this.clear(); return; }
+    this.n++; this.sum += dt; this.cpuSum += cpu; if (dt > T * 1.5) this.miss++;
     const now = performance.now();
-    if (now - this.t < 1500 || this.dts.length < 30) return;
-    const med = (a) => { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
-    const mdt = med(this.dts), mcpu = med(this.cpus), gpu = PerfMon.gpuOn ? PerfMon.lastGpu : null;
-    this.t = now; this.dts.length = this.cpus.length = 0;
+    if (now - this.t < 1500 || this.n < 30) return;
+    const mean = this.sum / this.n, mcpu = this.cpuSum / this.n, miss = this.miss / this.n, gpu = PerfMon.gpuOn ? PerfMon.lastGpu : null;
+    this.clear();
     if (this.skip > 0) { this.skip--; return; }
-    const late = gpu != null ? gpu > T * 0.9 : mdt > T * 1.15 && mcpu < T * 0.6;
-    const onTime = mdt <= T * 1.05 && (gpu == null || gpu < T * 0.75);
+    const slow = mean > T * 1.12 || miss > 0.15;
+    const late = gpu != null ? gpu > T * 0.9 : slow && mcpu < T * 0.8;
+    const onTime = mean <= T * 1.05 && miss < 0.05 && (gpu == null || gpu < T * 0.75);
+    const tr = this.trial;
+    if (tr) {
+      tr.sum += mean;
+      if (++tr.n < 2) return;
+      this.trial = null;
+      if (tr.sum / tr.n > tr.before * 0.93) { this.noDropUntil = now + 60000; this.cpuBound = true; this.slow = this.good = 0; this.set(g, tr.from); return; }
+    }
+    this.cpuBound = (slow && !late) || now < this.noDropUntil;
     this.slow = late ? this.slow + 1 : 0;
     this.good = onTime && !late ? this.good + 1 : 0;
-    if (this.slow >= 2 && this.scale > 0.5) {
+    if (this.slow >= 2 && this.scale > 0.5 && now >= this.noDropUntil) {
       // (a raise that didn't hold: leave the resolution alone for a while)
       if (now - this.lastRaise < 4000) this.noRaiseUntil = now + 30000;
+      this.trial = { from: this.scale, before: mean, n: 0, sum: 0 };
       this.slow = 0; this.good = 0; this.set(g, Math.max(0.5, Math.round((this.scale - 0.1) * 100) / 100));
     } else if (this.good >= 2 && this.scale < 1 && now >= this.noRaiseUntil) {
       this.good = 0; this.lastRaise = now; this.set(g, Math.min(1, Math.round((this.scale + 0.1) * 100) / 100));

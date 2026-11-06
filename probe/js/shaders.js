@@ -125,7 +125,7 @@ float ggx(vec3 n, vec3 V, vec3 L, float smoothG){
   float den = nh * nh * (rough - 1.0) + 1.0;
   float D = rough / (3.14159265 * den * den);
   float F = exp2((-5.55473 * lh - 6.98316) * lh) * 0.95 + 0.05;
-  float nlm = 1.0 - pow(1.0 - nl, 8.0);
+  float nlm = 1.0 - pow(max(1.0 - nl, 0.0), 8.0); // (nl can round past 1: pow of a negative is NaN on many GPUs)
   float sp = max(nlm * D * F / max(lh * lh, 0.01), 0.0);
   return sp / (0.125 * sp + 1.0);
 }
@@ -340,7 +340,13 @@ void main(){
     if (ov.a > 0.5) cls = ${PBR_GRASS};
   } else c = t.rgb * v_col.rgb;
   if (t.a < u_alphaTest) discard;
-  vec3 n = normalize(cross(dFdx(v_wpos), dFdy(v_wpos)));
+  // (a zero cross product - a sliver of a triangle, or far out where a phone's half precision loses the position's low
+  // bits - normalized to NaN; and a single NaN pixel spreads through the bloom chain into a black patch). The length
+  // squared goes as the pixel's size in blocks to the 4th: a wall a block away on a 2560 wide screen is ~1e-13, a
+  // spyglass far less - a cut at 1e-12 lit those walls as floors (the whole wall 42 levels off at FOV 10), so only
+  // what is next to zero is left out
+  vec3 nc = cross(dFdx(v_wpos), dFdy(v_wpos)); float nl2 = dot(nc, nc);
+  vec3 n = nl2 > 1e-30 ? nc * inversesqrt(nl2) : vec3(0.0, 1.0, 0.0);
   vec3 V = normalize(u_cam - v_wpos);
   if (dot(n, V) < 0.0) n = -n;
   // the mesher's shade is vanilla's face shading (top 1, north / south 0.8, east / west 0.6, bottom 0.5) times its
@@ -450,7 +456,8 @@ void main(){
   if (t.a < 0.1) discard;
   vec3 c = t.rgb * u_tint;
   c = mix(c, u_overlay.rgb, u_overlay.a);
-  vec3 n = normalize(v_n);
+  float nl2 = dot(v_n, v_n);
+  vec3 n = nl2 > 1e-12 ? v_n * inversesqrt(nl2) : vec3(0.0, 1.0, 0.0); // (a model's zero normal: no NaN, see FXCHUNK_FS)
   vec3 V = normalize(u_cam - v_wpos);
   if (dot(n, V) < 0.0) n = -n;
   // the hand is drawn around the camera at the origin: its light is the light where the camera is
@@ -708,6 +715,8 @@ void main(){
   if (u_misc.y > 0.5) c *= vec3(0.80, 0.87, 0.97) * 0.85;
   vec3 lin = pow(max(c, vec3(0.0)), vec3(2.2));
   if (u_useVol == 1 && !hand) lin += texture(u_vol, v_uv).rgb * (u_misc.y > 0.5 ? 0.25 : 1.0);
+  // a NaN (or infinite) pixel stops here: the bloom below spreads a single one into a black patch
+  lin = mix(vec3(0.0), lin, lessThan(abs(lin), vec3(1e30)));
   o = vec4(lin, bf);
 }`;
 // bloom: the whole image (not just bright parts) blurred over several scales and mixed in a little
@@ -1330,7 +1339,7 @@ class ShaderPack {
     gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(1.5, 3.0);
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
     const E = this.pEntShadow, S = this.pShadow, R2 = (D + 8) * (D + 8);
-    let cur = null;
+    let cur = null, vao = null;
     for (const d of rec) {
       const dx = d.m[12] - cam[0], dz = d.m[14] - cam[2];
       if (dx * dx + dz * dz > R2) continue;
@@ -1347,10 +1356,13 @@ class ShaderPack {
         }
         gl.uniformMatrix4fv(S.u.u_model, false, d.m);
       }
-      gl.bindVertexArray(d.vao); gl.drawElements(gl.TRIANGLES, d.n * 1.5, gl.UNSIGNED_INT, 0);
+      // (a packed model's parts share a VAO and start at their own quad: render.js packParts)
+      if (d.vao !== vao) { vao = d.vao; gl.bindVertexArray(vao); }
+      gl.drawElements(gl.TRIANGLES, d.n * 1.5, gl.UNSIGNED_INT, d.off || 0);
     }
     gl.disable(gl.POLYGON_OFFSET_FILL); gl.enable(gl.CULL_FACE);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, r.texArray);
+    r.tex1 = null; // (unit 1 holds the last skin drawn here, not the one render.js entBegin bound)
     this.entShadowOn = true;
   }
   drawShadowCascade(i, vp, at, D, size) {
@@ -1360,14 +1372,19 @@ class ShaderPack {
     gl.clear(gl.DEPTH_BUFFER_BIT);
     gl.uniformMatrix4fv(P.u.u_vp, false, vp);
     const planes = frustumPlanes(vp), R2 = (D * 1.42 + 24) * (D * 1.42 + 24);
+    const list = this.casList || (this.casList = []);
+    list.length = 0;
     for (const s of r.sections.values()) {
       if (!s.o) continue;
       const dx = s.x + 8 - at[0], dz = s.z + 8 - at[2];
       if (dx * dx + dz * dz > R2) continue;
       if (!aabbInFrustum(planes, s.x, s.y, s.z, s.x + 16, s.y + 16, s.z + 16)) continue;
-      gl.uniformMatrix4fv(P.u.u_model, false, s.m);
-      gl.bindVertexArray(s.o.vao); gl.drawElements(gl.TRIANGLES, s.n * 1.5, gl.UNSIGNED_INT, 0);
+      list.push(s);
     }
+    // by mesh page: depth only, the order changes nothing drawn, and each page's VAO binds once (render.js secDraw;
+    // in the sections' order it was a bind per section, ~1 000 for the far cascade)
+    list.sort((a, b) => a.o.a.pg.id - b.o.a.pg.id);
+    r.secDraw(P, list, true, false);
   }
   // before the translucent pass: snapshot colour + depth for reflections / the water's depth
   copyScene() {
@@ -1401,6 +1418,9 @@ class ShaderPack {
   end() {
     const r = this.r, gl = r.gl, cfg = this.cfg, [W, H] = this.size, A = this.A, env = this.env, game = this.game;
     r.fxOn = false;
+    // the passes below bind their own textures on units 0 - 5: whatever draws after them (previews, icons) binds the
+    // terrain / entity programs' textures again (render.js ufState / bindFrameTex: once an epoch)
+    r.ufEpoch = (r.ufEpoch || 0) + 1;
     if (!this.copied) this.copyScene();
     this.copied = false;
     gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.depthMask(false);

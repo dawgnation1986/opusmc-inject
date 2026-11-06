@@ -574,7 +574,7 @@ class CreditsScreen extends MenuScreen {
   layout() { }
   draw(ui) {
     const c = ui.ctx, now = performance.now(), dt = Math.min(100, now - this.last); this.last = now;
-    const fast = this.game.keys.Space || this.game.keys.ControlLeft;
+    const h = this.held || {}, fast = h.Space || h.ControlLeft || h.ControlRight;
     this.t += dt * (fast ? 0.12 : 0.025);
     c.fillStyle = '#000'; c.fillRect(0, 0, ui.w, ui.h);
     const x0 = Math.floor(ui.w / 2 - 137);
@@ -593,7 +593,22 @@ class CreditsScreen extends MenuScreen {
     if (y < -20) this.finish();
     Font.draw(c, '按住空格加速 · Esc 跳过', 4, ui.h - 12, '#555555');
   }
-  finish() { if (this.done) return; this.done = true; this.game.ui.screen = null; this.onDone(); }
-  key(ui, ev) { if (ev.key === 'Escape') { this.finish(); return true; } return true; }
+  finish() {
+    if (this.done) return; this.done = true;
+    removeEventListener('keyup', this.unhold); removeEventListener('blur', this.unhold);
+    this.game.ui.screen = null; this.onDone();
+  }
+  // (the touch close button: through onEsc - ui.close() left the player in the End)
+  onEsc() { this.finish(); }
+  // speeding up while space or ctrl is held (vanilla WinScreen): every key stops here, so game.keys never had them -
+  // the keys are kept here, let go of on keyup / leaving the window
+  key(ui, ev) {
+    if (ev.key === 'Escape') { this.finish(); return true; }
+    if (ev.code === 'Space' || ev.code === 'ControlLeft' || ev.code === 'ControlRight') {
+      if (!this.unhold) { this.unhold = (e) => { if (e.type === 'blur') this.held = {}; else if (this.held) delete this.held[e.code]; }; addEventListener('keyup', this.unhold); addEventListener('blur', this.unhold); }
+      (this.held || (this.held = {}))[ev.code] = true;
+    }
+    return true;
+  }
   mouseDown() { }
 }

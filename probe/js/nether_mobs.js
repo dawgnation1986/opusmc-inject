@@ -198,62 +198,77 @@ Game.prototype.fortressAt = function (x, z) {
   for (const s of refs.values()) if (s.name === 'fortress' && x >= s.box[0] && x <= s.box[3] && z >= s.box[2] && z <= s.box[5]) return s;
   return null;
 };
+// (magma cubes as vanilla's Slime.finalizeSpawn: size 1, 2 or 4 - createMob makes them all 4, the biggest)
+const netherMade = (m) => { if (m.type === 'magma_cube' && m.setSize) m.setSize([1, 2, 4][randInt(0, 2)]); };
+// a spot for a nether mob at this height, by vanilla's spawn rules there: a floor a mob may stand on below (not a light
+// block, magma only for the fireproof) and no solid block or fluid where it stands (striders: on the lava surface);
+// endermen and skeletons only in block light up to 7 (Monster.checkMonsterSpawnRules in the nether), piglins, hoglins and
+// zombified piglins never on nether wart blocks; the rest at any light. `roll`: ghasts pass one time in 20
+// (Ghast.checkGhastSpawnRules) - left out, ghasts came as often as anything else and four at a time: "恶魂一次刷三只",
+// "恶魂太多、刷得太快", feedback 2026-11-01..03
+function netherSpot(g, type, x, y, z, roll = true) {
+  const w = g.world, below = w.getBlock(x, y - 1, z), here = w.getBlock(x, y, z), up = w.getBlock(x, y + 1, z);
+  const room = (id) => id === 0 || (!BLOCKS[id].solid && !IS_FLUID[id] && !/fire$/.test(BLOCKS[id].key));
+  if (type === 'strider') return below === LAVA && here === 0;
+  if (!SOLIDCUBE[below] || EMIT[below] >= 14 || below === BID.magma_block && !MOB_TYPES[type].fireproof || !room(here) || !room(up)) return false;
+  if ((type === 'enderman' || type === 'skeleton' || type === 'wither_skeleton') && (w.getLight(x, y, z) & 15) > 7) return false;
+  if (/piglin|hoglin/.test(type) && below === BID.nether_wart_block) return false;
+  return !(roll && type === 'ghast' && Math.random() >= 1 / 20);
+}
 // one group from the fortress's spawn list, on a nether-brick floor of this column with room above; false if there is none
-Game.prototype.spawnFortressGroup = function (fort, x, z) {
+Game.prototype.spawnFortressGroup = function (fort, x, z, sp) {
   const w = this.world, def = self.STRUCT_DATA && STRUCT_DATA.structure.fortress, list = def && def.spawn_overrides && def.spawn_overrides.monster;
   if (!list) return false;
-  const spawns = list.spawns.filter(s => MOB_TYPES[s.type.replace('minecraft:', '')]);
+  // (inside the fortress's box, on its floors: as the spawnAttempt walk goes, of 4 mobs at most - a pack of 5 wither
+  // skeletons used to land inside 2 x 2 blocks)
+  const spot = (t, a, b, c) => w.getBlock(a, b - 1, c) === BID.nether_bricks && this.fortressAt(a, c) === fort && netherSpot(this, t, a, b, c);
   for (let y = Math.max(1, fort.box[1]); y <= fort.box[4]; y++) {
     if (w.getBlock(x, y - 1, z) !== BID.nether_bricks || w.getBlock(x, y, z) !== 0 || w.getBlock(x, y + 1, z) !== 0) continue;
-    if ((w.getLight(x, y, z) & 15) > 11) continue;
-    let r = Math.random() * spawns.reduce((t, s) => t + s.weight, 0), pick = spawns[0];
-    for (const s of spawns) { if ((r -= s.weight) < 0) { pick = s; break; } }
-    const type = pick.type.replace('minecraft:', ''), n = pick.minCount + Math.floor(Math.random() * (pick.maxCount - pick.minCount + 1));
-    // wither skeletons are 2.4 tall: a third block of room
-    if (type === 'wither_skeleton' && w.getBlock(x, y + 2, z) !== 0) continue;
-    for (let i = 0; i < n; i++) {
-      const m = createMob(this, type, x + 0.5 + (Math.random() - 0.5) * 2, y, z + 0.5 + (Math.random() - 0.5) * 2);
-      if (!m.collides(m.box())) this.entities.push(m);
-    }
+    const pick = spawnPickOf(list.spawns);
+    if (!pick || !spot(pick.type.replace('minecraft:', ''), x, y, z)) continue;
+    spawnAttempt(this, pick, x, y, z, sp, spot, () => spawnPickOf(list.spawns), netherMade);
     return true;
   }
   return false;
 };
+// Spawning in the nether by its biome lists, with the overworld's area, caps and spawn attempts (spawning.js spawnArea and
+// spawnAttempt): the cap here was 30 for every mob loaded anywhere, and a group came out all at one spot
 Game.prototype.spawnNetherV = function () {
-  const p = this.player, w = this.world;
   if (this.difficulty === 0) return;
-  const counts = {}; for (const e of this.entities) if (e instanceof Mob) counts[e.T.passive ? 'creature' : 'monster'] = (counts[e.T.passive ? 'creature' : 'monster'] || 0) + 1;
+  const sp = spawnArea(this);
+  if (!sp.n) return;
+  const counts = {};
+  for (const e of this.entities) { if (!(e instanceof Mob) || e.dead || spawnMustKeep(e) || !sp.has(e.pos[0], e.pos[2])) continue; const c = e.T.passive ? 'creature' : 'monster'; counts[c] = (counts[c] || 0) + 1; }
   for (let attempt = 0; attempt < 3; attempt++) {
-    const a = Math.random() * Math.PI * 2, d = 24 + Math.random() * 40;
-    const x = Math.floor(p.pos[0] + Math.sin(a) * d), z = Math.floor(p.pos[2] + Math.cos(a) * d);
-    if (!w.isLoaded(x, z)) continue;
-    const v = this.vbiomeAt(x, z);
+    const at = sp.pick();
+    if (!at || !sp.ok(at[0], at[1])) continue;
+    const [x, z] = at, v = this.vbiomeAt(x, z);
     if (!v || !v.def.spawners) continue;
+    const cat = Math.random() < 0.1 ? 'creature' : 'monster';
+    if ((counts[cat] || 0) >= Math.max(1, Math.round(SPAWN_CAPS[cat] * sp.scale))) continue;
     // inside a nether fortress, standing on its nether-brick floors, the fortress's own list replaces the biome's
     // (vanilla spawn_overrides, bounding box "piece"): blazes, wither skeletons, skeletons, magma cubes, piglins
-    const fort = (counts.monster || 0) < 30 && this.fortressAt(x, z);
-    if (fort && this.spawnFortressGroup(fort, x, z)) return;
-    const cat = Math.random() < 0.1 ? 'creature' : 'monster';
-    if ((counts[cat] || 0) >= (cat === 'monster' ? 30 : 8)) continue;
-    const list = (v.def.spawners[cat] || []).filter(s => MOB_TYPES[s.type.replace('minecraft:', '')]);
-    if (!list.length) continue;
-    const tot = list.reduce((s, e) => s + e.weight, 0);
-    let r = Math.random() * tot, pick = list[0];
-    for (const e of list) { if ((r -= e.weight) < 0) { pick = e; break; } }
+    const fort = cat === 'monster' && this.fortressAt(x, z);
+    if (fort && this.spawnFortressGroup(fort, x, z, sp)) return;
+    const pick = spawnPickOf(v.def.spawners[cat]);
+    if (!pick) continue;
     const type = pick.type.replace('minecraft:', '');
-    // a random y with floor below and room for the mob (striders: on the lava surface)
+    // a random y with a floor below and room (the ghast's one-in-20 roll once for the attempt, not for each height)
     for (let k = 0; k < 8; k++) {
       const y = 8 + Math.floor(Math.random() * 110);
-      const below = w.getBlock(x, y - 1, z), here = w.getBlock(x, y, z);
-      const ok = type === 'strider' ? below === LAVA && here === 0 : (BLOCKS[below] && BLOCKS[below].solid && here === 0 && w.getBlock(x, y + 1, z) === 0);
-      if (!ok || (w.getLight(x, y, z) & 15) > 11 && type !== 'strider' && type !== 'ghast') continue;
-      const n = pick.minCount + Math.floor(Math.random() * (pick.maxCount - pick.minCount + 1));
-      for (let i = 0; i < n; i++) {
-        const m = createMob(this, type, x + 0.5 + (Math.random() - 0.5) * 2, y, z + 0.5 + (Math.random() - 0.5) * 2);
-        if (type === 'ghast') m.pos[1] += 4;
-        if (!m.collides(m.box())) this.entities.push(m);
-      }
+      if (!netherSpot(this, type, x, y, z, false)) continue;
+      if (type === 'ghast' && Math.random() >= 1 / 20) return;
+      spawnAttempt(this, pick, x, y, z, sp, (t, a, b, c) => netherSpot(this, t, a, b, c), (a, c) => { const vb = this.vbiomeAt(a, c); return vb && vb.def.spawners ? spawnPickOf(vb.def.spawners[cat]) : null; }, netherMade);
       return;
     }
   }
 };
+// Ghasts only went when more than 128 blocks away (mobs2.js), never by chance as other monsters do (vanilla
+// Mob.checkDespawn: past 32 blocks, one tick in 800 once idle for 30 s): the ones spawned stayed for good and piled up
+(() => {
+  const _t = Ghast.prototype.tick;
+  Ghast.prototype.tick = function () {
+    if (!this.persistent && !this.customName && !this.remote && !this.leashHolder && this.age > 600 && Math.random() < 1 / 800 && this.distTo(this.game.player) > 32) { this.dead = true; return; }
+    return _t.call(this);
+  };
+})();

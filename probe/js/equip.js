@@ -19,7 +19,7 @@ Renderer.prototype.initEquipModels = function () {
     { name: 'lw', pivot: [-5, 24, 2], boxes: [[22, 0, 0, -20, 0, 10, 20, 2, 1]] },
     { name: 'rw', pivot: [5, 24, 2], boxes: [[22, 0, -10, -20, 0, 10, 20, 2, 1, true]] },
   ] };
-  for (const p of M.eq_elytra.parts) p.mesh = this.makeModelPart(p.boxes, 64, 32);
+  this.packParts(M.eq_elytra.parts, 64, 32); // (both wings in one VAO: render.js packParts)
   M.eq_trident = P(32, 32, [[0, 6, -0.5, -27, -0.5, 1, 25, 1], [4, 0, -1.5, -2, -0.5, 3, 2, 1], [4, 3, -2.5, -1, -0.5, 1, 4, 1],
     [0, 0, -0.5, 0, -0.5, 1, 4, 1], [4, 3, 1.5, -1, -0.5, 1, 4, 1, 0, true]]);
 };
@@ -210,7 +210,7 @@ class ThrownTrident extends Arrow {
   }
   drawSelf(g, ip, a, env, l) {
     const r = g.renderer; r.initEquipModels();
-    const m = M4.create(); M4.translate(m, ip[0], ip[1], ip[2]);
+    const m = r.mat(); M4.translate(m, ip[0], ip[1], ip[2]);
     M4.rotY(m, this.yaw); M4.rotX(m, this.pitch - Math.PI / 2);
     M4.translate(m, 0, 0.6, 0);
     r.gl.disable(r.gl.CULL_FACE);
@@ -484,11 +484,13 @@ Game.prototype.drawHand = function (a, env) {
   if (special) this.drawHandStack(held, false, a, env);
   if (off) this.drawHandStack(off, true, a, env);
 };
+const HAND_CAM = [0, 0, 0]; // (the hand's camera: at the origin of its own projection; only read)
 Game.prototype.drawHandStack = function (st, left, a, env) {
   const r = this.renderer, p = this.player, D = Math.PI / 180, PI = Math.PI, s = left ? -1 : 1;
-  const proj = M4.create(); M4.perspective(proj, 70 * D, r.canvas.width / r.canvas.height, 0.05, 10);
-  const savedVP = r.vp, savedCam = r.camPos; r.vp = proj; r.camPos = [0, 0, 0];
-  const m = M4.create(), k = keyOfStack(st), def = ITEMS[st.id];
+  // (both matrices from the renderer's pool for this frame: render.js mat)
+  const proj = r.mat(); M4.perspective(proj, 70 * D, r.canvas.width / r.canvas.height, 0.05, 10);
+  const savedVP = r.vp, savedCam = r.camPos; r.vp = proj; r.camPos = HAND_CAM;
+  const m = r.mat(), k = keyOfStack(st), def = ITEMS[st.id];
   if (this.settings.bobbing) { const bob = lerp(p.prevBob, p.bob, a) * PI * 0.6, amt = lerp(p.prevBobAmt || 0, p.bobAmt, a); M4.translate(m, Math.sin(bob) * amt * 0.5, -Math.abs(Math.cos(bob) * amt), 0); }
   const eq = left ? 0 : 1 - lerp(p.oHandH ?? 1, p.handH ?? 1, a);
   const using = p.usingItem === st.id && (p.useHand === 'off') === left;

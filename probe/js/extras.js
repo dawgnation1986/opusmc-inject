@@ -479,14 +479,19 @@ class PhotoScreen extends MenuScreen {
 }
 
 // ---- automatic quality: when even the lowest resolution can't keep up, see less far; back up when it can again ----
+// (fewer pixels can't help a device held up by its CPU - DynRes.cpuBound: a phone like that never got to the lowest
+// resolution and kept its render distance. The limit in effect - FramePacer.playLimit, 0 = the screen's rate. Not
+// while AFK or under a pausing screen - those frames are held to 30 / 10 - nor for 2.5 s after: g.fps counts whole
+// seconds)
 (() => {
   let low = 0, good = 0, last = performance.now();
   setInterval(() => {
-    const g = typeof game !== 'undefined' && game, s = g && g.settings;
-    if (!g || g.state !== 'play' || !s || s.autoQuality === false || !g.fps) { last = performance.now(); return; }
+    const g = typeof game !== 'undefined' && game, s = g && g.settings, P = g && g.pacer;
+    if (!g || !P || g.state !== 'play' || !s || s.autoQuality === false || !g.fps) { last = performance.now(); return; }
     const now = performance.now(), dt = now - last; last = now;
-    const target = Math.min(s.maxFps || 1000, g.pacer && g.pacer.refresh ? 1000 / g.pacer.refresh : 60, 60);
-    const atMinRes = !s.dynRes || (typeof DynRes !== 'undefined' && DynRes.scale <= 0.55);
+    if (P.afk || now - P.cappedT < 2500 || document.hidden) return;
+    const target = Math.min(P.playLimit || 1000, P.hz, 60);
+    const atMinRes = !s.dynRes || (typeof DynRes !== 'undefined' && (DynRes.scale <= 0.55 || DynRes.cpuBound));
     if (g.fps < target * 0.6 && atMinRes) { low += dt; good = 0; } else if (g.fps > target * 0.95) { good += dt; low = Math.max(0, low - dt); } else { low = Math.max(0, low - dt / 2); good = 0; }
     const base = s.autoDistBase || s.renderDist;
     if (low > 20000 && s.renderDist > 4) {

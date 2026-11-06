@@ -14,15 +14,17 @@ const EM = {
     if (key in this.models) return this.models[key];
     const L = window.ENTITY_DATA && ENTITY_DATA.layers[key];
     if (!L) return (this.models[key] = null);
-    const parts = {};
+    const parts = {}, meshed = [];
     const mk = (name, a) => {
-      const n = { name, ip: a.slice(0, 6), is: a[6] || null, mesh: a[7] ? emMesh(r, a[7]) : null, kids: [] };
+      const n = { name, ip: a.slice(0, 6), is: a[6] || null, mesh: null, kids: [] };
+      if (a[7]) meshed.push([n, a[7]]);
       if (a[8]) for (const k in a[8]) n.kids.push(mk(k, a[8][k]));
       if (name && !parts[name]) parts[name] = n;
       return n;
     };
     // the layer's own root is unnamed: models with a part called "root" get that one
     const m = { key, tw: L.tw, th: L.th, root: mk('', L.root), parts };
+    emPack(r, meshed);
     m.all = []; const walk = (n) => { m.all.push(n); n.kids.forEach(walk); }; walk(m.root);
     this.reset(m);
     return (this.models[key] = m);
@@ -81,15 +83,23 @@ function emSample(K, t) {
   }
   return _emV;
 }
-// a part's faces as a mesh: [nx, ny, nz, then x y z u v for each of 4 corners] in model pixels
-function emMesh(r, faces) {
-  const gl = r.gl, data = new Float32Array(faces.length * 32);
+// the parts' faces ([node, faces] each; a face: [nx, ny, nz, then x y z u v for each of 4 corners] in model pixels) as
+// one mesh: one buffer and VAO a layer, each part drawn from its own first quad - off, a byte offset into the shared quad
+// indices - so drawEM binds a model's VAO once, not once a part (~90 binds a frame with 28 mobs in view, 11-04)
+function emPack(r, list) {
+  if (!list.length) return;
+  let total = 0;
+  for (const [, faces] of list) total += faces.length;
+  const gl = r.gl, data = new Float32Array(total * 32);
   let o = 0;
-  for (const f of faces) for (let k = 0; k < 4; k++) {
-    const b = 3 + k * 5;
-    data[o++] = f[b] / 16; data[o++] = f[b + 1] / 16; data[o++] = f[b + 2] / 16;
-    data[o++] = f[b + 3]; data[o++] = f[b + 4];
-    data[o++] = f[0]; data[o++] = f[1]; data[o++] = f[2];
+  for (const [n, faces] of list) {
+    n.mesh = { vao: null, n: faces.length * 4, off: o / 32 * 24 };
+    for (const f of faces) for (let k = 0; k < 4; k++) {
+      const b = 3 + k * 5;
+      data[o++] = f[b] / 16; data[o++] = f[b + 1] / 16; data[o++] = f[b + 2] / 16;
+      data[o++] = f[b + 3]; data[o++] = f[b + 4];
+      data[o++] = f[0]; data[o++] = f[1]; data[o++] = f[2];
+    }
   }
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -99,7 +109,7 @@ function emMesh(r, faces) {
   gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 32, 20);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.quadIdx);
   gl.bindVertexArray(null);
-  return { vao, n: faces.length * 4 };
+  for (const [n] of list) n.mesh.vao = vao;
 }
 
 // an entity texture from etex.js ('entity/horse/horse_white'), made into a GL texture once its image loads
@@ -146,13 +156,15 @@ Renderer.prototype.etexMix = function (layers) {
 Renderer.prototype.drawEM = function (m, tex, base, light, env, opts = {}) {
   if (!m || !tex || !this.entityTex[tex]) return;
   const gl = this.gl, E = this.entBegin(tex, light, env, opts);
-  const mat = M4.copy(base); M4.scale(mat, -1, -1, 1); M4.translate(mat, 0, -1.501, 0);
+  // (the matrices from the renderer's pool for this frame, render.js mat: a new array per part was ~10 a mob a frame)
+  const mat = this.mat(base); M4.scale(mat, -1, -1, 1); M4.translate(mat, 0, -1.501, 0);
   const cull = opts.cull !== false;
   if (cull) gl.enable(gl.CULL_FACE); else gl.disable(gl.CULL_FACE);
   const att = [];
+  let vao = null;
   const rec = (n, pm) => {
     if (!n.visible) return;
-    const mm = M4.copy(pm);
+    const mm = this.mat(pm);
     M4.translate(mm, n.x / 16, n.y / 16, n.z / 16);
     if (n.zRot) M4.rotZ(mm, n.zRot);
     if (n.yRot) M4.rotY(mm, n.yRot);
@@ -160,16 +172,16 @@ Renderer.prototype.drawEM = function (m, tex, base, light, env, opts = {}) {
     if (n.xScale !== 1 || n.yScale !== 1 || n.zScale !== 1) M4.scale(mm, n.xScale, n.yScale, n.zScale);
     if (n.mesh && !n.skipDraw) {
       gl.uniformMatrix4fv(E.u.u_model, false, mm);
-      gl.bindVertexArray(n.mesh.vao);
-      gl.drawElements(gl.TRIANGLES, n.mesh.n * 1.5, gl.UNSIGNED_INT, 0);
+      if (n.mesh.vao !== vao) { vao = n.mesh.vao; gl.bindVertexArray(vao); } // (the layer's parts share one: emPack)
+      gl.drawElements(gl.TRIANGLES, n.mesh.n * 1.5, gl.UNSIGNED_INT, n.mesh.off);
     }
-    if (opts.attach && opts.attach[n.name]) att.push([opts.attach[n.name], M4.copy(mm)]);
+    if (opts.attach && opts.attach[n.name]) att.push([opts.attach[n.name], this.mat(mm)]);
     for (const k of n.kids) rec(k, mm);
   };
   rec(m.root, mat);
   gl.enable(gl.CULL_FACE);
+  this.unit0(); // (texture unit 0 again, before what is attached draws: render.js entBegin)
   for (const [fn, mm] of att) fn(mm);
-  gl.activeTexture(gl.TEXTURE0);
 };
 // the same, drawn additively over what is there (eyes, glowing layers)
 Renderer.prototype.drawEMGlow = function (m, tex, base, env, opts = {}) {

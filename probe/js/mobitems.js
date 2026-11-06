@@ -88,10 +88,10 @@ const STICK_FOR = { pig: 'carrot_on_a_stick', strider: 'warped_fungus_on_a_stick
   const _it = Mob.prototype.interact;
   Mob.prototype.interact = function (p, held) {
     if (_it && _it.call(this, p, held)) return true;
-    const g = this.game, k = held && ITEMS[held.id].key;
+    const g = this.game, k = keyOfStack(held); // (equip.js: null for an id not in ITEMS - no throw)
     if (STICK_FOR[this.type] && !this.baby) {
       if (k === 'saddle' && !this.saddled) { this.saddled = true; useOne(g, p); Sound.ev('entity.' + this.type + '.saddle', this.pos, 0.5, 1); return true; }
-      if (this.saddled && !p.vehicle && !p.sneaking && (!held || !ITEMS[held.id].spawnEgg)) { p.mount(this); return true; }
+      if (this.saddled && !p.vehicle && !p.sneaking && (!held || !(ITEMS[held.id] && ITEMS[held.id].spawnEgg))) { p.mount(this); return true; }
     }
     return nameTagUse(this, p, held) || leadUse(this, p, held);
   };
@@ -102,7 +102,8 @@ const STICK_FOR = { pig: 'carrot_on_a_stick', strider: 'warped_fungus_on_a_stick
     // ridden: goes where the rider looks while it holds the stick; a click with the stick gives a boost
     this.savePrev(); this.baseTick();
     if (this.deathTick()) return;
-    const p = this.rider, held = p.inv.held, steer = held && ITEMS[held.id].key === STICK_FOR[this.type];
+    // (an id not in ITEMS in the hand threw here every tick of the ride)
+    const p = this.rider, held = p.inv.held, steer = !!held && keyOfStack(held) === STICK_FOR[this.type];
     if (this.boostT > 0) this.boostT--;
     let fwd = 0;
     if (steer) { this.yaw = p.yaw; fwd = 1; }
@@ -122,7 +123,7 @@ const STICK_FOR = { pig: 'carrot_on_a_stick', strider: 'warped_fungus_on_a_stick
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
     const p = this.player, v = p.vehicle, held = p.inv.held;
-    if (v && held && STICK_FOR[v.type] === ITEMS[held.id].key && !v.vm && !(v.boostT > 0)) {
+    if (v && held && ITEMS[held.id] && STICK_FOR[v.type] === ITEMS[held.id].key && !v.vm && !(v.boostT > 0)) {
       v.boostT = 140 + randInt(0, 700) % 140; this.damageHeld(this.mode === 'creative' ? 0 : v.type === 'pig' ? 7 : 1); p.swing();
       if (held.dmg >= (ITEMS[held.id].durability || 1e9)) p.inv.slots[p.inv.sel] = makeStack('fishing_rod', 1);
       this.useCd = 10; return;
@@ -133,7 +134,7 @@ const STICK_FOR = { pig: 'carrot_on_a_stick', strider: 'warped_fungus_on_a_stick
 
 // ---- name tags ------------------------------------------------------------------------------------------------------------------------
 function nameTagUse(e, p, held) {
-  if (!held || ITEMS[held.id].key !== 'name_tag' || !held.name || e === p) return false;
+  if (!held || keyOfStack(held) !== 'name_tag' || !held.name || e === p) return false;
   e.customName = held.name; e.persistent = true;
   useOne(e.game, p);
   return true;
@@ -176,11 +177,31 @@ Game.prototype.drawNameTag = function (e, ip, name, o = {}) {
   gl.useProgram(T2.p);
   gl.uniformMatrix4fv(T2.u.u_vp, false, r.vp); gl.uniformMatrix4fv(T2.u.u_model, false, m);
   gl.uniform4f(T2.u.u_color, 1, 1, 1, 1);
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false); gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.CULL_FACE);
   gl.activeTexture(gl.TEXTURE0); gl.bindVertexArray(r.quadVao);
   const quad = (t) => { gl.bindTexture(gl.TEXTURE_2D, t); gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, 0); };
-  if (o.through) { gl.disable(gl.DEPTH_TEST); quad(nt.faint); gl.enable(gl.DEPTH_TEST); quad(nt.text); }
-  else quad(o.faded ? nt.faint : nt.tex);
+  // the letters write depth (vanilla's NORMAL text does): without, clouds and water drawn later came over the tag
+  // (feedback 11-01 22:24). On their letters only - vanilla's text shader drops texels under 0.1 alpha: a whole quad's
+  // depth cut a box out of the water and clouds behind it (11-04, a named horse before a water wall: the plate's 5867
+  // px showed the stone behind the water, grey 105 instead of the water's blue). The plates follow vanilla: the faint
+  // see-through one (no depth test) and a mob's leave the depth alone (vanilla's mob plate is a see-through one), the
+  // plate of one sneaking (NORMAL text_background) writes it
+  const cut = () => {
+    if (r.progTexCut === undefined) try { r.progTexCut = compile(gl, TEX_VS, TEX_FS.replace('o = t * u_color;', 'if (t.a < 0.1) discard; o = t * u_color;')); } catch (err) { r.progTexCut = null; }
+    const T3 = r.progTexCut;
+    if (T3) { gl.useProgram(T3.p); gl.uniformMatrix4fv(T3.u.u_vp, false, r.vp); gl.uniformMatrix4fv(T3.u.u_model, false, m); gl.uniform4f(T3.u.u_color, 1, 1, 1, 1); }
+    return !!T3;
+  };
+  if (o.through) {
+    gl.disable(gl.DEPTH_TEST); gl.depthMask(false); quad(nt.faint); gl.enable(gl.DEPTH_TEST);
+    if (cut()) gl.depthMask(true);
+    quad(nt.text);
+  } else if (o.faded) { gl.depthMask(true); quad(nt.faint); }
+  else {
+    // (the letters' depth in a pass of its own, colour untouched: the picture is the plate's alone)
+    gl.depthMask(false); quad(nt.tex);
+    if (cut()) { gl.colorMask(false, false, false, false); gl.depthMask(true); quad(nt.text); gl.colorMask(true, true, true, true); }
+  }
   gl.depthMask(true); gl.disable(gl.BLEND); gl.enable(gl.CULL_FACE);
 };
 (() => {
@@ -194,7 +215,7 @@ const LEASHABLE = (e) => e instanceof Mob && !(e.T.hostile && !['zoglin', 'hogli
 function leadUse(e, p, held) {
   const g = e.game;
   if (e.leashHolder === p) { e.leashHolder = null; if (g.mode !== 'creative') g.dropItem(e.pos[0], e.pos[1] + 0.5, e.pos[2], makeStack('lead', 1)); Sound.ev('item.lead.untied', e.pos, 1, 1); return true; }
-  if (held && ITEMS[held.id].key === 'lead' && LEASHABLE(e) && !e.leashHolder) { e.leashHolder = p; useOne(g, p); Sound.ev('item.lead.tied', e.pos, 1, 1); return true; }
+  if (held && keyOfStack(held) === 'lead' && LEASHABLE(e) && !e.leashHolder) { e.leashHolder = p; useOne(g, p); Sound.ev('item.lead.tied', e.pos, 1, 1); return true; }
   return false;
 }
 Mob.prototype.leashTick = function () {
@@ -240,7 +261,7 @@ class LeashKnot extends Entity {
         Sound.ev('entity.leash_knot.place', knot.pos, 1, 1); p.swing(); return;
       }
       if (knot && this.entities.some(e => e.leashHolder === knot)) { for (const e of this.entities) if (e.leashHolder === knot) e.leashHolder = p; knot.dead = true; p.swing(); return; }
-      if (p.inv.held && ITEMS[p.inv.held.id].key === 'lead') {
+      if (p.inv.held && keyOfStack(p.inv.held) === 'lead') {
         // a lead on a bare fence: a knot with nothing on it is not kept by vanilla either; nothing to do
       }
     }
@@ -290,7 +311,7 @@ const MOB_BUCKET = { cod_bucket: 'cod', salmon_bucket: 'salmon', pufferfish_buck
 (() => {
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
-    const p = this.player, w = this.world, held = p.inv.held, t = this.target, k = held && ITEMS[held.id].key;
+    const p = this.player, w = this.world, held = p.inv.held, t = this.target, k = held && ITEMS[held.id] && ITEMS[held.id].key; // (an id not in ITEMS: no throw)
     if (k && MOB_BUCKET[k] && t && !this.targetEntity) {
       const D = DIRS[t.face], b = BLOCKS[t.id], rep = b.replaceable || IS_FLUID[t.id];
       const [x, y, z] = rep ? t.pos : [t.pos[0] + D[0], t.pos[1] + D[1], t.pos[2] + D[2]];

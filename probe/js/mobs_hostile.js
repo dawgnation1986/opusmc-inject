@@ -99,7 +99,8 @@ class ZombieKind extends Humanoid {
   }
   get ai() { return this.type === 'drowned' && this.inWater ? 'amph' : 'ground'; }
   makeBaby() { super.makeBaby(); this.growT = 1e12; return this; }
-  wantsPlayer() { return this.game.difficulty > 0 && (this.type !== 'drowned' || this.inWater || !this.game.isDay() || this.game.player.inWater); }
+  // (vanilla Drowned.okTarget: at night, or a target in the water - by day one in the water hunted players on dry land too)
+  wantsPlayer() { return this.game.difficulty > 0 && (this.type !== 'drowned' || !this.game.isDay() || this.game.player.inWater); }
   huntTarget() { if ((this.age + this.id) % 20) return null; return this.game.entities.find(e => !e.dead && !e.deathTime && (e.type === 'villager' || e.type === 'wandering_trader' || e.type === 'iron_golem' || (e.type === 'turtle' && e.baby)) && e.distTo(this) < 16 && this.canSee(e)) || null; }
   ranged(c, t, d) {
     // drowned with a trident throw it from a distance
@@ -293,17 +294,21 @@ class Phantom extends VMob {
   drawLayers(g, r, md, m, a, env) { const t = r.etex('entity/phantom/phantom_eyes'); if (t) r.drawEMGlow(md, t, m, env, {}); }
 }
 defVMob('phantom', { cls: Phantom, ai: 'fly', burns: true, xp: 5, shadowR: 0.75, T: { hostile: true, attack: 6, flySpeed: 0.6 }, speed3: 2, noDeathFlip: false, stepSound: false });
-// phantoms come for players who haven't slept for three nights (vanilla's insomnia), at night or in a storm, under open sky
+// phantoms come for players who haven't slept for three nights (vanilla's insomnia, the TIME_SINCE_REST stat), at night,
+// from the sea level up under open sky (PhantomSpawner). Lying down in a bed sets the count back (trySleep below): it never
+// did, so after an hour of play they came every night, sleeping or not - "睡觉时还会刷幻翼", feedback 2026-11-02. And none
+// by day in the rain: vanilla needs the sky darkened by 5, which by day takes a thunderstorm (there are none here)
 Game.prototype.trySpawnPhantoms = function () {
   const p = this.player, w = this.world;
   if (this.difficulty === 0 || p.creative || (this.dim && this.dim !== 'overworld')) return;
   p.sinceRest = (p.sinceRest || 0) + 1200;
-  if (this.isDay() && this.weather < 0.8) return;
+  if (this.sleeping || spawnDarken(this) < 5) return;
   if (p.sinceRest < 72000 || Math.random() * p.sinceRest < 72000) return;
-  if (w.skyAt(Math.floor(p.pos[0]), Math.floor(p.pos[1] + 2), Math.floor(p.pos[2])) < 15) return;
+  if (Math.floor(p.pos[1]) < SEA + 1 || w.skyAt(Math.floor(p.pos[0]), Math.floor(p.pos[1] + 2), Math.floor(p.pos[2])) < 15) return;
   const n = 1 + randInt(0, this.difficulty);
   for (let i = 0; i < n; i++) { const m = spawnAt(this, 'phantom', p.pos[0] + randInt(-10, 10), p.pos[1] + 20 + randInt(0, 14), p.pos[2] + randInt(-10, 10)); m.persistent = false; m.target = p; }
 };
+(() => { const _sleep = Game.prototype.trySleep; Game.prototype.trySleep = function (...a) { const r = _sleep.apply(this, a); if (this.sleeping && this.player) this.player.sinceRest = 0; return r; }; })();
 
 // ---- witches: throw harmful potions, drink helpful ones -----------------------------------------------------------------------------
 class Witch extends Humanoid {

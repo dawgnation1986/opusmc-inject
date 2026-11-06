@@ -10,7 +10,7 @@ const isHead = (k) => /_(head|skull)$/.test(k);
 const DYE_RGB_ARR = (c) => { const v = DYE_RGB[c] || 0xffffff; return v; };
 // the special recipe for a grid, or null: { result, keep: grid index left in place }
 function specialRecipe(grid) {
-  const items = grid.map((s, i) => s ? { s, i, k: ITEMS[s.id].key } : null).filter(Boolean);
+  const items = grid.map((s, i) => s ? { s, i, k: ITEMS[s.id] ? ITEMS[s.id].key : '' } : null).filter(Boolean);
   if (!items.length) return null;
   const by = (re) => items.filter(o => re.test(o.k));
   const dyes = by(/_dye$/);
@@ -29,7 +29,7 @@ function specialRecipe(grid) {
   const fm = items.find(o => o.k === 'filled_map'), em = by(/^map$/);
   if (fm && em.length && em.length + 1 === items.length) return { result: { ...fm.s, count: em.length + 1 } };
   // tipped arrows: eight arrows round a lingering potion
-  if (items.length === 9 && grid[4] && ITEMS[grid[4].id].key === 'lingering_potion' && items.filter(o => o.k === 'arrow').length === 8) return { result: { ...makeStack('tipped_arrow', 8), pot: grid[4].pot } };
+  if (items.length === 9 && items[4].k === 'lingering_potion' && items.filter(o => o.k === 'arrow').length === 8) return { result: { ...makeStack('tipped_arrow', 8), pot: grid[4].pot } };
   // firework star: gunpowder, dyes, maybe a shape, a diamond (trail) and glowstone dust (twinkle)
   const gp = by(/^gunpowder$/);
   if (gp.length === 1 && dyes.length && !items.some(o => o.k === 'paper' || o.k === 'firework_star')) {
@@ -85,7 +85,7 @@ function specialRecipe(grid) {
     const fwLines = (fw, ind) => { lines.push({ text: ind + (shapeCn[fw.shape] || fw.shape), color: '#AAAAAA' }); if (fw.colors && fw.colors.length) lines.push({ text: ind + ' ' + fw.colors.map(c => zhT('item.minecraft.firework_star.' + c, c)).join('、'), color: '#AAAAAA' }); if (fw.fade && fw.fade.length) lines.push({ text: ind + ' 淡化成' + fw.fade.map(c => zhT('item.minecraft.firework_star.' + c, c)).join('、'), color: '#AAAAAA' }); if (fw.trail) lines.push({ text: ind + ' 踪迹', color: '#AAAAAA' }); if (fw.twinkle) lines.push({ text: ind + ' 闪烁', color: '#AAAAAA' }); };
     if (st.fw) fwLines(st.fw, '');
     if (st.flight) { lines.push({ text: '飞行时间：' + st.flight, color: '#AAAAAA' }); for (const e of st.explosions || []) fwLines(e, '  '); }
-    if (st.color != null && /leather|wolf_armor/.test(ITEMS[st.id].key)) lines.push({ text: '已染色', color: '#AAAAAA' });
+    if (st.color != null && ITEMS[st.id] && /leather|wolf_armor/.test(ITEMS[st.id].key)) lines.push({ text: '已染色', color: '#AAAAAA' });
     if (st.sherds) for (const s of st.sherds) lines.push({ text: ITEMS[ITEM_KEY[s]] ? ITEMS[ITEM_KEY[s]].cn : s, color: '#AAAAAA' });
     return lines;
   };
@@ -118,7 +118,7 @@ function specialRecipe(grid) {
   Game.prototype.use = function () {
     const held = this.player.inv.held, before = new Set(this.entities);
     const r = _use.call(this);
-    if (held && ITEMS[held.id].key === 'firework_rocket') for (const e of this.entities) if (e instanceof FireworkRocket && !before.has(e)) e.stackRef = { ...held };
+    if (held && ITEMS[held.id] && ITEMS[held.id].key === 'firework_rocket') for (const e of this.entities) if (e instanceof FireworkRocket && !before.has(e)) e.stackRef = { ...held };
     return r;
   };
 })();
@@ -189,7 +189,8 @@ function shieldTex(r, st) {
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
     const p = this.player, t = this.target, held = p.inv.held;
-    if (held && ITEMS[held.id].key === 'debug_stick' && t && !this.targetEntity && !this.net) {
+    // (an id not in ITEMS in the hand - telemetry 11-02/03, 'reading key': using anything threw here)
+    if (held && ITEMS[held.id] && ITEMS[held.id].key === 'debug_stick' && t && !this.targetEntity && !this.net) {
       const w = this.world, [x, y, z] = t.pos, id = w.getBlock(x, y, z), b = BLOCKS[id];
       const st = b.states && b.states[w.getMeta(x, y, z)];
       if (!st || !Object.keys(st).length) { this.ui.actionBar = { text: 'minecraft:' + b.key + ' 没有属性', t: performance.now() }; p.swing(); return; }

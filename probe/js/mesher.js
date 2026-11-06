@@ -16,12 +16,47 @@ const FACES = [
   { n: [0, 0, -1], c: [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]], uv: (x, y, z) => [1 - x, 1 - y] },
   { n: [0, 0, 1], c: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], uv: (x, y, z) => [x, 1 - y] },
 ];
+// quadAO's tables, for face f and corner k (index f * 4 + k): the padded-index steps from the cell in front of the face to
+// the corner's two edge neighbours, and the corner's uv, plain and turned (a log on its side). Meshing a section built
+// four arrays a face and a uv pair a corner; it runs on the main thread while a world loads and after every block edit
+const AO_D1 = new Int16Array(24), AO_D2 = new Int16Array(24), FACE_UV = new Float64Array(48), FACE_UVR = new Float64Array(48);
+for (let f = 0; f < 6; f++) for (let k = 0; k < 4; k++) {
+  const F = FACES[f], n = F.n, c = F.c[k], i = f * 4 + k;
+  let s1x = 0, s1y = 0, s1z = 0, s2x = 0, s2y = 0, s2z = 0;
+  if (n[0]) { s1y = c[1] ? 1 : -1; s2z = c[2] ? 1 : -1; }
+  else if (n[1]) { s1x = c[0] ? 1 : -1; s2z = c[2] ? 1 : -1; }
+  else { s1x = c[0] ? 1 : -1; s2y = c[1] ? 1 : -1; }
+  AO_D1[i] = s1y * 324 + s1z * 18 + s1x; AO_D2[i] = s2y * 324 + s2z * 18 + s2x;
+  const uv = F.uv(c[0], c[1], c[2]);
+  FACE_UV[i * 2] = uv[0]; FACE_UV[i * 2 + 1] = uv[1]; FACE_UVR[i * 2] = 1 - uv[1]; FACE_UVR[i * 2 + 1] = uv[0];
+}
+const AO_V = new Float64Array(4), AO_SK = new Float64Array(4), AO_BK = new Float64Array(4);
+const VM_HAS = new Uint8Array(MAX_BLOCKS); // 0 not looked up yet, 1 no vanilla model, 2 one (Mesher.block)
 // 图形品质 流畅 (vanilla's fast leaves): leaves are drawn solid (the overlay field's top bit tells the shaders
 // to skip the alpha test) and the faces between two leaf blocks are left out - inside a canopy most of them
 const LEAF_BLOCK = new Uint8Array(MAX_BLOCKS), SOLID_LEAF = 0x8000;
 for (let i = 0; i < MAX_BLOCKS; i++) if (BLOCKS[i] && /leaves$/.test(BLOCKS[i].key)) LEAF_BLOCK[i] = 1;
 let FAST_LEAVES = false;
 function setFastLeaves(on) { FAST_LEAVES = !!on; }
+// blocks that fill their whole footprint between two heights (farmland and paths 15/16, slabs, snow layers): a fluid
+// leaves out what they cover of its faces, as vanilla's occlusion test does. Water's side was drawn in the plane of the
+// farmland's and the two took turns on screen as the camera moved (feedback 2026-11-03: water edges flicker at farmland)
+const FLAT_BOX = new Uint8Array(MAX_BLOCKS); // 1: 0..15/16, 2: a slab (meta & 3), 3: snow layers (meta & 7)
+// translucent blocks other than fluids: meshed after a layer's water sides, their tops after its surfaces (Mesher.buildGathered)
+const TRANS_LATE = new Uint8Array(MAX_BLOCKS);
+// blocks a fluid's corner heights leave out (vanilla LiquidBlockRenderer.getHeight: -1 for a solid block - one that
+// collides - not only full opaque cubes): next to ice, glass, leaves, farmland, slabs or fences the surface sloped down
+// to the block, a step and a jagged edge along a frozen lake or a farm's water
+const FLUID_WALL = new Uint8Array(MAX_BLOCKS);
+for (let i = 0; i < MAX_BLOCKS; i++) {
+  const b = BLOCKS[i]; if (!b) continue;
+  if (b.key === 'farmland' || b.key === 'dirt_path') FLAT_BOX[i] = 1; else if (b.slab) FLAT_BOX[i] = 2; else if (b.key === 'snow') FLAT_BOX[i] = 3;
+  if (b.render === 'translucent' && b.shape !== SH_LIQUID) TRANS_LATE[i] = 1;
+  if (SOLIDCUBE[i] || (b.solid && b.shape !== SH_LIQUID)) FLUID_WALL[i] = 1;
+}
+// fluid faces sit this far inside their cell (vanilla 0.001; 1/256 lands on the 1/2048 position grid and keeps clear of a
+// glass or leaf face in the same plane out to about 50 blocks with a 24-bit depth buffer)
+const FLUID_INSET = 1 / 256;
 const ANIM_FRAMES = new Uint8Array(4096);
 function initAnimTable() {
   for (const k in ASSETS.anims) ANIM_FRAMES[ASSETS.tiles[k]] = ASSETS.anims[k];
@@ -36,6 +71,17 @@ class MeshBuffer {
     this.f = new Float32Array(buf); this.u16 = new Uint16Array(buf); this.u8 = new Uint8Array(buf);
   }
   reset() { this.n = 0; }
+  append(o) { if (this.n + o.n > this.cap) this.alloc(Math.max(this.cap * 2, this.n + o.n)); this.u8.set(o.u8.subarray(0, o.n * VSTRIDE), this.n * VSTRIDE); this.n += o.n; }
+  // o's quads that lie at or above height ymin (above), or the others
+  appendQuads(o, ymin, above) {
+    const f = o.f;
+    for (let q = 0; q < o.n; q += 4) {
+      const i = q * 8;
+      if ((f[i + 1] >= ymin && f[i + 9] >= ymin && f[i + 17] >= ymin && f[i + 25] >= ymin) !== above) continue;
+      if (this.n + 4 > this.cap) this.alloc(this.cap * 2);
+      this.u8.set(o.u8.subarray(q * VSTRIDE, (q + 4) * VSTRIDE), this.n * VSTRIDE); this.n += 4;
+    }
+  }
   // push one vertex
   v(x, y, z, u, v, layer, overlay, r, g, b, shade, sky, blk, anim) {
     if (this.n >= this.cap) this.alloc(this.cap * 2);
@@ -69,17 +115,20 @@ function toHalf(v) {
   return bits + (m & 1);
 }
 function compactVerts(mb, ox, oy, oz) {
-  const n = mb.n, f = mb.f, s16 = mb.u16, s8 = mb.u8;
-  const out = new ArrayBuffer(n * SVSTRIDE), o16 = new Uint16Array(out), o8 = new Uint8Array(out);
-  const q = (v) => { const r = Math.round((v + 8) * SV_SCALE); return r < 0 ? 0 : r > 65535 ? 65535 : r; };
+  const n = mb.n, f = mb.f, s16 = mb.u16, s8 = mb.u8, s32 = new Uint32Array(mb.buf);
+  const out = new ArrayBuffer(n * SVSTRIDE), o16 = new Uint16Array(out), o32 = new Uint32Array(out);
   for (let i = 0; i < n; i++) {
-    const fi = i * 8, d16 = i * 12, d8 = i * 24, b8 = i * 32;
-    o16[d16] = q(f[fi] - ox); o16[d16 + 1] = q(f[fi + 1] - oy); o16[d16 + 2] = q(f[fi + 2] - oz); o16[d16 + 3] = s8[b8 + 30];
-    o16[d16 + 4] = toHalf(f[fi + 3]); o16[d16 + 5] = toHalf(f[fi + 4]);
-    o16[d16 + 6] = s16[i * 16 + 10]; o16[d16 + 7] = s16[i * 16 + 11];
-    for (let k = 0; k < 6; k++) o8[d8 + 16 + k] = s8[b8 + 24 + k];
+    const fi = i * 8, d16 = i * 12;
+    let a = Math.round((f[fi] - ox + 8) * SV_SCALE); o16[d16] = a < 0 ? 0 : a > 65535 ? 65535 : a;
+    a = Math.round((f[fi + 1] - oy + 8) * SV_SCALE); o16[d16 + 1] = a < 0 ? 0 : a > 65535 ? 65535 : a;
+    a = Math.round((f[fi + 2] - oz + 8) * SV_SCALE); o16[d16 + 2] = a < 0 ? 0 : a > 65535 ? 65535 : a;
+    o16[d16 + 3] = s8[i * 32 + 30];
+    const u = f[fi + 3], v = f[fi + 4];
+    o16[d16 + 4] = u === 1 ? 0x3c00 : toHalf(u); o16[d16 + 5] = v === 1 ? 0x3c00 : toHalf(v);
+    // layer + overlay (bytes 20-23), colour + shade and the two light bytes (24-29): copied a word at a time
+    o32[i * 6 + 3] = s32[i * 8 + 5]; o32[i * 6 + 4] = s32[i * 8 + 6]; o16[d16 + 10] = s16[i * 16 + 14];
   }
-  return o8;
+  return new Uint8Array(out);
 }
 // Vanilla's VisGraph: which faces of a section can see each other through cells that aren't full opaque
 // cubes (the renderer walks this graph from the camera, so caves under the surface aren't drawn).
@@ -171,16 +220,28 @@ const Mesher = {
     (this.biomes || (this.biomes = new Uint8Array(18 * 18))).set(s.biomes);
   },
   buildGathered(cx, sy, cz) {
-    const ob = this.opaqueBuf, tb = this.transBuf;
-    ob.reset(); tb.reset();
+    const ob = this.opaqueBuf, tb = this.transBuf, lb = this.lateBuf || (this.lateBuf = new MeshBuffer(4096)), sb = this.surfBuf || (this.surfBuf = new MeshBuffer(4096));
+    ob.reset(); tb.reset(); lb.reset(); sb.reset();
     const ids = this.ids, wls = this.wls;
     const ox = cx * 16, oy = sy * 16, oz = cz * 16;
-    for (let y = 0; y < 16; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) {
-      const pi = ((y + 1) * 18 + (z + 1)) * 18 + (x + 1), id = ids[pi];
-      if (!id) continue;
-      this.block(id, x, y, z, ox, oy, oz);
-      if (wls && wls[pi]) this.liquid(BLOCKS[WATER], WATER, 0, x, y, z, ox, oy, oz); // (its water too)
-    }
+    this.surf = sb; // (liquid() puts the water surfaces there)
+    try {
+      for (let y = 0; y < 16; y++) {
+        for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) {
+          const pi = ((y + 1) * 18 + (z + 1)) * 18 + (x + 1), id = ids[pi];
+          if (!id) continue;
+          // the translucent pass doesn't sort within a section: a layer's ice, stained glass and honey go after its water's
+          // sides, so the water seen through them is under them, not drawn over them where it came later in the scan
+          // (feedback 2026-11-03); the water surfaces after those, so what is under the surface stays under it seen across a
+          // pond or into a hole in the ice (with the blocks after all the water the hole's walls showed dry, in front of
+          // the water); last what lies above the surface (the tops). Right from above, as are the layers, bottom first
+          if (TRANS_LATE[id]) { this.transBuf = lb; try { this.block(id, x, y, z, ox, oy, oz); } finally { this.transBuf = tb; } }
+          else this.block(id, x, y, z, ox, oy, oz);
+          if (wls && wls[pi]) this.liquid(BLOCKS[WATER], WATER, 0, x, y, z, ox, oy, oz); // (its water too)
+        }
+        if (lb.n || sb.n) { const top = oy + y + 8 / 9 - 1e-4; tb.appendQuads(lb, top, false); tb.append(sb); tb.appendQuads(lb, top, true); lb.reset(); sb.reset(); }
+      }
+    } finally { this.surf = null; }
     return { opaque: ob.n ? compactVerts(ob, ox, oy, oz) : null, trans: tb.n ? compactVerts(tb, ox, oy, oz) : null, nOpaque: ob.n, nTrans: tb.n, vis: this.visibility() };
   },
   // face-to-face visibility of the gathered section (flood fill of the non-opaque cells)
@@ -239,7 +300,10 @@ const Mesher = {
     if (b.be === 'invisible' && !single) return;
     const meta = this.metas[this.P(x, y, z)];
     if (WLOG[id] && !single) this.liquid(BLOCKS[WATER], WATER, 0, x, y, z, ox, oy, oz, false);
-    if (VM.has(b.key) && this.vmodel(b, meta, x, y, z, ox, oy, oz, single)) return;
+    // (whether vanilla models draw it, looked up by name once a block: 9 % of meshing time went to the lookup)
+    let vm = VM_HAS[id];
+    if (!vm) { vm = !VM.ready ? 0 : VM.has(b.key) ? 2 : 1; VM_HAS[id] = vm; }
+    if (vm === 2 && this.vmodel(b, meta, x, y, z, ox, oy, oz, single)) return;
     switch (b.shape) {
       case SH_CUBE: this.cube(b, id, meta, x, y, z, ox, oy, oz, single); break;
       case SH_CROSS: this.cross(b, meta, x, y, z, ox, oy, oz, single); break;
@@ -266,7 +330,11 @@ const Mesher = {
       if (SOLIDCUBE[nid]) continue;
       if (b.cullSame && nid === id) continue;
       if (fast && LEAF_BLOCK[nid]) continue;
-      if (b.render === 'translucent' && IS_FLUID[nid]) continue; // avoids order-dependent blending against water
+      // a translucent cube's faces against a fluid are drawn, as in vanilla: leaving them all out showed the water's side in
+      // place of the ice's (feedback 2026-11-03「冰紧挨水的那一面缺失 / 被画成水的贴图」, 6 reports; packed and blue ice are
+      // opaque, so only ice had it). Not the bottom over a fluid with air above: from below the top face shows through (the
+      // translucent pass draws both sides), and over a frozen ocean it would be one more see-through layer across the screen
+      if (f === 2 && b.render === 'translucent' && IS_FLUID[nid] && !ids[this.P(x, y + 1, z)]) continue;
       if (b.render === 'translucent' && BLOCKS[nid].render === 'translucent' && SOLIDCUBE[nid] === 0 && nid !== 0 && BLOCKS[nid].shape === SH_CUBE && id !== 35) continue;
       let layer = this.texOf(b, f, meta);
       let overlay = fast ? SOLID_LEAF : b.overlay[f];
@@ -290,41 +358,31 @@ const Mesher = {
 
   // Quad with smooth lighting + ambient occlusion
   quadAO(buf, F, x, y, z, ox, oy, oz, layer, overlay, r, g, bl, f, rot, single) {
-    const ids = this.ids, lights = this.lights, n = F.n;
-    const fx = x + n[0], fy = y + n[1], fz = z + n[2];
-    const ao = [0, 0, 0, 0], sk = [0, 0, 0, 0], bk = [0, 0, 0, 0];
+    const ids = this.ids, lights = this.lights, n = F.n, ao = AO_V, sk = AO_SK, bk = AO_BK;
+    const p0 = this.P(x + n[0], y + n[1], z + n[2]), l0 = lights[p0];
     const anim = ANIM_FRAMES[layer];
     // vanilla AO: each corner averages four "shade brightness" samples (1.0 open, 0.2 for a
     // full-collision cube): the block in front of the face, the two edge blocks and the corner block.
     // A face buried inside leaves therefore gets as dark as 0.2, which gives canopies their depth.
-    const front = single ? 0 : AOCUBE[ids[this.P(fx, fy, fz)]];
+    const front = single ? 0 : AOCUBE[ids[p0]];
     for (let k = 0; k < 4; k++) {
-      const c = F.c[k];
-      // tangent offsets
-      let s1x = 0, s1y = 0, s1z = 0, s2x = 0, s2y = 0, s2z = 0;
-      if (n[0]) { s1y = c[1] ? 1 : -1; s2z = c[2] ? 1 : -1; }
-      else if (n[1]) { s1x = c[0] ? 1 : -1; s2z = c[2] ? 1 : -1; }
-      else { s1x = c[0] ? 1 : -1; s2y = c[1] ? 1 : -1; }
-      const p0 = this.P(fx, fy, fz);
-      const p1 = this.P(fx + s1x, fy + s1y, fz + s1z);
-      const p2 = this.P(fx + s2x, fy + s2y, fz + s2z);
-      const p3 = this.P(fx + s1x + s2x, fy + s1y + s2y, fz + s1z + s2z);
-      const o1 = SOLIDCUBE[ids[p1]], o2 = SOLIDCUBE[ids[p2]], o3 = SOLIDCUBE[ids[p3]];
-      const a1 = AOCUBE[ids[p1]], a2 = AOCUBE[ids[p2]], a3 = (AOCUBE[ids[p1]] && AOCUBE[ids[p2]]) ? 1 : AOCUBE[ids[p3]];
+      // the corner's two edge neighbours and the one diagonal to it, in the layer in front of the face
+      const d2 = AO_D2[f * 4 + k], p1 = p0 + AO_D1[f * 4 + k], p2 = p0 + d2, p3 = p1 + d2;
+      const i1 = ids[p1], i2 = ids[p2], o1 = SOLIDCUBE[i1], o2 = SOLIDCUBE[i2], o3 = SOLIDCUBE[ids[p3]];
+      const a1 = AOCUBE[i1], a2 = AOCUBE[i2], a3 = (a1 && a2) ? 1 : AOCUBE[ids[p3]];
       ao[k] = single ? 1 : (4 - (front + a1 + a2 + a3) * 0.8) / 4;
-      let ls = lights[p0] >> 4, lb = lights[p0] & 15, cnt = 1;
+      let ls = l0 >> 4, lb = l0 & 15, cnt = 1;
       if (!o1) { ls += lights[p1] >> 4; lb += lights[p1] & 15; cnt++; }
       if (!o2) { ls += lights[p2] >> 4; lb += lights[p2] & 15; cnt++; }
       if (!o3 && !(o1 && o2)) { ls += lights[p3] >> 4; lb += lights[p3] & 15; cnt++; }
       sk[k] = ls / cnt; bk[k] = lb / cnt;
     }
-    const shade = FACE_SHADE[f];
-    const order = (ao[0] + ao[2] + (sk[0] + sk[2]) * 0.003 < ao[1] + ao[3] + (sk[1] + sk[3]) * 0.003) ? [1, 2, 3, 0] : [0, 1, 2, 3];
-    for (const k of order) {
-      const c = F.c[k];
-      let uv = F.uv(c[0], c[1], c[2]);
-      if (rot) uv = [1 - uv[1], uv[0]];
-      buf.v(ox + x + c[0], oy + y + c[1], oz + z + c[2], uv[0], uv[1], layer, overlay, r, g, bl,
+    const shade = FACE_SHADE[f], uvs = rot ? FACE_UVR : FACE_UV;
+    // start at corner 1 (the other diagonal) when that one is the brighter pair
+    const k0 = (ao[0] + ao[2] + (sk[0] + sk[2]) * 0.003 < ao[1] + ao[3] + (sk[1] + sk[3]) * 0.003) ? 1 : 0;
+    for (let j = 0; j < 4; j++) {
+      const k = (j + k0) & 3, c = F.c[k], u = (f * 4 + k) * 2;
+      buf.v(ox + x + c[0], oy + y + c[1], oz + z + c[2], uvs[u], uvs[u + 1], layer, overlay, r, g, bl,
         Math.round(shade * ao[k] * 255), Math.round(sk[k] * 17), Math.round(bk[k] * 17), anim);
     }
   },
@@ -371,7 +429,7 @@ const Mesher = {
   // or falling column 8/9, a flow of level L (8 - L) / 9); not this fluid -> 0 if the block isn't solid, -1 if it is
   fluidHeight(id, x, y, z) {
     const wls = this.wls, p = this.P(x, y, z), same = (q) => this.ids[q] === id || (id === WATER && (WLOG[this.ids[q]] || (wls && wls[q])));
-    if (!same(p)) return SOLIDCUBE[this.ids[p]] ? -1 : 0;
+    if (!same(p)) return FLUID_WALL[this.ids[p]] ? -1 : 0;
     if (same(this.P(x, y + 1, z))) return 1;
     if (WLOG[this.ids[p]] || (wls && wls[p])) return 8 / 9;
     const m = this.metas[p];
@@ -408,33 +466,59 @@ const Mesher = {
     const L = (dx, dy, dz) => this.lights[this.P(x + dx, y + dy, z + dz)];
     const own = this.lights[this.P(x, y, z)];
     const lmax = (a, c) => (Math.max(a >> 4, c >> 4) << 4) | Math.max(a & 15, c & 15);
-    // top
-    if (!same(above, pAbove)) {
-      const l = lmax(L(0, 1, 0), own);
+    const E = FLUID_INSET, selfBox = single ? -1 : this.flatBox(ids[this.P(x, y, z)], this.metas[this.P(x, y, z)]); // (a waterlogged slab)
+    // top: not when it would lie flush under a cube or a flat box's bottom (vanilla: occluded by the neighbour)
+    const capped = !single && h00 >= 1 && h10 >= 1 && h01 >= 1 && h11 >= 1 && (SOLIDCUBE[above] || (this.flatBox(above, this.metas[pAbove]) & 31) === 0);
+    if (!same(above, pAbove) && !capped) {
+      const l = lmax(L(0, 1, 0), own), sbuf = !single && this.surf && b.render === 'translucent' ? this.surf : buf; // (buildGathered)
       const e = 0.001;
-      this.quadFlat(buf, [[X, Y + h00 - e, Z, 0, 0], [X, Y + h01 - e, Z + 1, 0, 1], [X + 1, Y + h11 - e, Z + 1, 1, 1], [X + 1, Y + h10 - e, Z, 1, 0]], layer, 0, t[0], t[1], t[2], 1, l, anim);
+      this.quadFlat(sbuf, [[X, Y + h00 - e, Z, 0, 0], [X, Y + h01 - e, Z + 1, 0, 1], [X + 1, Y + h11 - e, Z + 1, 1, 1], [X + 1, Y + h10 - e, Z, 1, 0]], layer, 0, t[0], t[1], t[2], 1, l, anim);
       if (b.render === 'translucent') // underside visible from below the surface
-        this.quadFlat(buf, [[X + 1, Y + h10 - e, Z, 1, 0], [X + 1, Y + h11 - e, Z + 1, 1, 1], [X, Y + h01 - e, Z + 1, 0, 1], [X, Y + h00 - e, Z, 0, 0]], layer, 0, t[0], t[1], t[2], 0.8, l, anim);
+        this.quadFlat(sbuf, [[X + 1, Y + h10 - e, Z, 1, 0], [X + 1, Y + h11 - e, Z + 1, 1, 1], [X, Y + h01 - e, Z + 1, 0, 1], [X, Y + h00 - e, Z, 0, 0]], layer, 0, t[0], t[1], t[2], 0.8, l, anim);
     }
-    // bottom
+    // bottom (a little above the floor, out of the plane of a glass or leaf top below; not over a flat box's top)
     const pBelow = this.P(x, y - 1, z), below = ids[pBelow];
-    if (!same(below, pBelow) && !SOLIDCUBE[below]) {
-      this.quadFlat(buf, [[X, Y, Z, 0, 0], [X + 1, Y, Z, 1, 0], [X + 1, Y, Z + 1, 1, 1], [X, Y, Z + 1, 0, 1]], layer, 0, t[0], t[1], t[2], 0.5, lmax(L(0, -1, 0), own), anim);
+    if (!same(below, pBelow) && !SOLIDCUBE[below] && (this.flatBox(below, this.metas[pBelow]) >> 5) !== 16 && (selfBox < 0 || (selfBox & 31) !== 0)) {
+      const yb = Y + (single ? 0 : E);
+      this.quadFlat(buf, [[X, yb, Z, 0, 0], [X + 1, yb, Z, 1, 0], [X + 1, yb, Z + 1, 1, 1], [X, yb, Z + 1, 0, 1]], layer, 0, t[0], t[1], t[2], 0.5, lmax(L(0, -1, 0), own), anim);
     }
-    // sides
+    // sides, inset (vanilla: 0.001) so they don't share a plane with the face of a glass, leaf, slab or stair beside them
     // [face, dx, dz, BL(x,z), BR(x,z), height at BR, height at BL]
+    const e = single ? 0 : E;
     const sides = [
-      [0, -1, 0, X, Z, X, Z + 1, h01, h00],
-      [1, 1, 0, X + 1, Z + 1, X + 1, Z, h10, h11],
-      [4, 0, -1, X + 1, Z, X, Z, h00, h10],
-      [5, 0, 1, X, Z + 1, X + 1, Z + 1, h11, h01],
+      [0, -1, 0, X + e, Z, X + e, Z + 1, h01, h00],
+      [1, 1, 0, X + 1 - e, Z + 1, X + 1 - e, Z, h10, h11],
+      [4, 0, -1, X + 1, Z + e, X, Z + e, h00, h10],
+      [5, 0, 1, X, Z + 1 - e, X + 1, Z + 1 - e, h11, h01],
     ];
     for (const [f, dx, dz, ax, az, bx, bz, hb, ha] of sides) {
       const pn = this.P(x + dx, y, z + dz), nid = ids[pn];
       if (same(nid, pn) || SOLIDCUBE[nid]) continue;
-      const q = [[ax, Y, az, 0, 1], [bx, Y, bz, 1, 1], [bx, Y + hb, bz, 1, 1 - hb], [ax, Y + ha, az, 0, 1 - ha]];
+      // what a flat box beside it (or the waterlogged block itself) leaves showing: above lo, below cap
+      let lo = 0, cap = 1;
+      for (let k = 0; k < 2; k++) {
+        const c = k ? selfBox : this.flatBox(nid, this.metas[pn]);
+        if (c < 0) continue;
+        if ((c & 31) === 0) lo = Math.max(lo, (c >> 5) / 16); else if ((c >> 5) === 16) cap = Math.min(cap, (c & 31) / 16);
+      }
+      const hmin = Math.min(ha, hb);
+      if (lo >= Math.max(ha, hb) || cap <= lo) continue; // farmland beside a source, a double slab
+      // the bottom raised to the box's top (no higher than the lower end, so nothing that shows is cut), the top
+      // lowered to a top slab's underside when both ends reach it
+      const y0 = Math.min(lo, hmin), ta = cap <= hmin ? cap : ha, tb2 = cap <= hmin ? cap : hb;
+      const q = [[ax, Y + y0, az, 0, 1 - y0], [bx, Y + y0, bz, 1, 1 - y0], [bx, Y + tb2, bz, 1, 1 - tb2], [ax, Y + ta, az, 0, 1 - ta]];
       this.quadFlat(buf, q, layer, 0, t[0], t[1], t[2], FACE_SHADE[f], lmax(L(dx, 0, dz), own), anim);
     }
+  },
+  // the vertical extent of a block that fills its whole footprint between two heights (FLAT_BOX), in 16ths: bottom
+  // + top * 32, or -1
+  flatBox(id, m) {
+    switch (FLAT_BOX[id]) {
+      case 1: return 15 << 5;
+      case 2: return (m & 3) === 0 ? 8 << 5 : (m & 3) === 1 ? 8 | (16 << 5) : 16 << 5;
+      case 3: return (2 * ((m & 7) + 1)) << 5;
+    }
+    return -1;
   },
 
   boxes(b, id, meta, x, y, z, ox, oy, oz, single) {

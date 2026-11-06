@@ -54,7 +54,13 @@ function bindInput(g) {
   });
   // the browser refuses the mouse lock (some browsers and app web views never give it): played with the mouse free
   // instead of the pause menu coming back each time "back to game" is clicked (players' feedback 2026-10-31, ~10)
-  document.addEventListener('pointerlockerror', () => { g.lockFails = (g.lockFails || 0) + 1; });
+  // (a soft refusal - asked with no click behind it, or again right after the player left the lock: game.js
+  // capturePointer marks the request with lockSoftAt - is not counted: the browser said nothing about itself. This
+  // listener runs before game.js's own, which then finds lockSoftAt cleared)
+  document.addEventListener('pointerlockerror', () => {
+    if (g.lockSoftAt && performance.now() - g.lockSoftAt < 1500) { g.lockSoftAt = 0; return; }
+    g.lockFails = (g.lockFails || 0) + 1;
+  });
   const freeMouse = () => g.lockFails > 0 && !locked() && !touchOn(g);
   window.addEventListener('mousemove', (e) => {
     if ((locked() || freeMouse()) && !ui.screen && g.state === 'play') {
@@ -109,10 +115,25 @@ Renderer.prototype.playerPreview = function (game, ui, x, y, w, h, opts) {
   // asynchronously: read into a pixel buffer, fenced, and copied out a frame or two later once the fence has
   // passed - a plain readPixels made the CPU wait for the whole frame (the world behind the inventory
   // included) every time the mouse moved
-  const P = game.player, gear = P ? [P.inv.sel, ...[P.inv.held, ...P.inv.slots.slice(36, 41)].map(s => s ? s.id + ':' + (s.dmg || 0) : 0)].join('/') : '';
-  // (the skin, the cape and its frame: the wardrobe's turning preview, skins.js / capes.js)
-  const look = P && typeof Skins !== 'undefined' ? Skins.texOf(game, P) + Skins.modelOf(game, P) + (Capes.of(game, P) || '') + Math.floor(performance.now() / 125) : '';
-  const key = (opts && opts.yaw !== undefined ? 'y' + opts.yaw.toFixed(2) : Math.round(ui.mouse.x) + ',' + Math.round(ui.mouse.y)) + ',' + x + ',' + y + ',' + W + ',' + H + ',' + gear + look;
+  // (a dyed piece's colour too: two leather chestplates swapped differ by it alone - the frame below no longer covers it)
+  const P = game.player, gear = P ? [P.inv.sel, ...[P.inv.held, ...P.inv.slots.slice(36, 41)].map(s => s ? s.id + ':' + (s.dmg || 0) + ':' + (s.color ?? '') : 0)].join('/') : '';
+  // (the skin, the cape and its frame: the wardrobe's turning preview, skins.js / capes.js. The frame (8 a second) only
+  // for an animated cape or the wardrobe, whose pet moves - and for 1.5 s after what is worn changed, as an armour or
+  // wing texture seen for the first time loads a moment later (emodel.js etex: null until then). Always in the key,
+  // the inventory drew the player again 8 times a second with nothing changed)
+  const cape = P && typeof Capes !== 'undefined' ? Capes.of(game, P) : null, cp = cape && Capes.get(cape), now = performance.now();
+  const look = P && typeof Skins !== 'undefined' ? Skins.texOf(game, P) + Skins.modelOf(game, P) + (cape || '') : '';
+  const worn = x + ',' + y + ',' + W + ',' + H + ',' + gear + look;
+  if (this.pvWorn !== worn) { this.pvWorn = worn; this.pvWornT = now; }
+  // (asked for every frame while its screen is open: a gap means the screen was opened again - drawn again once then,
+  // as what the key leaves out may have changed meanwhile: a crossbow loaded, a hat, a trim, where the compass points.
+  // Without it a reopened inventory showed the last picture until the mouse moved - on phones until a touch, 11-04)
+  if (now - (this.pvAt || -1e9) > 500) this.pvForce = true;
+  this.pvAt = now;
+  // (a held compass / clock turns in the hand - the frame keeps it going as before)
+  const dyn = (s) => /^(compass|recovery_compass|clock)$/.test(keyOfStack(s) || '');
+  const moving = (opts && opts.yaw !== undefined) || !!(cp && cp.frames && cp.frames.length > 1) || now - this.pvWornT < 1500 || !!(P && (dyn(P.inv.held) || dyn(P.inv.slots[40])));
+  const key = (opts && opts.yaw !== undefined ? 'y' + opts.yaw.toFixed(2) : Math.round(ui.mouse.x) + ',' + Math.round(ui.mouse.y)) + ',' + worn + (moving ? ',' + Math.floor(now / 125) : '');
   if (this.pv && this.pv.sync && this.pv.W === W && this.pv.H === H) {
     const pv = this.pv;
     if (gl.getSyncParameter(pv.sync, gl.SYNC_STATUS) !== gl.SIGNALED) return pv.cv;
@@ -124,7 +145,8 @@ Renderer.prototype.playerPreview = function (game, ui, x, y, w, h, opts) {
     pv.ctx.putImageData(pv.img, 0, 0);
     pv.key = pv.pendingKey;
   }
-  if (this.pv && this.pv.key === key) return this.pv.cv;
+  if (this.pv && this.pv.key === key && !this.pvForce) return this.pv.cv;
+  this.pvForce = false;
   if (!this.pv || this.pv.W !== W || this.pv.H !== H) {
     if (this.pv) {
       gl.deleteFramebuffer(this.pv.fb); gl.deleteTexture(this.pv.tex); gl.deleteRenderbuffer(this.pv.rb);

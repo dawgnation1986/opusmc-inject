@@ -76,6 +76,8 @@ function shade(c) {
   const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
   return '#' + [r >> 2, g >> 2, b >> 2].map(v => v.toString(16).padStart(2, '0')).join('');
 }
+// an item icon scaled smoothly (a block drawn in 3D) or in whole pixels (flat items, crosses)
+const iconSmooth = (id) => { const def = ITEMS[id]; return !!(def && def.block && !def.flat && BLOCKS[id] && BLOCKS[id].shape !== SH_CROSS); };
 // the shining buttons' colours (UI.goldShine): [normal, hover] pairs; glint is an rgba() prefix
 const SHINE_GOLD = { top: ['rgba(246,205,80,0.9)', 'rgba(255,226,120,0.92)'], bottom: ['rgba(190,132,24,0.9)', 'rgba(214,160,40,0.92)'],
   light: 'rgba(255,248,210,0.55)', dark: 'rgba(110,70,0,0.55)', glint: 'rgba(255,255,220,', edge: ['#E8B830', '#FFF2B0'] };
@@ -159,18 +161,19 @@ class UI {
   }
   drawItem(stack, x, y, opts = {}) {
     if (!stack) return;
-    const r = this.game.renderer, S = r.iconSize, c = this.ctx;
-    const id = stack.id;
-    c.imageSmoothingEnabled = !!(ITEMS[id] && ITEMS[id].block && !ITEMS[id].flat && BLOCKS[id] && BLOCKS[id].shape !== SH_CROSS);
+    const r = this.game.renderer, c = this.ctx;
+    const id = stack.id, def = ITEMS[id];
+    c.imageSmoothingEnabled = iconSmooth(id);
     c.imageSmoothingQuality = 'high';
-    if (stack.unk) { // an item this game doesn't have (on a server): the missing texture
+    // an item this game doesn't have (on a server; or an id not in ITEMS at all - telemetry 11-02/03, tooltips and the
+    // held item's name threw on one, every frame): the missing texture
+    if (stack.unk || !def) {
       c.fillStyle = '#000'; c.fillRect(x, y, 16, 16); c.fillStyle = '#F800F8'; c.fillRect(x, y, 8, 8); c.fillRect(x + 8, y + 8, 8, 8);
     } else if (stackTinted(stack) && r.stackIcon(id, stack)) c.drawImage(r.stackIcon(id, stack), x, y, 16, 16);
     else if (typeof itemStateTex === 'function' && itemStateTex(stack, this.game.player)) c.drawImage(r.tileIcon(itemStateTex(stack, this.game.player)), x, y, 16, 16);
-    else c.drawImage(this.itemIcon(id), 0, 0, S, S, x, y, 16, 16);
+    else c.drawImage(this.itemIcon(id), x, y, 16, 16);
     c.imageSmoothingEnabled = false; c.imageSmoothingQuality = 'low';
-    if (stack.g || (stack.g !== false && ((stack.e && stack.e.length) || (ITEMS[id] && ITEMS[id].glint)))) this.drawGlint(stack, x, y);
-    const def = ITEMS[id];
+    if (def && (stack.g || (stack.g !== false && ((stack.e && stack.e.length) || def.glint)))) this.drawGlint(stack, x, y);
     if (def && def.durability && stack.dmg > 0) {
       const f = 1 - stack.dmg / def.durability;
       c.fillStyle = '#000'; c.fillRect(x + 2, y + 13, 13, 2);
@@ -184,27 +187,42 @@ class UI {
   // an item's icon as a small canvas of its own (copied once from the icon atlas, most recently used kept).
   // Drawn straight from the atlas (2048x3200, filled with putImageData) every slot of every frame, the browser
   // had to upload the whole atlas to the GPU again each time its GPU copy was dropped from the canvas cache -
-  // which, once it happened (after a while, often on opening a menu), held the game at 7-8 fps until a reload
+  // which, once it happened (after a while, often on opening a menu), held the game at 7-8 fps until a reload.
+  // Made at the size it is shown (16 GUI px: 48 device px on most phones, never over the atlas's 64), scaled once the
+  // way drawItem scaled it each frame, and enough of them kept for every item: 600 of 64x64 churned through the
+  // creative tabs - going through them all a second time still made 2838 canvases (4.1 ms a frame), now none
+  // (0.20 ms a frame); all 1578 kept at 48 px are 13.9 MB, the 600 at 64 px were 9.4 (11-03)
   itemIcon(id) {
-    const r = this.game.renderer, S = r.iconSize;
-    if (this.iconsOf !== r.iconAtlas) { this.iconsOf = r.iconAtlas; this.icons = new Map(); }
+    const r = this.game.renderer, S = r.iconSize, D = Math.min(S, 16 * this.scale);
+    if (this.iconsOf !== r.iconAtlas || this.iconD !== D) { this.iconsOf = r.iconAtlas; this.iconD = D; this.icons = new Map(); }
     const cache = this.icons;
     let cv = cache.get(id);
     if (cv) { cache.delete(id); cache.set(id, cv); return cv; }
-    cv = document.createElement('canvas'); cv.width = cv.height = S;
-    cv.getContext('2d').drawImage(r.iconAtlas, ...r.iconXY(id), S, S, 0, 0, S, S);
+    cv = document.createElement('canvas'); cv.width = cv.height = D;
+    const k = cv.getContext('2d');
+    if (D === S) k.drawImage(r.iconAtlas, ...r.iconXY(id), S, S, 0, 0, S, S);
+    else { k.imageSmoothingEnabled = iconSmooth(id); k.imageSmoothingQuality = 'high'; k.drawImage(this.iconCopy(id), 0, 0, S, S, 0, 0, D, D); }
     cache.set(id, cv);
-    if (cache.size > 600) cache.delete(cache.keys().next().value);
+    if (cache.size > 2048) cache.delete(cache.keys().next().value);
     return cv;
   }
-  // the enchantment glint: the icon's shape tinted purple, pulsing
+  // the item's 64 px picture copied out of the atlas into one canvas kept for it, to be scaled from there: the same
+  // picture to the bit as before (scaled straight out of the 2048x3200 atlas, 75 flat icons came out a pixel off at
+  // their edges and 1032 block icons up to 29/255 apart - the texel picked on the half-pixel steps of 64 -> 48 px, 11-04)
+  iconCopy(id) {
+    const r = this.game.renderer, S = r.iconSize, cv = this.iconTmp || (this.iconTmp = document.createElement('canvas'));
+    if (cv.width !== S || cv.height !== S) cv.width = cv.height = S;
+    const k = cv.getContext('2d'); k.clearRect(0, 0, S, S); k.drawImage(r.iconAtlas, ...r.iconXY(id), S, S, 0, 0, S, S);
+    return cv;
+  }
+  // the enchantment glint: the icon's shape tinted purple, pulsing (its shape from the 64 px picture, once per item)
   drawGlint(stack, x, y) {
     const r = this.game.renderer, S = r.iconSize, id = stack.id, cache = this.glints || (this.glints = new Map());
     let cv = cache.get(id);
     if (!cv) {
       cv = document.createElement('canvas'); cv.width = cv.height = 16;
       const k = cv.getContext('2d');
-      k.drawImage(this.itemIcon(id), 0, 0, S, S, 0, 0, 16, 16);
+      k.drawImage(this.iconCopy(id), 0, 0, S, S, 0, 0, 16, 16);
       k.globalCompositeOperation = 'source-atop'; k.fillStyle = '#A050FF'; k.fillRect(0, 0, 16, 16);
       cache.set(id, cv);
     }
@@ -226,9 +244,14 @@ class UI {
     let yy = ty;
     lines.forEach((l, i) => { Font.draw(c, l.text, tx, yy, l.color || '#FFFFFF'); yy += i === 0 ? 12 : 10; });
   }
+  // a slot's tooltip: an id not in ITEMS (telemetry 11-02/03: 'rarity' of undefined) only gets these - the itemLines
+  // wrappers of other files read ITEMS[id] too
+  tipLines(stack) { return ITEMS[stack.id] || stack.unk ? this.itemLines(stack) : this.unknownLines(stack); }
+  unknownLines(stack) { return [{ text: '未知物品', color: '#FFFFFF' }, { text: '#' + stack.id, color: '#555555' }]; }
   itemLines(stack) {
     if (stack.unk) return netItemLines(stack, [{ text: '未知物品', color: '#FFFFFF' }, { text: 'minecraft:' + stack.unk, color: '#555555' }]);
     const d = ITEMS[stack.id];
+    if (!d) return this.unknownLines(stack);
     const R = ['common', 'uncommon', 'rare', 'epic'], ri = Math.max(0, R.indexOf(d.rarity || 'common')), rr = stack.e && stack.e.length ? (ri < 2 ? 2 : 3) : ri;
     const lines = [{ text: d.cn, color: ['#FFFFFF', '#FFFF55', '#55FFFF', '#FF55FF'][rr] }];
     if (stack.trim && typeof TRIM_CN !== 'undefined') {
@@ -330,8 +353,11 @@ class UI {
     // (the field's own text is invisible - drawInputText draws it. On a touch screen at least 16px: iPhones zoom the
     // whole page in on a field with smaller text when it is focused)
     el.style.fontSize = Math.max(navigator.maxTouchPoints > 0 ? 16 : 12, (h - 6) * s) + 'px';
-    el.value = value || ''; el.maxLength = opts.max || 100;
-    el.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') onEnter(el.value); if (e.key === 'Escape') { if (opts.onEsc) opts.onEsc(); } };
+    el.value = value || ''; el.maxLength = opts.max || 100; el.enterKeyHint = opts.enter || 'done';
+    // (Esc in a field: marked as held, as main.js does for the window's keys - the field keeps its keys to itself - so a
+    // screen it closes takes the mouse lock back only when the key comes up. Taken while it was down, the browser read
+    // the same Esc as leaving the lock and opened the pause menu: chat open + Esc did that, feedback 2026-11-01 14:13)
+    el.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') onEnter(el.value); if (e.key === 'Escape') { if (!e.repeat) this.game.escHeld = performance.now(); if (opts.onEsc) opts.onEsc(); } };
     el.oninput = () => { if (opts.onInput) opts.onInput(el.value); };
     // after a touch the field waits for its own tap, so the on-screen keyboard doesn't pop up uninvited
     if (!(this.lastTouch && performance.now() - this.lastTouch < 2000)) setTimeout(() => el.focus(), 0);
@@ -473,12 +499,12 @@ class UI {
     }
     // held item name
     if (p.inv.sel !== this.lastSel) { this.lastSel = p.inv.sel; this.itemNameT = performance.now(); }
-    const held = p.inv.held;
+    const held = p.inv.held, hd = held && ITEMS[held.id];
     const dt = performance.now() - this.itemNameT;
-    if (held && dt < 2500) {
+    if (hd && dt < 2500) {
       const a = dt > 2000 ? 1 - (dt - 2000) / 500 : 1;
       c.globalAlpha = a;
-      Font.center(c, ITEMS[held.id].cn, W / 2, H - (p.creative ? 38 : 58), '#FFFFFF');
+      Font.center(c, hd.cn || hd.key, W / 2, H - (p.creative ? 38 : 58), '#FFFFFF');
       c.globalAlpha = 1;
     }
     // action bar message
@@ -508,14 +534,16 @@ class UI {
     // menu, like vanilla when the window loses focus - its "back to game" click captures the mouse. A short grace
     // for a capture still in flight; g.noLockPause (scripted tests, which never get the lock) keeps playing instead
     // closed with Esc, though, the browser refuses the lock (a key press is no "user gesture" for it): a line asking
-    // for a click instead of the same menu coming straight back (Mac, players' feedback 2026-10-31)
-    const unlocked = document.pointerLockElement !== g.canvas;
+    // for a click instead of the same menu coming straight back (Mac, players' feedback 2026-10-31). Nor while the Esc
+    // that closed a screen is still down (escCapture: the lock is asked for when it comes up, main.js) - held past the
+    // grace, the pause menu opened anyway: chat + Esc did that, feedback 2026-11-01 14:13
+    const unlocked = document.pointerLockElement !== g.canvas, escWait = g.escCapture && g.escHeld && performance.now() - g.escHeld < 1500;
     if (g.clickToResume && (!unlocked || this.screen || g.state !== 'play')) g.clickToResume = 0;
     if (g.clickToResume && !touchOn(g) && !g.lockFails) {
       const t = '点击画面继续游戏', tw = Font.width(t);
       c.globalAlpha = 0.6; c.fillStyle = '#000'; c.fillRect(Math.floor(W / 2 - tw / 2 - 6), Math.floor(H / 2) + 14, tw + 12, 14); c.globalAlpha = 1;
       Font.center(c, t, W / 2, Math.floor(H / 2) + 17, '#FFFFFF');
-    } else if (!this.screen && g.state === 'play' && unlocked && !g.debugPause && !touchOn(g) && !g.noLockPause && !g.lockFails) {
+    } else if (!this.screen && g.state === 'play' && unlocked && !g.debugPause && !touchOn(g) && !g.noLockPause && !g.lockFails && !escWait) {
       const now = performance.now();
       if (!this.unlockedAt) this.unlockedAt = now;
       else if (now - this.unlockedAt > 250) { this.unlockedAt = 0; this.open(new PauseScreen(g)); }
@@ -639,6 +667,10 @@ class UI {
   // ---- frame ------------------------------------------------------------------------------
   draw() {
     const c = this.ctx;
+    // (a page with no size - an app web view in the background or a frame folded away: the vignette copy, made the
+    // canvas's size, could not be drawn - telemetry 11-02/03 'canvas element with a width or height of 0' - and there is
+    // nothing to see anyway: nothing drawn until it has a size again, which resize() gives it)
+    if (!this.canvas.width || !this.canvas.height) return;
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.clearRect(0, 0, this.canvas.width, this.canvas.height);
     c.setTransform(this.scale, 0, 0, this.scale, 0, 0);
@@ -660,12 +692,26 @@ class UI {
     if (this.touch) this.touch.draw(this);
     if (this.cursor) this.drawItem(this.cursor, this.mouse.x - 8, this.mouse.y - 8);
   }
+  // the underwater tile at brightness q (0-1): black at 1 - q laid over it inside its own alpha, which is what the
+  // brightness(q) filter did to it (at most 33 of 16x16 kept)
+  waterTile(q) {
+    const src = this.img.underwater;
+    if (this.waterOf !== src) { this.waterOf = src; this.waterTiles = new Map(); }
+    let cv = this.waterTiles.get(q);
+    if (!cv) {
+      cv = document.createElement('canvas'); cv.width = src.width; cv.height = src.height;
+      const k = cv.getContext('2d'); k.drawImage(src, 0, 0);
+      if (q < 1) { k.globalCompositeOperation = 'source-atop'; k.fillStyle = `rgba(0,0,0,${1 - q})`; k.fillRect(0, 0, cv.width, cv.height); }
+      this.waterTiles.set(q, cv);
+    }
+    return cv;
+  }
   drawOverlays() {
     const g = this.game, p = g.player, c = this.ctx, W = this.w, H = this.h;
     // vignette
     // vanilla darkens the screen by the texture's brightness (blend ZERO, ONE_MINUS_SRC_COLOR);
     // the UI canvas is transparent, so turn it into a black overlay with that brightness as alpha
-    if (!this.vigCanvas) {
+    if (!this.vigCanvas && this.img.vignette && this.img.vignette.width) {
       const src = this.img.vignette, vc = document.createElement('canvas');
       vc.width = src.width; vc.height = src.height;
       const vx = vc.getContext('2d'); vx.drawImage(src, 0, 0);
@@ -678,20 +724,22 @@ class UI {
     // over the whole screen every frame is cheap only while the browser draws canvases on the GPU - when it falls
     // back to drawing them in software (it can, after a while, until the page reloads) it cost most of a frame
     const cw = this.canvas.width, chh = this.canvas.height;
-    if (!this.vigFull || this.vigFull.width !== cw || this.vigFull.height !== chh) {
+    if (this.vigCanvas && (!this.vigFull || this.vigFull.width !== cw || this.vigFull.height !== chh)) {
       const vf = this.vigFull = document.createElement('canvas'); vf.width = cw; vf.height = chh;
       const fx = vf.getContext('2d'); fx.globalAlpha = 0.5; fx.imageSmoothingEnabled = true; fx.drawImage(this.vigCanvas, 0, 0, cw, chh);
     }
-    c.save(); c.setTransform(1, 0, 0, 1, 0, 0); c.drawImage(this.vigFull, 0, 0); c.restore();
+    if (this.vigFull) { c.save(); c.setTransform(1, 0, 0, 1, 0, 0); c.drawImage(this.vigFull, 0, 0); c.restore(); }
     // under water: vanilla ScreenEffectRenderer.renderWater - underwater.png stretched four times across the
-    // screen each way, at 10% and darkened by the light at the eyes, sliding 1/64 tile per degree of turning
-    if (g.headInWater) {
+    // screen each way, at 10% and darkened by the light at the eyes, sliding 1/64 tile per degree of turning.
+    // Darkened beforehand: the 16 px tile kept per brightness step (1/32: under 1/2 a level of the 10% overlay) - a
+    // canvas filter made the browser draw each of the 25 tiles through an offscreen layer of its own
+    if (g.headInWater && this.img.underwater) {
       const [sky, blk] = p.lightAt(), lv = Math.max(sky * g.daylight(), blk), br = lv / (4 - 3 * lv);
-      const tw = W / 4, th = H / 4, D = 180 / Math.PI;
+      const tw = W / 4, th = H / 4, D = 180 / Math.PI, im = this.waterTile(Math.round(br * 32) / 32);
       const ox = (((p.yaw * D / 64) % 1 + 1) % 1) * tw, oy = (((p.pitch * D / 64) % 1 + 1) % 1) * th;
-      c.globalAlpha = 0.1; c.imageSmoothingEnabled = true; c.filter = `brightness(${br.toFixed(3)})`;
-      for (let x = ox - tw; x < W; x += tw) for (let y = oy - th; y < H; y += th) c.drawImage(this.img.underwater, x, y, tw, th);
-      c.filter = 'none'; c.globalAlpha = 1; c.imageSmoothingEnabled = false;
+      c.globalAlpha = 0.1; c.imageSmoothingEnabled = true;
+      for (let x = ox - tw; x < W; x += tw) for (let y = oy - th; y < H; y += th) c.drawImage(im, x, y, tw, th);
+      c.globalAlpha = 1; c.imageSmoothingEnabled = false;
     }
     if (g.headInLava) { c.fillStyle = 'rgba(200,60,0,0.75)'; c.fillRect(0, 0, W, H); }
     // freezing in powder snow: vanilla's frost round the edges of the view, as strong as how frozen (140 ticks = full)
@@ -791,7 +839,7 @@ class ContainerScreen {
       ui.drawItem(st, this.x + s.x, this.y + s.y);
       if (s === hov || (this.dragSlots && this.dragSlots.has(s))) { ui.ctx.fillStyle = 'rgba(255,255,255,0.5)'; ui.ctx.fillRect(this.x + s.x, this.y + s.y, 16, 16); }
     }
-    if (hov && hov.get() && !ui.cursor) ui.tooltip(ui.itemLines(hov.get()), ui.mouse.x, ui.mouse.y);
+    if (hov && hov.get() && !ui.cursor) ui.tooltip(ui.tipLines(hov.get()), ui.mouse.x, ui.mouse.y);
   }
   draw(ui) { this.drawBase(ui); this.drawExtra && this.drawExtra(ui); this.drawSlots(ui); }
   canPlace(s, st) { return !s.output && (!s.accept || s.accept(st)); }
@@ -816,7 +864,7 @@ class ContainerScreen {
     // and a real double click never got there - 「电脑双击不能收集一组」, feedback 2026-11-02)
     if (button === 0 && ui.cursor && !st && this.lastClick && now - this.lastClick.t < 300 && this.lastClick.slot === s && this.lastClick.stack === ui.cursor) {
       const c = ui.cursor, ms = maxStack(c.id);
-      if (!ITEMS[c.id].durability) for (const o of this.slots) {
+      if (!(ITEMS[c.id] && ITEMS[c.id].durability)) for (const o of this.slots) {
         if (o.output || c.count >= ms) continue;
         const os = o.get();
         if (os && os !== c && sameKind(os, c)) { const k = Math.min(os.count, ms - c.count); c.count += k; os.count -= k; if (!os.count) o.set(null); }
@@ -837,7 +885,7 @@ class ContainerScreen {
     if (button === 0) {
       if (!ui.cursor) { if (st) { ui.cursor = st; s.set(null); } }
       else if (!st) { if (this.canPlace(s, ui.cursor)) { const k = Math.min(ui.cursor.count, this.maxIn(s, ui.cursor)); s.set({ ...ui.cursor, count: k }); ui.cursor.count -= k; if (!ui.cursor.count) ui.cursor = null; } }
-      else if (sameKind(st, ui.cursor) && !ITEMS[st.id].durability) { const k = Math.min(ui.cursor.count, this.maxIn(s, st) - st.count); st.count += k; ui.cursor.count -= k; if (!ui.cursor.count) ui.cursor = null; }
+      else if (sameKind(st, ui.cursor) && !(ITEMS[st.id] && ITEMS[st.id].durability)) { const k = Math.min(ui.cursor.count, this.maxIn(s, st) - st.count); st.count += k; ui.cursor.count -= k; if (!ui.cursor.count) ui.cursor = null; }
       else if (this.canPlace(s, ui.cursor)) { s.set(ui.cursor); ui.cursor = st; }
     } else if (button === 2) {
       if (!ui.cursor) { if (st) { const k = Math.ceil(st.count / 2); ui.cursor = { ...st, count: k }; st.count -= k; if (!st.count) s.set(null); } }
@@ -877,12 +925,12 @@ class ContainerScreen {
     if (s.group === 'hotbar') targets = this.slots.filter(o => o.group === 'container').length ? this.slots.filter(o => o.group === 'container') : this.slots.filter(o => o.group === 'main');
     else if (s.group === 'main') targets = this.slots.filter(o => o.group === 'container').length ? this.slots.filter(o => o.group === 'container') : this.slots.filter(o => o.group === 'hotbar');
     else targets = this.slots.filter(o => o.group === 'hotbar' || o.group === 'main').sort((a, b) => (a.group === 'hotbar' ? 1 : 0) - (b.group === 'hotbar' ? 1 : 0)).reverse();
-    if (ITEMS[st.id].armor && (s.group === 'main' || s.group === 'hotbar')) {
+    if (ITEMS[st.id] && ITEMS[st.id].armor && (s.group === 'main' || s.group === 'hotbar')) {
       const a = this.slots.find(o => o.armorSlot === ITEMS[st.id].armor.slot && !o.get());
       if (a) { a.set(st); s.set(null); return; }
     }
     targets = targets.filter(t => this.canPlace(t, st));
-    for (const t of targets) { const ts = t.get(); if (ts && sameKind(ts, st) && !ITEMS[st.id].durability) { const k = Math.min(st.count, this.maxIn(t, st) - ts.count); ts.count += k; st.count -= k; if (!st.count) { s.set(null); return; } } }
+    for (const t of targets) { const ts = t.get(); if (ts && sameKind(ts, st) && !(ITEMS[st.id] && ITEMS[st.id].durability)) { const k = Math.min(st.count, this.maxIn(t, st) - ts.count); ts.count += k; st.count -= k; if (!st.count) { s.set(null); return; } } }
     for (const t of targets) { if (!t.get()) { const k = Math.min(st.count, this.maxIn(t, st)); t.set({ ...st, count: k }); st.count -= k; if (!st.count) { s.set(null); return; } } }
   }
   takeOutput(ui, s, shift) {
@@ -943,7 +991,7 @@ class CraftingScreen extends ContainerScreen {
     if (!big) {
       const inv = game.player.inv;
       const icons = ['slot_helmet', 'slot_chestplate', 'slot_leggings', 'slot_boots'];
-      for (let i = 0; i < 4; i++) this.slots.push({ x: 8, y: 8 + i * 18, armorSlot: i, emptyIcon: icons[i], get: () => inv.slots[36 + i], set: (s) => { inv.slots[36 + i] = s; }, accept: (st) => ITEMS[st.id].armor && ITEMS[st.id].armor.slot === i, max: 1, group: 'armor' });
+      for (let i = 0; i < 4; i++) this.slots.push({ x: 8, y: 8 + i * 18, armorSlot: i, emptyIcon: icons[i], get: () => inv.slots[36 + i], set: (s) => { inv.slots[36 + i] = s; }, accept: (st) => !!ITEMS[st.id] && ITEMS[st.id].armor && ITEMS[st.id].armor.slot === i, max: 1, group: 'armor' });
     }
     this.addPlayerSlots(84, 142);
     if (!big && !game.net) { const inv = game.player.inv; this.slots.push({ x: 77, y: 62, emptyIcon: 'slot_shield', get: () => inv.slots[40], set: (s) => { inv.slots[40] = s; }, group: 'offhand' }); }
@@ -1259,7 +1307,7 @@ class CreativeScreen extends ContainerScreen {
     const A = ['slot_helmet', 'slot_chestplate', 'slot_leggings', 'slot_boots'];
     this.invSlots = [
       ...[0, 1, 2, 3].map(i => ({ x: 54 + Math.floor(i / 2) * 54, y: 6 + (i % 2) * 27, armorSlot: i, emptyIcon: A[i], max: 1, group: 'armor',
-        get: () => inv.slots[36 + i], set: (s) => { inv.slots[36 + i] = s; }, accept: (st) => ITEMS[st.id].armor && ITEMS[st.id].armor.slot === i })),
+        get: () => inv.slots[36 + i], set: (s) => { inv.slots[36 + i] = s; }, accept: (st) => !!ITEMS[st.id] && ITEMS[st.id].armor && ITEMS[st.id].armor.slot === i })),
       { x: 35, y: 20, emptyIcon: 'slot_shield', group: 'offhand', get: () => inv.slots[40], set: (s) => { inv.slots[40] = s; } },
       ...Array.from({ length: 27 }, (_, k) => ({ x: 9 + (k % 9) * 18, y: 54 + Math.floor(k / 9) * 18, group: 'main', get: () => inv.slots[9 + k], set: (s) => { inv.slots[9 + k] = s; } })),
       ...this.itemSlots.filter(s => s.group === 'hotbar'), this.trashSlot,
@@ -1332,7 +1380,7 @@ class CreativeScreen extends ContainerScreen {
       ui.drawItem(s.get(), this.x + s.x, this.y + s.y);
       if (s === hov) { ui.ctx.fillStyle = 'rgba(255,255,255,0.5)'; ui.ctx.fillRect(this.x + s.x, this.y + s.y, 16, 16); }
     }
-    if (hov && hov.get() && !ui.cursor) ui.tooltip(ui.itemLines(hov.get()), ui.mouse.x, ui.mouse.y);
+    if (hov && hov.get() && !ui.cursor) ui.tooltip(ui.tipLines(hov.get()), ui.mouse.x, ui.mouse.y);
   }
   mouseDown(ui, mx, my, button, shift) {
     const tabs = this.tabs();

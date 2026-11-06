@@ -181,51 +181,75 @@ class QualityScreen extends MenuScreen {
     this.startBench();
   }
   get hz() { const p = this.game.pacer; return p && p.refresh ? Math.round(1000 / p.refresh) : 60; }
+  // the frame rate a game gets here (60 on a 90/120 Hz phone unless the player chose more: perf.js playLimit)
+  get gameFps() { const p = this.game.pacer; return Math.min(this.hz, (p && p.playLimit) || 1000); }
   // the measurement: how long the device really works on a frame of the live world, for each shader level in
   // turn. Not the time between frames - with VSync that is only the display's rate, whatever the card could do;
   // reading a pixel back after the frame waits until the graphics card has finished it
   startBench() {
     const g = this.game, gl = g.renderer.gl, px = new Uint8Array(4), self = this;
     this.levels = this.fxOk && !this.hw.phone ? SHADER_CARDS.map((c) => c.lv) : [0];
-    this.li = 0; this.got = []; this.skip = 6; this.ms = {}; this.lt0 = performance.now();
+    this.li = 0; this.got = []; this.skip = 6; this.ms = {}; this.lt0 = performance.now(); this.benchFrom = 0;
     this.setLevel(this.levels[0]);
     const own = Object.prototype.hasOwnProperty.call(g, 'render') ? g.render : null, orig = g.render;
     g.render = function (...a) {
       const t = performance.now(), r = orig.apply(this, a);
-      if (self.phase === 'detect' && !document.hidden) { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); self.sample(performance.now() - t); }
+      if (self.phase === 'detect' && !document.hidden && self.loaded()) { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); self.sample(performance.now() - t); }
       return r;
     };
     this.unhook = () => { if (own) g.render = own; else delete g.render; this.unhook = null; };
+  }
+  // measured only once the title world is built: nothing generating or waiting to be meshed and as many sections for
+  // 1 s (at most 10 s). It used to start at once - frames building the world and uploading its meshes measured
+  // light on a fresh page, and phones were recommended 高 / 极致 they could not keep up with
+  loaded() {
+    if (this.benchFrom) return true;
+    const g = this.game, now = performance.now(), n = g.renderer.sections ? g.renderer.sections.size : 0;
+    const busy = g.titleGround || (g.genQueue && g.genQueue.length) || g.meshPending || (g.genPending && g.genPending.size) || (g.finalQ && g.finalQ.length);
+    if (busy || n !== this.secN) { this.secN = n; this.secT = now; }
+    if ((!busy && n && now - this.secT >= 1000) || now - this.t0 > 10000) { this.benchFrom = this.lt0 = now; this.skip = 6; return true; }
+    return false;
   }
   setLevel(lv) { const g = this.game; g.settings.shaders = lv; g.applySettings(); }
   sample(ms) {
     // (the first frames after a change build the shaders; a stall says nothing about the device)
     if (this.skip > 0) { this.skip--; return; }
     if (ms < 250) this.got.push(ms);
-    if (this.got.length < 24 && performance.now() - this.lt0 < 1200) return;
+    // (at least 48 frames over at least 2 s - 24 in 1.2 s was a moment, often a lucky one; a level slower than that
+    // gets 5 s and goes by what it has)
+    const now = performance.now();
+    if ((this.got.length < 48 || now - this.lt0 < 2000) && now - this.lt0 < 5000) return;
     const v = this.got.sort((a, b) => a - b);
     if (v.length >= 5) this.ms[this.levels[this.li]] = v[Math.floor(v.length / 2)];
-    if (++this.li < this.levels.length) { this.got = []; this.skip = 6; this.lt0 = performance.now(); this.setLevel(this.levels[this.li]); }
+    if (++this.li < this.levels.length) { this.got = []; this.skip = 6; this.lt0 = now; this.setLevel(this.levels[this.li]); }
     else this.finish();
   }
   tick() {
-    // (a page in the background draws nothing: after 12 s it goes on with what it has)
-    if (this.phase === 'detect' && performance.now() - this.t0 > 12000) this.finish();
+    // (a page in the background draws nothing: it goes on with what it has - 12 s without the world built, or the
+    // levels' time once measuring)
+    if (this.phase !== 'detect') return;
+    const now = performance.now();
+    if (this.benchFrom ? now - this.benchFrom > this.levels.length * 5500 + 1500 : now - this.t0 > 12000) this.finish();
   }
   finish() {
     if (this.phase !== 'detect') return;
     this.unhook && this.unhook();
-    const s = this.game.settings;
+    const s = this.game.settings, phone = this.hw.phone, measured = Object.keys(this.ms).length > 0;
+    // phones and tablets: a margin - they slow down as they warm up, and a game's world (mobs, particles, the HUD, chunks
+    // loading) costs more than the title's
+    if (phone) for (const k in this.ms) this.ms[k] *= 1.4;
     // a level that could not be measured: from the measured ones by the cards' rough cost (nothing measured: a guess
     // from the hardware)
     const m0 = this.ms[0] || (this.q === 'low' ? 12 : this.q === 'medium' ? 8 : 5);
     for (const c of SHADER_CARDS) if (!this.ms[c.lv]) this.ms[c.lv] = m0 * c.cost;
     this.base = { ms: this.ms, rd: s.renderDist || 8, res: s.resScale || 1 };
-    // recommended: the best pair still at least ~55 fps (or the display's rate if lower), shaders only on capable devices
-    const goal = Math.min(55, this.hz * 0.9);
+    // recommended: the best pair still at least ~55 fps (or the rate a game gets if lower), shaders only on capable
+    // devices; never 极致 on a phone. Nothing measured: the hardware's guess stays
+    const goal = Math.min(55, this.gameFps * 0.9);
     let best = { q: 'low', sh: 0 };
-    for (const qc of QUALITY_CARDS) for (const sc of SHADER_CARDS) {
-      if (sc.lv && (!this.fxOk || this.hw.phone)) continue;
+    if (!measured) best = { q: phone && this.q === 'ultra' ? 'high' : this.q, sh: 0 };
+    else for (const qc of QUALITY_CARDS) for (const sc of SHADER_CARDS) {
+      if ((sc.lv && (!this.fxOk || phone)) || (phone && qc.id === 'ultra')) continue;
       if (this.estimate(qc, sc) >= goal && qc.cost * sc.cost >= QUALITY_CARDS.find((x) => x.id === best.q).cost * SHADER_CARDS[best.sh].cost) best = { q: qc.id, sh: sc.lv };
     }
     this.rec = best; this.q = best.q; this.sh = best.sh; this.apply();
@@ -240,7 +264,7 @@ class QualityScreen extends MenuScreen {
     const p = PRESETS[qc.id] || {}, rdR = ((p.renderDist || b.rd) / b.rd) ** 2, pxR = ((p.resScale || 1) / b.res) ** 2;
     const m0 = b.ms[0], extra = Math.max(0, (b.ms[sc.lv] || m0 * sc.cost) - m0);
     const ms = m0 * (0.6 * rdR + 0.4 * pxR) + extra * (0.5 * rdR + 0.5 * pxR);
-    return Math.min(this.hz, Math.round(1000 / (ms * 1.15 + 1)));
+    return Math.min(this.gameFps, Math.round(1000 / (ms * 1.15 + 1)));
   }
   apply() {
     const g = this.game, s = g.settings;
@@ -263,9 +287,8 @@ class QualityScreen extends MenuScreen {
     if (this.phase !== 'pick') return;
     for (const c of R.q) this.widgets.push({ x: c.x, y: c.y, w: c.w, h: c.h, label: '', card: c, kind: 'q', onClick: () => { this.q = c.id; this.apply(); } });
     for (const c of R.s) this.widgets.push({ x: c.x, y: c.y, w: c.w, h: c.h, label: '', card: c, kind: 's', enabled: this.fxOk || c.lv === 0, onClick: () => { this.sh = c.lv; this.apply(); } });
-    const rates = [60, 90, 120].filter((r) => r <= this.hz + 5);
-    if (this.hw.phone && rates.length > 1) this.widgets.push({ x: cx - 152, y: u.h - 24, w: 98, h: 20, label: () => '帧率：' + (this.game.settings.maxFps || this.hz), tip: ['越高越流畅，但更耗电、手机更热'], onClick: () => { const s = this.game.settings, i = rates.indexOf(s.maxFps || this.hz); s.maxFps = rates[(i + 1) % rates.length]; this.game.saveSettings(); } });
-    this.widgets.push({ x: cx + 54, y: u.h - 24, w: 98, h: 20, gold: true, label: '就这样', onClick: () => { const n = this.next; this.next = null; n && n(); } });
+    // (the frame rate: the frame-rate test right after this decides it - FpsTestScreen)
+    this.widgets.push({ x: cx - 49, y: u.h - 24, w: 98, h: 20, gold: true, label: '就这样', onClick: () => { const n = this.next; this.next = null; n && n(); } });
   }
   draw(ui) {
     this.tick();
@@ -277,7 +300,7 @@ class QualityScreen extends MenuScreen {
     if (this.phase === 'detect') {
       const lv = this.levels[this.li], what = this.levels.length > 1 && lv !== undefined ? `（光影「${SHADER_CARDS[lv].name}」）` : '';
       Font.center(c, fitText('正在测试你的设备' + what + '… ' + info, ui.w - 8), cx, 18, '#A0A0A0');
-      const f = Math.min(1, (this.li + Math.min(1, this.got.length / 24)) / this.levels.length);
+      const f = Math.min(1, (this.li + Math.min(1, this.got.length / 48)) / this.levels.length);
       c.fillStyle = '#555555'; c.fillRect(cx - 80, 29, 160, 2); c.fillStyle = '#80FF80'; c.fillRect(cx - 80, 29, Math.round(160 * f), 2);
     } else {
       Font.center(c, fitText('检测到：' + info, ui.w - 8), cx, 16, '#A0A0A0');
@@ -303,6 +326,142 @@ class QualityScreen extends MenuScreen {
     for (const w of this.widgets) if (w.tip && ui.hit(w)) ui.tooltip(w.tip.map((t) => ({ text: t })), ui.mouse.x, ui.mouse.y);
   }
   onEsc() { }
+}
+
+// ---- the frame-rate test (the user, 11-06: every player once after this update, new players after the quality): the
+// live title world at the display's own rate for 4 s, then the highest limit it keeps up with - 120 / 90 / 60 of what
+// the screen has, 30 where it cannot hold ~40. The frames' own work counts too, with a margin (a game's world - mobs,
+// particles, chunks loading - costs more than the title's, and a phone slows down as it warms up); a phone that cannot
+// keep the limit in play still drops to 60 by itself (mobile.js). The player may pick another ----
+const FPS_TEST_V = 1;
+const FPS_SUB = { 120: '最流畅，最耗电', 90: '很流畅，较耗电', 60: '流畅，省电', 30: '最省电，低配设备' };
+class FpsTestScreen extends MenuScreen {
+  constructor(game, next) {
+    super(game, null); this.next = next; this.pauses = false; this.blurBg = false; this.bgDim = 0.3;
+    this.phase = 'wait'; this.t0 = performance.now(); this.from = 0; this.ts = []; this.cpu = []; this.skip = 10;
+    const P = game.pacer; this.phone = !!(P && P.touch);
+    if (P) P.free = this;
+    Telemetry.count && Telemetry.count('fpstest_start');
+  }
+  get hz() { const P = this.game.pacer; return P ? P.hz : 60; }
+  // the choices: 120 / 90 / 60 / 30 of what the screen has; a PC's screen above 125 Hz gets its own rate too
+  options() {
+    const hz = this.hz, L = [120, 90, 60, 30].filter((r) => r <= hz + 5);
+    if (!this.phone && hz > 125) L.unshift(hz);
+    return L;
+  }
+  // the setting for a choice: 60 is the default (0: 自动 60 on a 90/120 Hz phone, the screen's rate on a 60 Hz one),
+  // a PC's own rate 0 (跟随屏幕), the others the number
+  value(f) { const hz = this.hz; return f === 60 ? (this.phone || hz <= 65 ? 0 : 60) : !this.phone && f >= hz - 5 && f > 125 ? 0 : f; }
+  label(f) { return !this.phone && f > 125 ? `跟随屏幕 ${f}` : f + ' 帧'; }
+  // measured once the title world is built (as the quality test: nothing generating or meshing and as many sections
+  // for 1 s, at most 10 s)
+  loaded() {
+    if (this.from) return true;
+    const g = this.game, now = performance.now(), n = g.renderer.sections ? g.renderer.sections.size : 0;
+    const busy = g.titleGround || (g.genQueue && g.genQueue.length) || g.meshPending || (g.genPending && g.genPending.size) || (g.finalQ && g.finalQ.length);
+    if (busy || n !== this.secN) { this.secN = n; this.secT = now; }
+    if ((!busy && n && now - this.secT >= 1000) || now - this.t0 > 10000) { this.from = now; this.phase = 'test'; return true; }
+    return false;
+  }
+  // one frame (from draw): its start and the last frame's own work (PerfMon)
+  sample() {
+    // (no frames for a while - the page in the background, the phone's screen off: the time starts again, and frames
+    // measured before the gap are dropped)
+    const t = performance.now(), gap = this.lastDraw ? t - this.lastDraw : 0; this.lastDraw = t;
+    if (gap > 1000 && this.phase !== 'pick') { this.t0 += gap; if (this.from) { this.from = t; this.ts = []; this.cpu = []; this.skip = 10; } }
+    if (this.phase === 'pick' || document.hidden || !this.loaded()) return;
+    if (this.skip > 0) { this.skip--; this.from = performance.now(); return; }
+    const now = performance.now(), N = PerfMon.N;
+    this.ts.push(now); this.cpu.push(PerfMon.cpu[(PerfMon.i + N - 1) % N]);
+    if (now - this.from >= 4000 && this.ts.length >= 20) this.finish();
+  }
+  tick() {
+    // (a page in the background draws nothing: it goes by what it has after 20 s)
+    if (this.phase !== 'pick' && performance.now() - this.t0 > 20000) this.finish();
+  }
+  finish() {
+    if (this.phase === 'pick') return;
+    const ts = this.ts, n = ts.length, hz = this.hz, L = this.options();
+    let fps = 0, work = 0, sustain = 0;
+    if (n >= 20) {
+      fps = (n - 1) * 1000 / (ts[n - 1] - ts[0]);
+      const c = [...this.cpu].sort((a, b) => a - b); work = c[Math.floor(c.length * 0.75)];
+      // the rate the frames' own work allows in a game: a margin on the title's (phones more), a millisecond on top
+      const byWork = 1000 / (work * (this.phone ? 1.6 : 1.25) + 1);
+      sustain = Math.min(fps, byWork);
+    }
+    // the highest choice it keeps up with (8 % short still counts: a frame now and then); 60 down to ~40 still 60 -
+    // dynamic resolution takes it the rest of the way; below that 30. Nothing measured: 60
+    let rec = 60;
+    if (n >= 20) { rec = 30; for (const f of L) if (f >= 60 && sustain >= f * 0.92) { rec = f; break; } if (rec === 30 && sustain >= 40) rec = 60; }
+    this.res = { fps: Math.round(fps), work: Math.round(work * 10) / 10, sustain: Math.round(sustain), hz, measured: n >= 20 };
+    this.rec = rec; this.sel = rec; this.phase = 'pick';
+    const P = this.game.pacer; if (P && P.free === this) P.free = null;
+    if (this.game.ui.screen === this) this.layout();
+  }
+  cardRects() {
+    const u = this.game.ui, L = this.options(), w = Math.min(100, Math.floor((u.w - 20) / L.length) - 6), h = 40;
+    const x0 = Math.floor(u.w / 2 - (L.length * w + (L.length - 1) * 6) / 2), y = Math.floor(u.h / 2) - 6;
+    return L.map((f, i) => ({ f, x: x0 + i * (w + 6), y, w, h }));
+  }
+  layout() {
+    const u = this.game.ui, cx = u.w / 2;
+    this.widgets = [];
+    if (this.phase !== 'pick') { this.widgets.push({ x: cx - 50, y: u.h - 28, w: 100, h: 20, label: '跳过', onClick: () => this.skipTest() }); return; }
+    for (const k of this.cardRects()) this.widgets.push({ x: k.x, y: k.y, w: k.w, h: k.h, label: '', card: k, onClick: () => { this.sel = k.f; } });
+    this.widgets.push({ x: cx - 100, y: u.h - 30, w: 200, h: 20, gold: true, label: '确定', onClick: () => this.done() });
+  }
+  // skipped: the setting stays as it was (the test comes no more)
+  skipTest() {
+    const P = this.game.pacer; if (P && P.free === this) P.free = null;
+    Telemetry.count && Telemetry.count('fpstest_skip');
+    this.game.settings.fpsTestV = FPS_TEST_V; this.game.saveSettings();
+    const n = this.next; this.next = null; n && n();
+  }
+  done() {
+    const g = this.game, s = g.settings;
+    s.maxFps = this.value(this.sel); s.fpsTestV = FPS_TEST_V;
+    s.fpsTest = { ...this.res, rec: this.rec, pick: this.sel, at: Date.now() };
+    g.saveSettings(); g.applySettings && g.applySettings();
+    Telemetry.count && Telemetry.count('fpstest_' + this.rec + (this.sel === this.rec ? '' : '_pick' + this.sel));
+    const n = this.next; this.next = null; n && n();
+  }
+  draw(ui) {
+    this.sample(); this.tick();
+    super.draw(ui);
+    const c = ui.ctx, cx = ui.w / 2, cy = Math.floor(ui.h / 2);
+    c.fillStyle = 'rgba(0,0,0,0.55)'; c.fillRect(0, 0, ui.w, 44);
+    Font.center(c, '帧率检测', cx, 6, '#FFFFFF');
+    if (this.phase !== 'pick') {
+      Font.center(c, fitText('正在测试你的设备能跑多少帧，找出最合适的帧率上限（约 5 秒）…', ui.w - 8), cx, 20, '#A0A0A0');
+      const f = this.phase === 'test' ? Math.min(1, (performance.now() - this.from) / 4000) : 0;
+      c.fillStyle = '#555555'; c.fillRect(cx - 80, 33, 160, 2); c.fillStyle = '#80FF80'; c.fillRect(cx - 80, 33, Math.round(160 * f), 2);
+      const ts = this.ts, k = ts.length, live = k > 10 ? Math.round(10 * 1000 / (ts[k - 1] - ts[k - 11])) : 0;
+      c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(cx - 90, cy - 22, 180, 44);
+      Font.center(c, this.phase === 'test' ? `当前 ${live || '…'} 帧` : '正在准备画面…', cx, cy - 12, '#FFFFFF');
+      Font.center(c, `屏幕刷新率 ${this.hz} Hz`, cx, cy + 4, '#A0A0A0');
+    } else {
+      const r = this.res;
+      Font.center(c, fitText(r.measured ? `屏幕刷新率 ${r.hz} Hz，测试中每秒 ${r.fps} 帧，游戏里预计能稳定 ${r.sustain} 帧` : `屏幕刷新率 ${r.hz} Hz（没有测出来，先用 60 帧）`, ui.w - 8), cx, 19, '#A0A0A0');
+      Font.center(c, `推荐帧率上限：${this.label(this.rec)}（已经帮你选好）`, cx, 31, '#80FF80');
+      c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(0, cy - 26, ui.w, 72);
+      Font.center(c, '帧率上限', cx, cy - 20, '#FFFFFF');
+      for (const w of this.widgets) {
+        const k = w.card; if (!k) continue;
+        const sel = this.sel === k.f;
+        c.fillStyle = sel ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.5)'; c.fillRect(k.x, k.y, k.w, k.h);
+        c.strokeStyle = sel ? '#FFFFFF' : ui.hit(w) ? '#A0A0A0' : '#555555'; c.lineWidth = sel ? 2 : 1; c.strokeRect(k.x + 0.5, k.y + 0.5, k.w - 1, k.h - 1); c.lineWidth = 1;
+        Font.draw(c, this.label(k.f), k.x + 4, k.y + 5, '#FFFFFF');
+        Font.draw(c, fitText(FPS_SUB[k.f] || '跟屏幕一样快，最耗电', k.w - 8), k.x + 4, k.y + 17, '#A0A0A0');
+        if (r.measured && k.f > this.rec) Font.draw(c, fitText('可能跟不上', k.w - 8), k.x + 4, k.y + 28, '#FFAA55');
+        if (this.rec === k.f) { c.fillStyle = '#E8B830'; c.fillRect(k.x + k.w - 26, k.y, 26, 10); Font.draw(c, '推荐', k.x + k.w - 25, k.y + 1, '#3A2A00'); }
+      }
+      Font.center(c, fitText(this.phone ? '之后可以在 选项 → 控制 → 触屏操作 里改；手机发热跟不上时会自动降到 60 帧' : '之后可以在 选项 → 视频设置 → 最大帧率 里改', ui.w - 8), cx, ui.h - 44, '#808080');
+    }
+    for (const w of this.widgets) if (!w.card) ui.button(w);
+  }
+  onEsc() { if (this.phase === 'pick') this.done(); }
 }
 
 // ---- step 2b (after the quality): which device - the detected one chosen already, the player may pick the other.
@@ -362,7 +521,8 @@ const Onboarding = {
       g.ui.open(new LoginScreen(g, after));
     };
     const device = () => g.ui.open(new DeviceScreen(g, login));
-    const quality = () => g.ui.open(new QualityScreen(g, device));
+    const fps = () => g.ui.open(new FpsTestScreen(g, device));
+    const quality = () => g.ui.open(new QualityScreen(g, fps));
     const kind = () => g.ui.open(new PlayerKindScreen(g, quality));
     if (s.onboarded) { if ((s.legalV || 0) < LEGAL.v) g.ui.open(new AgreementScreen(g, () => g.ui.open(new TitleScreen(g)))); return; }
     g.ui.open(new AgreementScreen(g, kind));
@@ -385,7 +545,14 @@ const Onboarding = {
       this.onboardChecked = true;
       // (an invite link goes straight to the room; the agreement still comes first)
       if (!s.onboarded || (s.legalV || 0) < LEGAL.v) setTimeout(() => Onboarding.start(this), 50);
-      else if (s.seenBuild !== GAME_BUILD && WHATS_NEW[GAME_BUILD]) setTimeout(() => this.ui.open(new WhatsNewScreen(this, () => this.ui.open(new TitleScreen(this)))), 50);
+      else {
+        // the frame-rate test once (players from before it: FpsTestScreen), then what changed. Not when an invite link
+        // opens the join screen (net.js): the next start
+        const title = () => this.ui.open(new TitleScreen(this)), news = s.seenBuild !== GAME_BUILD && WHATS_NEW[GAME_BUILD];
+        const after = news ? () => this.ui.open(new WhatsNewScreen(this, title)) : title;
+        if ((s.fpsTestV || 0) < FPS_TEST_V && !(typeof RoomService !== 'undefined' && RoomService.fromUrl())) setTimeout(() => { if (this.state === 'title') this.ui.open(new FpsTestScreen(this, after)); }, 50);
+        else if (news) setTimeout(after, 50);
+      }
     }
     return r;
   };

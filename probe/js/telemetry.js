@@ -20,7 +20,7 @@ const TELEMETRY_V = 1;
 const GAME_BUILD = '2026.10.30';
 const Telemetry = {
   g: null, sid: Math.random().toString(36).slice(2, 10), seq: 0, t0: performance.now(),
-  hist: new Uint16Array(201), frames: 0, sum: { cpu: 0, chunk: 0, render: 0, gpu: 0, gpuN: 0 }, minuteAt: 0, playMs: 0,
+  hist: new Uint16Array(201), frames: 0, sum: { cpu: 0, chunk: 0, render: 0, gpu: 0, gpuN: 0 }, minuteAt: 0, playMs: 0, afkMs: 0,
   points: [], stalls: [], errors: new Map(), counts: {}, events: [], rtt: [], lastFlush: performance.now(),
   pings: new Map(), pingSeq: 0, lastPing: 0, prevState: null, loadStart: 0,
   // where the data goes, and whether it may go there
@@ -28,7 +28,9 @@ const Telemetry = {
   on() {
     const g = this.g;
     if (!g || g.settings.telemetry === false || !/^https?:$/.test(location.protocol) || !this.base()) return false;
-    const local = /^(localhost|127\.|\[::1\]|192\.168\.|10\.)/.test(location.hostname);
+    // (*.localhost / *.test too: test pages on per-test origins sent their numbers to the live service, and its origin
+    // check banned the developer's own address, 2026-11-03)
+    const local = /^(localhost|127\.|\[::1\]|192\.168\.|10\.)/.test(location.hostname) || /\.(localhost|test)$/.test(location.hostname);
     return !local || new URLSearchParams(location.search).has('rooms');
   },
   // this browser's anonymous id (a random number kept in the page's storage), and whether it is new here
@@ -72,6 +74,9 @@ const Telemetry = {
     // a frame of more than 10 s is a suspended page, not a stall either
     if (this.away || dt > 10000) { this.away = false; return; }
     if (g.state !== 'play' || (g.ui.screen && g.ui.screen.pauses)) return;
+    // (nor a frame held to 30 / 10 by the inactivity limit, or the one after: perf.js FramePacer.cappedFrame. Its time
+    // still counts as played - the session's play time meant that before the limit came)
+    if (g.pacer && g.pacer.cappedFrame) { this.afkMs += dt; return; }
     this.hist[Math.min(200, dt | 0)]++; this.frames++; this.playMs += dt;
     this.sum.cpu += cpu; this.sum.chunk += chunk; this.sum.render += render;
     if (PerfMon.gpuOn && PerfMon.lastGpu != null) { this.sum.gpu += PerfMon.lastGpu; this.sum.gpuN++; }
@@ -98,6 +103,7 @@ const Telemetry = {
       gpu: this.sum.gpuN ? +(this.sum.gpu / this.sum.gpuN).toFixed(2) : null, mem,
       ents: g.entities ? g.entities.length : 0, chunks: g.world && g.world.chunks ? g.world.chunks.size : 0, rd: s.renderDist,
       dyn: typeof DynRes !== 'undefined' ? DynRes.scale : 1, res: s.resScale, preset: s.preset || '', shaders: s.shaders || 0, maxFps: s.maxFps || 0, vsync: s.vsync !== false,
+      lim: g.pacer ? g.pacer.playLimit : 0, // (the limit in effect: maxFps 0 is 60 on a 90/120 Hz phone, -1 跟随屏幕; 0 = the screen's rate)
       mode: g.net ? 'room' : 'single', dim: g.dim, gm: g.mode,
     });
     this.lastPointMs = this.playMs;
@@ -108,7 +114,7 @@ const Telemetry = {
     const net = this.rtt.length ? { rtt: this.rttSummary() } : null;
     const p = {
       v: TELEMETRY_V, kind: 'session', id: this.install(), sid: this.sid, seq: this.seq++, build: GAME_BUILD, final: !!final,
-      fresh: !!this._fresh, dur: Math.round((performance.now() - this.t0) / 1000), play: Math.round(this.playMs / 1000),
+      fresh: !!this._fresh, dur: Math.round((performance.now() - this.t0) / 1000), play: Math.round((this.playMs + this.afkMs) / 1000),
       dev: this.seq === 1 ? this.device() : undefined, points: this.points, stalls: this.stalls,
       errors: [...this.errors].map(([k, e]) => ({ k, ...e })), counts: this.counts, events: this.events, net,
     };
@@ -159,6 +165,15 @@ const Telemetry = {
   Game.prototype.init = async function (...a) { const r = await _init.apply(this, a); try { Telemetry.init(this); } catch (e) { } return r; };
   const _frame = PerfMon.frame;
   PerfMon.frame = function (dt, cpu, chunk, g) { const r = _frame.call(this, dt, cpu, chunk, g); try { Telemetry.frame(dt, cpu, chunk, this.renderMs || 0); } catch (e) { } return r; };
+  // the renderer's side of a frame (render.js): nothing is drawn while the WebGL context is lost (its notice is up and a
+  // tap reloads); inFrame - a canvas resize asked for between frames waits for the next one (it showed a black frame)
+  const _render = Game.prototype.render;
+  Game.prototype.render = function (a, now) {
+    const r = this.renderer;
+    if (r && r.lost) { if (r.lostFrame) r.lostFrame(this); return; }
+    if (r) r.inFrame = true;
+    try { return _render.call(this, a, now); } finally { if (r) r.inFrame = false; }
+  };
   const _err = Game.prototype.reportError;
   Game.prototype.reportError = function (where, e, quiet) { Telemetry.error(where, e && e.message || e, e && e.stack); return _err.call(this, where, e, quiet); };
   const _open = UI.prototype.open;

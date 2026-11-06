@@ -137,13 +137,15 @@ class TouchControls {
     // 2026-11-02) and not inside the Bilibili app, whose own container is fullscreen already
     if (this.on() && !this.fsTried && !cancel && this.g.state === 'play' && !/BiliApp/i.test(navigator.userAgent)) {
       this.fsTried = true;
-      const de = document.documentElement;
-      if (!document.fullscreenElement && de.requestFullscreen) {
+      // (screens.js's checks: iPads and older Safari only have the webkit-prefixed call, iPhones none at all, a frame
+      // may not - fullscreenEnabled false)
+      const de = document.documentElement, req = de.requestFullscreen || de.webkitRequestFullscreen;
+      if (!fsElement() && req && fsSupported()) {
         // (counted and sent first: a device that hangs here still tells)
         if (typeof Telemetry !== 'undefined' && Telemetry.count) { Telemetry.count('fs_try'); Telemetry.flush && Telemetry.flush(false); }
         try {
-          de.requestFullscreen({ navigationUI: 'hide' })
-            .then(() => { Telemetry.count && Telemetry.count('fs_ok'); if (screen.orientation && screen.orientation.lock) return screen.orientation.lock('landscape'); }).catch(() => { });
+          const r = req.call(de, { navigationUI: 'hide' });
+          if (r && r.then) r.then(() => { Telemetry.count && Telemetry.count('fs_ok'); if (screen.orientation && screen.orientation.lock) return screen.orientation.lock('landscape'); }).catch(() => { });
         } catch (e) { }
       }
     }
@@ -408,10 +410,29 @@ class TouchControls {
   }
   // a button in vanilla's pixel style (11-03 - the user: 原版的像素风，方块按钮，不要花哨颜色): a see-through dark square
   // in a black outline, lit along the top and left and shaded along the bottom and right in whole pixels; pressed it
-  // goes lighter, the bevel turns over and the icon sinks a pixel. Black, white and greys only
+  // goes lighter, the bevel turns over and the icon sinks a pixel. Black, white and greys only.
+  // Drawn once into a canvas of its own (device pixels, at the opacity) and copied from then on: rect by rect the
+  // controls were 770 fillRect and 688 globalAlpha changes a frame - 0.116 ms recording on a PC (11-03), several times
+  // that on phones; copied, 13 drawImage and 0.017 ms. Over a clear canvas the copy is the same to the bit; over the
+  // vignette 1/255 apart in a few channels (the order the alphas add up in). Keyed by all the picture depends on (the
+  // bevel p follows w and h); let go when the screen, the scale, the opacity or the layout's sizes change
   btn(c, r, icon, on, text) {
     if (!r) return;
-    const x = Math.round(r.x), y = Math.round(r.y), w = Math.round(r.w), h = Math.round(r.h), p = Math.max(1, Math.round(Math.min(w, h) / 22));
+    const x = Math.round(r.x), y = Math.round(r.y), w = Math.round(r.w), h = Math.round(r.h), s = this.ui.scale, a = c.globalAlpha;
+    if (w <= 0 || h <= 0) return;
+    const S = this.spr || (this.spr = new Map()), key = (text ? '"' + text : icon) + '|' + (on ? 1 : 0) + '|' + w + '|' + h + '|' + a + '|' + s;
+    let cv = S.get(key);
+    if (cv) { S.delete(key); S.set(key, cv); }
+    else {
+      cv = document.createElement('canvas'); cv.width = w * s; cv.height = h * s;
+      const k = cv.getContext('2d'); k.setTransform(s, 0, 0, s, 0, 0); k.imageSmoothingEnabled = false; k.globalAlpha = a;
+      this.btnRaw(k, 0, 0, w, h, icon, on, text);
+      S.set(key, cv); if (S.size > 64) S.delete(S.keys().next().value);
+    }
+    c.globalAlpha = 1; c.drawImage(cv, x, y, w, h); c.globalAlpha = a;
+  }
+  btnRaw(c, x, y, w, h, icon, on, text) {
+    const p = Math.max(1, Math.round(Math.min(w, h) / 22));
     c.fillStyle = 'rgba(0,0,0,0.55)'; c.fillRect(x, y, w, p); c.fillRect(x, y + h - p, w, p); c.fillRect(x, y + p, p, h - 2 * p); c.fillRect(x + w - p, y + p, p, h - 2 * p);
     c.fillStyle = on ? 'rgba(150,150,150,0.6)' : 'rgba(40,40,40,0.5)'; c.fillRect(x + p, y + p, w - 2 * p, h - 2 * p);
     const lit = on ? 'rgba(0,0,0,0.3)' : 'rgba(255,255,255,0.28)', dark = on ? 'rgba(255,255,255,0.22)' : 'rgba(0,0,0,0.35)';
@@ -422,9 +443,13 @@ class TouchControls {
     else if (TOUCH_ICONS[icon]) { this.icon(c, icon, { ...ir, x: ir.x + p, y: ir.y + p }, 'rgba(0,0,0,0.5)'); this.icon(c, icon, ir, on ? '#FFFFFF' : '#E6E6E6'); }
   }
   draw(ui) {
-    const g = this.g, c = ui.ctx;
+    const g = this.g, c = ui.ctx, st = g.settings;
     this.update(performance.now());
     if (!this.on()) return;
+    // (the buttons' pictures: kept while nothing they depend on changed - the cap of 64 lets go of the rest meanwhile)
+    const sig = ui.canvas.width + 'x' + ui.canvas.height + 'x' + ui.scale + 'x' + (st.touchOpacity ?? 0.7) + 'x' + (st.touchSize ?? '');
+    if (this.spr && (this.sprSig !== sig || this.sprScale !== st.touchScale)) this.spr.clear();
+    this.sprSig = sig; this.sprScale = st.touchScale;
     if (ui.h > ui.w) {
       const t = '横屏游玩体验更佳', w = Font.width(t) + 8;
       c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(Math.floor(ui.w / 2 - w / 2), 2, w, 12);
@@ -482,10 +507,14 @@ function bindTouch(g) {
   // the game turns them on for this session, the mouse turns them off again (unless chosen in the settings). Before,
   // 「回到游戏」took the pointer lock, the next touch let it go and the pause screen came back - players stuck in the
   // menu (feedback 2026-10-31). (pointerdown comes before touchstart / mousedown, which then see the new mode)
+  // The same the other way on a phone / tablet, touch by default: a Bluetooth mouse clicked in the world plays by mouse
+  // (before, only a touch PC switched back - on a tablet the pointer stayed out and could not be locked). Only where
+  // the system says a fine pointer is there: a web view that called a finger a mouse would lose its buttons
+  const fine = () => !!(window.matchMedia && matchMedia('(any-pointer: fine)').matches);
   window.addEventListener('pointerdown', (e) => {
     if (g.settings.touch !== undefined || g.state !== 'play') return;
     if ((e.pointerType === 'touch' || e.pointerType === 'pen') && !touchOn(g)) { g.touchAuto = true; g.releasePointer(); }
-    else if (e.pointerType === 'mouse' && g.touchAuto && !g.ui.screen) g.touchAuto = false;
+    else if (e.pointerType === 'mouse' && touchOn(g) && !g.ui.screen && (g.touchAuto || fine())) { tc.reset(); g.touchAuto = false; }
   }, true);
   // touch mode plays without pointer lock
   const capture = Game.prototype.capturePointer;

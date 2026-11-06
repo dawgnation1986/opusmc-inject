@@ -23,6 +23,14 @@ function createMob(game, type, x, y, z) {
   return new Mob(game, type, x, y, z);
 }
 
+// vanilla Mob.checkDespawn's chance: past 32 blocks, one tick in 800 once idle for 30 s (the age stands in for the
+// idle time, as for ghasts - nether_mobs.js). Endermen, zombified piglins, blazes and magma cubes went only past 96-100
+// blocks, so the ones spawned piled up. Not one that is persistent, named, leashed, a server's or holding a block
+// (vanilla Enderman.requiresCustomPersistence - none carry one here)
+function randomDespawn(e) {
+  return !e.persistent && !e.customName && !e.remote && !e.leashHolder && !e.carriedBlock && e.age > 600 && Math.random() < 1 / 800 && e.distTo(e.game.player) > 32;
+}
+
 function particleBurst(g, type, x, y, z, n, spread, col) {
   for (let i = 0; i < n; i++) {
     const p = g.particles.spawn(type, x + (Math.random() - 0.5) * spread, y + Math.random() * spread, z + (Math.random() - 0.5) * spread, (Math.random() - 0.5) * 0.2, (Math.random() - 0.3) * 0.2, (Math.random() - 0.5) * 0.2);
@@ -73,7 +81,7 @@ class Enderman extends Mob {
     this.savePrev(); this.baseTick();
     if (this.deathTick()) return;
     const g = this.game, p = g.player, dP = this.distTo(p);
-    if (!this.persistent && dP > 100) { this.dead = true; return; }
+    if (!this.persistent && dP > 100 || randomDespawn(this)) { this.dead = true; return; }
     if (this.tpCd > 0) this.tpCd--;
     // water and rain hurt endermen
     const wet = this.inWater || (g.dim === 'overworld' && g.weather > 0.5 && this.world.skyAt(Math.floor(this.pos[0]), Math.floor(this.pos[1] + 2), Math.floor(this.pos[2])) >= 15 && !g.isCold(Math.floor(this.pos[0]), Math.floor(this.pos[2])));
@@ -134,7 +142,7 @@ class ZombifiedPiglin extends Mob {
     this.savePrev(); this.baseTick();
     if (this.deathTick()) return;
     const g = this.game, p = g.player, dP = this.distTo(p);
-    if (!this.persistent && dP > 100) { this.dead = true; return; }
+    if (!this.persistent && dP > 100 || randomDespawn(this)) { this.dead = true; return; }
     if (--this.idleSound < 0) { this.idleSound = 200 + Math.random() * 400; if (dP < 20) Sound.mob('zombified_piglin', this.angry > 0 ? 'angry' : 'idle', this.pos); }
     if (this.attackCd > 0) this.attackCd--;
     let fwd = 0, jump = false;
@@ -188,7 +196,7 @@ class Blaze extends FlyingMob {
     this.savePrev(); this.baseTick();
     if (this.deathTick()) return;
     const g = this.game, p = g.player, dP = this.distTo(p);
-    if (!this.persistent && dP > 96) { this.dead = true; return; }
+    if (!this.persistent && dP > 96 || randomDespawn(this)) { this.dead = true; return; }
     if (this.inWater && this.age % 10 === 0) this.hurt(1, { type: 'drown' });
     if (--this.idleSound < 0) { this.idleSound = 160 + Math.random() * 200; if (dP < 20) Sound.mob('blaze', 'idle', this.pos); }
     if (Math.random() < 0.3) g.particles.spawn('smoke', this.pos[0] + (Math.random() - 0.5) * 0.6, this.pos[1] + Math.random() * 1.8, this.pos[2] + (Math.random() - 0.5) * 0.6, 0, 0.02, 0);
@@ -295,7 +303,7 @@ class MagmaCube extends Mob {
     this.savePrev(); this.baseTick();
     if (this.deathTick()) return;
     const g = this.game, p = g.player, dP = this.distTo(p);
-    if (!this.persistent && dP > 100) { this.dead = true; return; }
+    if (!this.persistent && dP > 100 || randomDespawn(this)) { this.dead = true; return; }
     this.prevSquish = this.squish; this.squish *= 0.6;
     const playerOk = p.deathTime === 0 && !p.creative;
     this.target = playerOk && dP < seenWithin(p, 16) ? p : null;
@@ -341,9 +349,10 @@ class Fireball extends Entity {
     this.savePrev(); this.age++;
     if (this.age > 300) { this.dead = true; return; }
     const g = this.game, v = this.vel, steps = 4;
+    const ents = g.entities.concat([g.player]); // (once a tick: it copied the whole list at each of its 4 steps)
     for (let s = 0; s < steps; s++) {
       const nx = this.pos[0] + v[0] / steps, ny = this.pos[1] + v[1] / steps, nz = this.pos[2] + v[2] / steps;
-      for (const e of g.entities.concat([g.player])) {
+      for (const e of ents) {
         if (e === this || e === this.owner || e.dead || !(e instanceof Living) || e.deathTime > 0) continue;
         if (this.owner instanceof Ghast && e instanceof Ghast) continue;
         const b = e.box(), r = this.w / 2;
@@ -573,7 +582,7 @@ class EnderDragon extends Living {
     const playerOk = p.deathTime === 0 && !p.creative && g.dim === 'end';
     this.phaseT++;
     let target, speed = 0.6;
-    const crystals = g.entities.filter(e => e instanceof EndCrystal && !e.dead).length;
+    let crystals = 0; for (const e of g.entities) if (e instanceof EndCrystal && !e.dead) crystals++; // (counted, not a new list each tick)
     switch (this.phase) {
       case 'circle': {
         this.circleA += 0.008 * this.circleDir;
@@ -636,6 +645,9 @@ class EnderDragon extends Living {
         if (this.pos[1] > 95 || this.phaseT > 100) this.setPhase('circle');
         break;
     }
+    // (strafe and charge give up on a player who died, went creative or left: back to circling - with no target for
+    // that tick, the steering below threw 'reading 0', telemetry 11-02/03: ~58 devices. The circle's point instead)
+    if (!target) target = [Math.cos(this.circleA) * 70, 95 + Math.sin(this.circleA * 3) * 10, Math.sin(this.circleA) * 70];
     // steering
     const dx = target[0] - this.pos[0], dy = target[1] - this.pos[1], dz = target[2] - this.pos[2], d = Math.hypot(dx, dy, dz) || 1;
     if (this.phase === 'perch') {

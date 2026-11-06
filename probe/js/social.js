@@ -102,8 +102,10 @@ Toy.onPageClose(() => {
 }).catch(() => { });
 
 // ---- announcements from the administrators (rooms/server.js announce): in the chat in gold and over the hotbar, for
-// everyone playing - in a room they come at once, otherwise the page asks once a minute; each shown once (the last
-// one seen kept in this browser), and on a page just opened only those of the last 10 minutes ----
+// everyone playing - in a room they come at once, otherwise the page asks every 5 minutes (it was every minute: a
+// request waking the phone's radio 60 times an hour, for a few announcements a week), not while the page is hidden;
+// each shown once (the last one seen kept in this browser), and on a page just opened only those of the last 10
+// minutes ----
 function showAnnounce(g, a) {
   let seen = 0; try { seen = +localStorage.getItem('mcjs-announce') || 0; } catch (e) { }
   if (!a || a.id <= seen) return;
@@ -116,11 +118,11 @@ function showAnnounce(g, a) {
   const opened = Date.now();
   setInterval(async () => {
     const g = typeof game !== 'undefined' && game;
-    if (!g || g.state !== 'play' || g.net || typeof RoomService === 'undefined' || !RoomService.base()) return;
+    if (!g || g.state !== 'play' || g.net || document.hidden || typeof RoomService === 'undefined' || !RoomService.base()) return;
     let seen = 0; try { seen = +localStorage.getItem('mcjs-announce') || 0; } catch (e) { }
     try {
       const r = await RoomService.api('/api/announce?after=' + Math.max(seen, opened - 10 * 60e3));
       for (const a of r.list || []) showAnnounce(g, a);
     } catch (e) { }
-  }, 60e3);
+  }, 5 * 60e3);
 })();

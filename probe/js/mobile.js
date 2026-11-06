@@ -10,7 +10,8 @@
 //     creative flies, up / down while flying, swim up in water), hotbar tap / hold to
 //     drop, the inventory button; pause, chat, quick chat and the view at the top
 //   - vibration when a block breaks or the player is hurt; the buttons' layout edited by dragging
-//   - 60 / 90 / 120 fps on high refresh phones, back to 60 when the phone heats up and cannot keep up
+//   - 60 fps on high refresh phones unless 90 / 120 / 跟随屏幕 is chosen, back to 60 when the phone heats up and cannot
+//     keep up (the gyroscope view taken down 11-05: the Toy page does not let the game read the motion sensors)
 // ---------------------------------------------------------------------------
 const Stage = {
   rot: false, el: null, inset: { top: 0, right: 0, bottom: 0, left: 0 }, toyLandscape: false,
@@ -329,42 +330,6 @@ Object.assign(TOUCH_ICONS, {
   };
 })();
 
-// ---- the gyroscope: turning the phone turns the view (off until the player turns it on - the user, 11-03) ----
-// devicemotion's rotation rate (degrees a second, about the device's own axes) taken into the screen's: its angle
-// (counterclockwise), plus a quarter turn while the page is turned by CSS (Stage.rot: the phone is held turned left).
-// Turning about the screen's up axis turns left / right, about its right axis looks up / down; a small rate is drift
-const Gyro = {
-  bound: false, last: 0, seen: false,
-  ios: () => typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function',
-  // (inside a tap: iOS asks the player once a visit) -> '' or why not
-  async enable() {
-    if (typeof DeviceMotionEvent === 'undefined') return '这台设备不支持陀螺仪';
-    if (this.ios()) { try { if ((await DeviceMotionEvent.requestPermission()) !== 'granted') return '没有得到陀螺仪权限'; } catch (e) { return '没有得到陀螺仪权限（' + (e.message || e) + '）'; } }
-    this.bind(); return '';
-  },
-  bind() { if (this.bound) return; this.bound = true; addEventListener('devicemotion', (e) => this.motion(e)); },
-  motion(e) {
-    const now = performance.now(), dt = Math.min(0.1, (now - (this.last || now)) / 1000), r = e.rotationRate; this.last = now;
-    if (r && (r.alpha || r.beta || r.gamma)) this.seen = true;
-    const g = typeof game !== 'undefined' && game;
-    if (!g || !g.settings.gyro || !r || g.state !== 'play' || g.ui.screen || !touchOn(g) || !g.player || g.player.dead) return;
-    const o = screen.orientation && typeof screen.orientation.angle === 'number' ? screen.orientation.angle : (+window.orientation || 0);
-    const a = (o + (Stage.rot ? 90 : 0)) * Math.PI / 180, bx = r.beta || 0, gy = r.gamma || 0;
-    let right = bx * Math.cos(a) - gy * Math.sin(a), up = bx * Math.sin(a) + gy * Math.cos(a);
-    if (Math.abs(right) < 1.5) right = 0; if (Math.abs(up) < 1.5) up = 0;
-    const st = g.settings, k = (st.gyroSens ?? 1) * dt * Math.PI / 180, p = g.player;
-    p.yaw += up * k * (st.invertX ? -1 : 1);
-    p.pitch = clamp(p.pitch + right * k * (st.invertY ? -1 : 1), -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001);
-  },
-};
-// on from an earlier visit: listening again (iOS asks again, at the first tap)
-addEventListener('load', () => {
-  const g = typeof game !== 'undefined' && game;
-  if (!g || !g.settings.gyro) return;
-  if (!Gyro.ios()) { Gyro.bind(); return; }
-  const ask = () => { removeEventListener('touchend', ask, true); if (g.settings.gyro) Gyro.enable(); };
-  addEventListener('touchend', ask, true);
-});
 // the pause menu: the touch settings one tap away (they were four deep - players could not find the sensitivity)
 (() => {
   const pl = PauseScreen.prototype.layout;
@@ -467,6 +432,26 @@ class TouchLayoutScreen extends MenuScreen {
   onEsc() { if (this.done) this.save(); else this.discard(); }
 }
 
+// ---- the frame-rate choice (触控设置, the first-run quality screen: onboard.js) ----
+// A phone or tablet with a 90/120 Hz screen (FramePacer.auto60): 自动 (0, the default: 60) -> 90 -> 120 (what the screen
+// has) -> 跟随屏幕 (-1) - the user, 11-03: 60 unless the player wants more. A 60 there before (an older version, the heat
+// fallback) reads as 60 and goes on to 90. Anything else (a 60 Hz screen, a touchscreen PC): 60 ... -> the screen's rate
+// (0), as before
+const FpsChoice = {
+  list(g) {
+    const P = g.pacer, up = [90, 120].filter((r) => r <= (P ? P.hz : 60) + 5);
+    return P && P.auto60 ? [0, ...up, -1] : [60, ...up, 0];
+  },
+  label(g, v) {
+    const P = g.pacer, hz = P ? P.hz : 60;
+    return v > 0 ? v + ' 帧' : v === -1 || !(P && P.auto60) ? '跟随屏幕（' + hz + ' 帧）' : '自动（60 帧）';
+  },
+  next(g) {
+    const s = g.settings, L = this.list(g), v = s.maxFps > 0 || s.maxFps === -1 ? s.maxFps : 0;
+    s.maxFps = L[(L.indexOf(v === 60 && L[0] === 0 ? 0 : v) + 1) % L.length];
+  },
+};
+
 // ---- the touch options: joystick, vibration, layout, frame rate, turning the screen ----
 (() => {
   const opts = OptionsListScreen.prototype.options;
@@ -475,8 +460,6 @@ class TouchLayoutScreen extends MenuScreen {
     if (this.page !== 'touch') return list;
     const s = this.game.settings, g = this.game;
     const bt = (label, fn, extra) => ({ label, onClick: () => { fn(); g.applySettings(); g.saveSettings(); }, ...extra });
-    const hz = g.pacer && g.pacer.refresh ? Math.round(1000 / g.pacer.refresh) : 60;
-    const rates = [60, 90, 120].filter((r) => r <= hz + 5);
     return [
       bt(() => '移动：' + (s.touchStick === false ? '方向键' : '摇杆'), () => { s.touchStick = s.touchStick === false; }),
       ...(s.touchStick === false ? [] : [
@@ -485,31 +468,28 @@ class TouchLayoutScreen extends MenuScreen {
       ]),
       ...list,
       Object.assign(bt(() => '操作方式：' + (s.touchClassic ? '经典（点屏幕放置，长按挖）' : '准星 + 按钮'), () => { s.touchClassic = !s.touchClassic; }), { tip: ['准星 + 按钮：用攻击、使用按钮对着屏幕中间的准星操作', '经典：直接点屏幕放置、长按屏幕挖掘，按钮也还在'] }),
-      Object.assign(bt(() => '陀螺仪：' + (s.gyro ? '开' : '关'), () => {
-        if (s.gyro) { s.gyro = false; return; }
-        s.gyro = true;
-        Gyro.enable().then((err) => { if (err) { s.gyro = false; g.saveSettings(); g.ui.message(err, '#FF5555'); } if (this.layout) this.layout(); });
-      }), { tip: ['转动手机来转视角，手指滑动照样可以用'] }),
-      ...(s.gyro ? [{ slider: true, value: Math.log((s.gyroSens ?? 1) / 0.25) / Math.log(16), label: () => '陀螺仪灵敏度：' + Math.round((s.gyroSens ?? 1) * 100) + '%', onChange: (v) => { s.gyroSens = Math.round(0.25 * Math.pow(16, v) * 20) / 20; g.saveSettings(); } }] : []),
       bt(() => '震动：' + (s.vibrate === false ? '关' : '开'), () => { s.vibrate = s.vibrate === false; }),
       bt('编辑按钮布局…', () => g.ui.open(new TouchLayoutScreen(g, this))),
-      Object.assign(bt(() => '帧率上限：' + (s.maxFps ? s.maxFps + ' 帧' : '跟随屏幕（' + hz + ' 帧）'), () => { const cur = rates.indexOf(s.maxFps); s.maxFps = cur < 0 ? rates[0] : cur === rates.length - 1 ? 0 : rates[cur + 1]; }),
-        { tip: ['越高越流畅，但更耗电、手机更热', '手机热到跟不上时会自动降回 60 帧'] }),
+      Object.assign(bt(() => '帧率上限：' + FpsChoice.label(g, s.maxFps), () => FpsChoice.next(g)),
+        { tip: ['越高越流畅，但更耗电、手机更热', '自动：90 / 120 Hz 的屏幕上是 60 帧', '手机热到跟不上时会自动降回 60 帧'] }),
       bt(() => '竖着拿手机时旋转画面：' + (s.rotatePortrait === false ? '关' : '开'), () => { s.rotatePortrait = s.rotatePortrait === false; Stage.update(); }),
     ];
   };
 })();
 
-// ---- a phone that cannot keep its high frame rate (heat): back to 60, once ----
+// ---- a phone that cannot keep a frame rate above 60 (heat): back to 60, once ----
+// (the limit in effect - FramePacer.playLimit, 0 = the screen's rate; the time between two checks counts only while
+// this applies: 'last' stayed behind on the other paths and a pause menu of minutes came back as minutes of "too slow".
+// Not under a pausing screen or the inactivity limit, nor for 2.5 s after - g.fps counts whole seconds)
 (() => {
   let low = 0, last = performance.now();
   setInterval(() => {
-    const g = typeof game !== 'undefined' && game;
-    if (!g || g.state !== 'play' || !touchOn(g) || !(g.settings.maxFps > 60 || (!g.settings.maxFps && g.pacer && g.pacer.refresh < 14))) { low = 0; return; }
-    const target = g.settings.maxFps || Math.round(1000 / g.pacer.refresh), now = performance.now();
-    if (g.fps && g.fps < target * 0.7) low += now - last; else low = Math.max(0, low - (now - last) / 2);
-    last = now;
-    if (low > 30000) { g.settings.maxFps = 60; g.saveSettings(); g.ui.message('手机有点热，帧率上限降到 60 帧（触控设置里可以改回来）', '#FFAA00'); low = 0; }
+    const g = typeof game !== 'undefined' && game, P = g && g.pacer, now = performance.now(), dt = now - last; last = now;
+    const lim = P ? P.playLimit || P.hz : 0;
+    if (!P || g.state !== 'play' || !touchOn(g) || lim <= 65) { low = 0; return; }
+    if (document.hidden || now - P.cappedT < 2500 || !g.fps) return;
+    if (g.fps < lim * 0.7) low += dt; else low = Math.max(0, low - dt / 2);
+    if (low > 30000) { g.settings.maxFps = P.auto60 ? 0 : 60; g.saveSettings(); g.ui.message('手机有点热，帧率上限降到 60 帧（触控设置里可以改回来）', '#FFAA00'); low = 0; }
   }, 2000);
 })();
 

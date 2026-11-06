@@ -22,6 +22,8 @@ const toYaw = (deg) => Math.PI - deg / R2D, fromYaw = (rad) => 180 - rad * R2D;
 // this game's face order (-x +x -y +y -z +z) -> vanilla's Direction (down up north south west east)
 const NET_FACE = [4, 5, 0, 1, 2, 3];
 const oursToWin = (i) => i === 40 ? 45 : i < 9 ? 36 + i : i < 36 ? i : 5 + i - 36; // 40: the offhand (window slot 45)
+// the render distance told to the server (vanilla's options range; the proxy keeps it within the server's)
+const netRd = (g) => clamp(Math.round(+(g.settings && g.settings.renderDist) || 10), 2, 32);
 // set_player_inventory numbering: 0-8 hotbar, 9-35 main, 36-39 armour from the feet up
 const pinvToOurs = (s) => s < 36 ? s : s <= 39 ? 36 + 39 - s : -1;
 // two stacks of the same item that may merge (same components; unknown items by their name)
@@ -131,13 +133,20 @@ class NetClient {
     this.inv = new Array(40).fill(null); this.w0x = new Array(5).fill(null); this.off = null; this.win = null; this.sentSel = -1; this.unknownItems = new Set(); this.eid = 0; this.pendingItems = new Map();
     const ws = this.ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', name, version: 1, proto: 1, room: opts.room, key: opts.key, token: (opts.room && typeof Account !== 'undefined' && Account.token) || undefined }));
+    // (rd: this player's render distance - the proxy asks the server for no more chunks than that, like vanilla's client
+    // information; it asked for 10 whatever the client's: a phone at 6 got 473 chunks out to 11 rings, 26 MB in 20 s on
+    // the local test server, now 265 and 16 MB, 11-03)
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', name, version: 1, proto: 1, room: opts.room, key: opts.key, token: (opts.room && typeof Account !== 'undefined' && Account.token) || undefined, rd: netRd(game) }));
     ws.onmessage = (e) => { this.stats.msgs++; try { if (typeof e.data === 'string') this.onMessage(JSON.parse(e.data)); else this.onBinary(e.data); } catch (err) { console.error('net', err); } };
     ws.onerror = () => { if (!this.closed) this.fail(opts.room ? '连不上联机服务器，请稍后再试' : '无法连接到联机中转 ' + url + '（中转程序没有启动？）'); };
     ws.onclose = () => { if (!this.closed) this.fail('与服务器的连接已断开'); };
   }
   send(o) { if (this.ws.readyState === 1) this.ws.send(JSON.stringify(o)); }
-  close() { this.closed = true; try { this.ws.close(); } catch (e) { } }
+  // the render distance for the server (session.js writes it as the client information): when it changed, a second
+  // after the last change - a slider dragged, or 自动画质 stepping it, is one message
+  sendSettings() { const rd = netRd(this.g); if (rd === this.sentRd) return; this.sentRd = rd; this.send({ t: 'settings', rd }); }
+  settingsSoon() { clearTimeout(this.rdTimer); this.rdTimer = setTimeout(() => { if (!this.closed && this.g.net === this) this.sendSettings(); }, 1000); }
+  close() { this.closed = true; clearTimeout(this.rdTimer); try { this.ws.close(); } catch (e) { } }
   fail(reason) {
     if (this.closed) return;
     this.closed = true;
@@ -168,7 +177,8 @@ class NetClient {
         break;
       }
       case 'biomes': this.biomes = m.list.map((n) => Math.max(VB_BASE, vbiomeIndex(n))); break;
-      case 'login': this.eid = m.eid; this.enterWorld(m, true); break;
+      // (the render distance again once in the game: the room service passes on a hello of its own, without it)
+      case 'login': this.eid = m.eid; this.enterWorld(m, true); this.sentRd = null; this.sendSettings(); break;
       case 'respawn': this.enterWorld(m, false); break;
       case 'pos': {
         const r = m.rel || {};
@@ -179,6 +189,7 @@ class NetClient {
         p.pitch = r.pitch ? p.pitch - m.pitch / R2D : -m.pitch / R2D;
         p.prev = [...p.pos]; p.vel = [0, 0, 0]; p.fallDist = 0;
         this.send({ t: 'tpok', id: m.id });
+        this.posDue = true; // (vanilla answers a teleport with its position at once, its chunk there or not)
         break;
       }
       case 'abilities': p.flying = !!(m.flags & 2); p.canFly = !!(m.flags & 4); break;
@@ -696,6 +707,11 @@ class NetClient {
       // survival: the inventory is the server's (moved around through windows)
       for (let i = 0; i < 40; i++) if (!sameStack(p.inv.slots[i], this.inv[i])) { this.applyInv(); break; }
     }
+    // the player's chunk not here yet (the player stands still, game.js tick): no move, look or keys - vanilla's client
+    // doesn't tick its player there - only the end of the tick. A position every tick of hanging in the air is what a
+    // server without allow-flight kicks for flying; the answer to a teleport still goes (posDue)
+    if (!p.loadedHere() && !this.posDue) { this.send({ t: 'tick' }); return; }
+    this.posDue = false;
     const input = g.ui.screen ? null : g.readInput();
     const keys = input && { f: input.fwd > 0, b: input.fwd < 0, l: input.strafe < 0, r: input.strafe > 0, j: input.jump, s: input.sneak, sp: !!p.sprinting };
     const v = p.vehicle;
@@ -1035,6 +1051,10 @@ Game.prototype.netTick = function () {
 const RoomService = {
   base() {
     const q = new URLSearchParams(location.search).get('rooms');
+    // a test page on this machine (localhost, *.localhost, *.test) leaves the live service alone unless ?rooms= says
+    // otherwise: it refuses those pages anyway, and each refusal counted against the developer's address until it
+    // was banned (2026-11-03)
+    if (!q && /^(localhost|127\.|\[::1\])|\.(localhost|test)$/.test(location.hostname)) return '';
     return String(q || (window.NET_CONFIG && NET_CONFIG.rooms) || '').replace(/\/+$/, '');
   },
   ws() { return this.base().replace(/^http/, 'ws') + '/ws'; },
@@ -1267,7 +1287,6 @@ class CreateRoomScreen extends FormScreen {
       // (a room whose save didn't arrive is not kept)
       if (code) RoomService.api('/api/rooms/' + code + '/delete', { key: RoomService.key() }).catch(() => { });
       this.busy = false; this.say(e.message, true); this.loadCap(); this.layout();
-      // [本地离线版] gate 错误不再弹登录屏（本地来源被服务端拒，弹屏只会死循环），改为显示错误
       if (e.gate) this.say('服务端拒绝了本地页面的请求（来源白名单）—— 联机请用在线版', true);
     }
   }
@@ -1936,18 +1955,32 @@ const NET_CHUNK_MSG = new Set(['block', 'blocks', 'unload', 'signs', 'be']);
     if (m.t === 'respawn' || m.t === 'login') this.cq = [];
     return _om.call(this, m);
   };
+  // (the frame's chunk budget - perf.js, from the display's refresh and the rest of the frame - twice it while a join's
+  // burst is waiting; it was a fixed 6 ms, 18 over 300 queued, whatever the frame had to spare: the same on a phone
+  // with little left as on the test PC, whose budget is 12. Counted as chunk work, so the pacer backs off after a late
+  // frame, and the decoding no longer counts as the frame's other time - that shrank the budget the meshing got.
+  // Joining the local test server at 8 chunks with the CPU slowed 6x, 11-04: a frame's decoding p95 5.3-5.8 ms, was
+  // 8.3-9.1; the queue empty 7.0-7.9 s after joining, was 7.5-7.8)
   NetClient.prototype.drainChunks = function (budget) {
     const q = this.cq; if (!q || !q.length) return;
-    const t0 = performance.now(), lim = q.length > 300 ? budget * 3 : budget;
+    const t0 = performance.now(), lim = q.length > 300 ? budget * 2 : budget;
     let i = 0;
     while (i < q.length && (i === 0 || performance.now() - t0 < lim)) {
       const [k, v] = q[i++];
       try { if (k === 0) _ob.call(this, v); else _om.call(this, v); } catch (e) { console.error('net', e); }
     }
     q.splice(0, i);
+    const P = this.g.pacer; if (P) P.chunkMs += performance.now() - t0;
   };
   const _fr = Game.prototype.frame;
-  Game.prototype.frame = function (...a) { if (this.net) this.net.drainChunks(6); return _fr.apply(this, a); };
+  // (on the loading screen at least the 6 ms it had: its meshing takes 30 a frame anyway, and the pacer's budget, backed
+  // off by those long frames, kept the screen up longer - phone emulation, CPU slowed 6x, 8 chunks, 11-05: 3.06 s to
+  // the world on average over 8 joins, 2.80 over 6 with this, 2.89 over 6 with the old fixed slice)
+  Game.prototype.frame = function (...a) { if (this.net) this.net.drainChunks(this.state === 'loading' ? Math.max(6, this.chunkBudget()) : this.chunkBudget()); return _fr.apply(this, a); };
+  // a render distance changed in the options: to the server too (only a change of it starts the wait: dynamic resolution
+  // applies the settings every few seconds, and each call put a slider's change off another second)
+  const _as = Game.prototype.applySettings;
+  Game.prototype.applySettings = function (...a) { const r = _as.apply(this, a), n = this.net; if (n) { const rd = netRd(this); if (rd !== n.seenRd) { n.seenRd = rd; n.settingsSoon(); } } return r; };
 })();
 
 // ---- the recipe book on a server (1.21.2+): the recipes the player has unlocked come from the server, each with
@@ -2144,6 +2177,34 @@ function netRecipe(o) {
     }
     if (best) { for (let i = 0; i < 3; i++) p.pos[i] += best.o[i]; p.prev = [...p.pos]; }
     return r;
+  };
+})();
+// on a server nothing pauses, as in vanilla's multiplayer: with the pause menu (or another pausing screen) open this
+// client stopped ticking - no moves went out and the server saw the player hang in mid-air ("联机里空中按 Esc 会悬浮",
+// feedback 2026-11-01 09:53), which rooms now kick as flying (rooms.js allow-flight). (pauses is a getter on some
+// screens - ItemDexScreen: shadowed for the tick, not assigned; the buttons held let go, like opening a screen does)
+(() => {
+  const tick = Game.prototype.tick;
+  Game.prototype.tick = function () {
+    const sc = this.net && this.state === 'play' && this.ui && this.ui.screen;
+    if (!sc || !sc.pauses) return tick.call(this);
+    const own = Object.getOwnPropertyDescriptor(sc, 'pauses');
+    this.mouseBtn = [false, false, false]; this.mouseClicked0 = false;
+    Object.defineProperty(sc, 'pauses', { value: false, configurable: true, writable: true });
+    try { return tick.call(this); } finally { if (own) Object.defineProperty(sc, 'pauses', own); else delete sc.pauses; }
+  };
+})();
+// 选项's difficulty on a server or in someone's local room: the room's (its owner sets it, 房间 → 难度), not this page's -
+// the button changed only what this page showed, and players took it for a hole「成员可以在设置中切换游戏难度」
+// (feedback 11-01, 11-02; those rooms' server logs show no /difficulty at all)
+(() => {
+  const lay = OptionsScreen.prototype.layout;
+  OptionsScreen.prototype.layout = function () {
+    lay.call(this);
+    const g = this.game; if (!(g.net || g.p2pGuest) || g.state !== 'play') return;
+    const b = this.widgets.find((w) => w && typeof w.label === 'function' && /^难度：/.test(String(w.label())));
+    const own = g.net && g.net.room && g.net.room.isOwner;
+    if (b) Object.assign(b, { enabled: false, onClick: () => { }, label: '难度：' + (g.net && !g.net.room ? '由服务器决定' : '由房主决定'), tip: [own ? '在 暂停菜单 → 房间… 里改难度' : g.net && !g.net.room ? '服务器的难度由服务器的管理员决定' : '房间的难度只有房主能改'] });
   };
 })();
 // the game mode on a server: an operator's switch (F3 + F4 / F3 + N, the pause menu) asks the server (/gamemode)

@@ -13,10 +13,14 @@
   if (inWorker) importScripts('worldgen_data.js', 'blockdata.js', 'worldgen.js', 'structures_data.js', 'structgen.js', 'structtypes.js');
 
   function makeGenCore() {
-    let gen = null, seed = null, palette = null;
+    let gen = null, seed = null, palette = null, initErr = null;
     const gens = {};
-    // one generator per dimension; chunks are padded to the world's full height
-    const genFor = (dim) => gens[dim] || (gens[dim] = dim === 'overworld' ? gen : new WG.Generator(BigInt(seed), self.WG_DATA, palette, dim));
+    // one generator per dimension; chunks are padded to the world's full height. (A generator that could not be built
+    // says why in every answer: the jobs used to fail with "G is null", and the page's error log never showed the cause)
+    const genFor = (dim) => {
+      if (!gen) throw new Error('generator not built' + (initErr ? ': ' + initErr : ''));
+      return gens[dim] || (gens[dim] = dim === 'overworld' ? gen : new WG.Generator(BigInt(seed), self.WG_DATA, palette, dim));
+    };
     return async function handle(m, post) {
       try {
         if (m.type === 'init') {
@@ -29,13 +33,29 @@
           const G = genFor(m.dim || 'overworld'), t0 = performance.now();
           // structures reaching this chunk: their terrain adaptation goes into the noise, their pieces
           // are placed right after the carvers (vanilla places them in the feature steps)
-          let sc = null;
-          if (m.structures !== false && self.SG && G.dim !== 'end') { await SG.ready; sc = SG.forChunk(G, m.cx, m.cz); G.beard = sc.beard; }
+          // (structures that fail - their templates not unpacked, a browser without DecompressionStream - leave the chunk
+          // without them and say so in msg.warn, instead of failing the chunk. Firefox before 113 runs the game but has no
+          // DecompressionStream: SG.ready was rejected once and for all, every chunk of the session came back as an error,
+          // and the page took the errors for chunks - telemetry 11-02/03, all Firefox devices, the world never loaded)
+          let sc = null, warn = null;
+          const noStructs = (e) => { sc = null; G.beard = null; warn = 'structures: ' + String(e && e.stack || e); };
+          if (m.structures !== false && self.SG && G.dim !== 'end') {
+            try { await SG.ready; sc = SG.forChunk(G, m.cx, m.cz); G.beard = sc.beard; }
+            catch (e) { noStructs(e); }
+          }
           const t1 = performance.now();
           let c;
-          try { c = G.generate(m.cx, m.cz); } finally { G.beard = null; }
+          // (terrain that fails with a structure's adaptation in it is made again without)
+          try { c = G.generate(m.cx, m.cz); }
+          catch (e) { if (!G.beard) throw e; noStructs(e); c = G.generate(m.cx, m.cz); }
+          finally { G.beard = null; }
           const t2 = performance.now();
-          const sx = sc && sc.starts.length ? SG.place(G, m.cx, m.cz, c.blocks, c.meta, c.heightmap, sc.starts) : null;
+          let sx = null;
+          if (sc && sc.starts.length) {
+            // (pieces that fail half placed: the terrain once more, without them)
+            try { sx = SG.place(G, m.cx, m.cz, c.blocks, c.meta, c.heightmap, sc.starts); }
+            catch (e) { noStructs(e); sx = null; c = G.generate(m.cx, m.cz); }
+          }
           // surface biome per column (zoomed at the top block), for tints, weather and spawning; in the Nether
           // there is no "surface", so use the floor below y 64
           const sb = new Uint8Array(256);
@@ -52,6 +72,7 @@
             c.quartBiomes = q;
           }
           const msg = { type: 'chunk', cx: m.cx, cz: m.cz, id: m.id, blocks: c.blocks, qb: c.quartBiomes, hm: c.heightmap, sb, ms: [t1 - t0, t2 - t1, performance.now() - t2] };
+          if (warn) msg.warn = warn;
           const tr = [c.blocks.buffer, c.quartBiomes.buffer, c.heightmap.buffer, sb.buffer];
           if (sx) { msg.meta = c.meta; msg.sx = sx; tr.push(c.meta.buffer); }
           post(msg, tr);
@@ -69,10 +90,11 @@
           });
           post({ type: 'biomes', id: m.id, qy: QY, data: out }, [out.buffer]);
         } else if (m.type === 'spawn') {
-          const r = WG.findSpawn(gen);
+          const r = WG.findSpawn(genFor('overworld'));
           post({ type: 'spawn', id: m.id, x: r[0], z: r[1] });
         }
       } catch (err) {
+        if (m.type === 'init' && !initErr) initErr = String(err && err.message || err);
         post({ type: 'error', id: m.id, message: String(err && err.stack || err) });
       }
     };

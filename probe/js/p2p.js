@@ -36,6 +36,34 @@ function p2pFrame(kind, id, payload) { const out = new Uint8Array(5 + payload.le
 // what a block entity is worth comparing (JSON without the parts that are only the client's)
 const beJson = (be) => { try { return JSON.stringify(be, (k, v) => (k === 'open' || k === 'lid' || k === 'viewers' ? undefined : v)); } catch (e) { return ''; } };
 const beKey = (k) => typeof k === 'string' && /^-?\d+,-?\d+,-?\d+$/.test(k);
+// an item id from the other side, if this game has it: a phone still on an older (cached) or newer version sends ids
+// missing here, and a held item or dropped item drawn with one threw every frame
+const p2pItem = (id) => (id != null && ITEMS[id] ? id : null);
+// a message's size on the wire: bytes as they are, a string as UTF-8 (at most 3 bytes a character: encoded only when
+// that could matter)
+const p2pBytes = (d) => (typeof d !== 'string' ? d.length : d.length * 3 <= 65536 ? d.length * 3 : new TextEncoder().encode(d).length);
+// a look from the other side as skins.js takes a room's (NetClient 'look'): a skin id that isn't one, or a cape this
+// version doesn't have, is left out - an older (cached) or newer game sends what this one can't draw, and a player whose
+// drawing throws is skipped: not seen at all (hats, pets and prefixes are looked up safely, cosmetics.js hasKey)
+const p2pWord = (v) => (typeof v === 'string' && /^[a-z]{3,16}$/.test(v) ? v : null);
+const p2pLook = (l) => (l && typeof l === 'object' ? { skin: typeof l.skin === 'string' && /^(p:[a-z_]{3,20}|m:[A-Za-z0-9_]{3,16})$/.test(l.skin) ? l.skin : null, slim: !!l.slim,
+  cape: p2pWord(l.cape) && typeof Capes !== 'undefined' && Capes.info(l.cape) ? l.cape : null, hat: p2pWord(l.hat), pet: p2pWord(l.pet), pre: p2pWord(l.pre) } : null);
+// a list (block changes) in as many messages as the connection takes, each one standing alone: a /fill of some 13,000
+// blocks is more than 256 KB, and the whole change was lost for the guests (measured with a 4 KB limit: 3,584 blocks,
+// 60,946 bytes, 'message too large')
+function p2pSendList(link, t, list) {
+  const j = JSON.stringify({ t, list });
+  if (list.length < 2 || p2pBytes(j) <= link.maxSize() - 256) return link.send(j);
+  const h = list.length >> 1; p2pSendList(link, t, list.slice(0, h)); return p2pSendList(link, t, list.slice(h));
+}
+// a chunk reply larger than one message goes in pieces (frame kind 2: [2][u32 request id][u8 last][bytes]); an older
+// guest ignores them and reads the chunk as it did when the send threw (its request times out)
+function p2pFrames(id, payload, max) {
+  if (payload.length + 5 <= max) return [p2pFrame(1, id, payload)];
+  const out = [], n = max - 6;
+  for (let o = 0; o < payload.length; o += n) { const part = payload.subarray(o, o + n), f = new Uint8Array(6 + part.length); f[0] = 2; new DataView(f.buffer).setUint32(1, id); f[5] = o + n >= payload.length ? 1 : 0; f.set(part, 6); out.push(f); }
+  return out;
+}
 
 // ---- the matchmaking socket and one peer connection ----
 class P2PLink {
@@ -61,7 +89,19 @@ class P2PLink {
       if (d.sdp.type === 'offer') { await pc.setLocalDescription(await pc.createAnswer()); sendSignal({ sdp: pc.localDescription.toJSON() }); }
     } else if (d.cand) { if (pc.remoteDescription) await pc.addIceCandidate(d.cand).catch(() => { }); else this.pending.push(d.cand); }
   }
-  send(o) { const dc = this.dc; if (!dc || dc.readyState !== 'open') return false; if (dc.bufferedAmount > 8 << 20) return false; dc.send(o instanceof Uint8Array ? o : JSON.stringify(o)); return true; }
+  // the largest message the connection takes (256 KB between two Chromes; 64 KB assumed where the browser doesn't say).
+  // A larger one threw out of dc.send ("larger than max-message-size", measured 11-03): out of welcome() the guest never
+  // got in (a world whose chests and signs hold Chinese text: 150,000 characters are up to 450 KB), out of tick() no
+  // guest after it got another snapshot
+  maxSize() { const s = this.pc && this.pc.sctp; return Math.min(s && s.maxMessageSize > 0 ? s.maxMessageSize : 65536, 262144); }
+  backlog() { return this.dc ? this.dc.bufferedAmount : 0; }
+  // o: an object (sent as JSON), its JSON already made, or bytes
+  send(o) {
+    const dc = this.dc; if (!dc || dc.readyState !== 'open') return false; if (dc.bufferedAmount > 8 << 20) return false;
+    const data = o instanceof Uint8Array || typeof o === 'string' ? o : JSON.stringify(o);
+    if (p2pBytes(data) > this.maxSize()) { console.warn('p2p: message too large', o && o.t, p2pBytes(data)); return false; }
+    try { dc.send(data); return true; } catch (e) { console.warn('p2p send', e); return false; }
+  }
   close() { try { this.dc && this.dc.close(); } catch (e) { } try { this.pc && this.pc.close(); } catch (e) { } }
 }
 
@@ -137,6 +177,9 @@ class LocalHost {
   // last visit, where to appear
   welcome(p) {
     const g = this.g, w = g.world, m = g.worldMeta;
+    // (the host went to the Nether or the End while nobody was in: a guest would have appeared at its place there in the
+    // overworld, its stand-in among the other dimension's mobs - not let in until the host is back)
+    if (g.dim !== 'overworld') { p.link.send({ t: 'kicked', reason: '房主现在不在主世界：等房主回到主世界再进来' }); setTimeout(() => this.dropPeer(p.id, '没能进入'), 300); return; }
     const keys = new Set(w.savedIndex || []);
     for (const ch of w.chunks.values()) if (ch.modified) keys.add(ckey(ch.cx, ch.cz));
     let saved = (m.guests || {})[p.name.toLowerCase()] || null;
@@ -144,15 +187,20 @@ class LocalHost {
     if (saved && !(saved.health > 0)) saved = { ...saved, health: 20, food: 20, sat: 5, pos: [...(g.player.spawn || m.spawn || g.player.pos)] };
     const sp = g.player.pos;
     const bes = [...g.blockEntities].filter(([k]) => beKey(k)).map(([k, be]) => [k, JSON.parse(beJson(be) || 'null')]), parts = [];
+    // (in parts under the connection's message size, counted in bytes: see P2PLink.maxSize)
+    const lim = Math.min(p.link.maxSize(), 65536) - 4096;
     for (let i = 0, cur = [], n = 0; i <= bes.length; i++) {
-      if (i === bes.length || n > 150000) { if (cur.length) parts.push({ t: 'wbes', list: cur }); cur = []; n = 0; if (i === bes.length) break; }
-      cur.push(bes[i]); n += JSON.stringify(bes[i]).length;
+      const b = i < bes.length ? p2pBytes(JSON.stringify(bes[i])) + 1 : 0;
+      if (i === bes.length || (cur.length && n + b > lim)) { if (cur.length) parts.push({ t: 'wbes', list: cur }); cur = []; n = 0; if (i === bes.length) break; }
+      cur.push(bes[i]); n += b;
     }
     const kl = [...keys];
-    for (let i = 0; i < kl.length; i += 15000) parts.push({ t: 'wkeys', list: kl.slice(i, i + 15000) });
+    for (let i = 0; i < kl.length; i += 4000) parts.push({ t: 'wkeys', list: kl.slice(i, i + 4000) });
     for (const q of parts) p.link.send(q);
+    // (flat and structures: what the guest's world generates from the seed - without them a superflat host's guests
+    // walked on normal terrain, feedback 11-01 20:36 / 20:38)
     p.link.send({
-      t: 'welcome', name: m.name, seed: m.seed, gen: m.gen, mode: g.mode === 'spectator' ? 'survival' : g.mode, difficulty: g.difficulty, hardcore: !!g.hardcore,
+      t: 'welcome', name: m.name, seed: m.seed, gen: m.gen, flat: !!m.flat, structures: m.structures !== false, mode: g.mode === 'spectator' ? 'survival' : g.mode, difficulty: g.difficulty, hardcore: !!g.hardcore,
       time: g.worldTime, weather: g.weather, rain: g.rainTarget, spawn: g.player.spawn || m.spawn, near: [sp[0], sp[1], sp[2]], host: (Account.loggedIn && Account.name) || 'Host',
       saved, sponsor: this.sponsor, players: [...this.peers.values()].filter((q) => q.joined).map((q) => q.name),
     });
@@ -163,22 +211,35 @@ class LocalHost {
     this.toAll({ t: 'chat', sys: true, text: `${p.name} 加入了游戏` }, p);
     Telemetry.count && Telemetry.count('p2p_guest');
   }
+  // a guest's stand-in, made again when it is no longer in the world: one taken out (its tick threw 5 times running -
+  // tickEntity drops those -, /kill ...) was kept, so nobody saw that guest again, mobs no longer chased it, and its
+  // snapshots stayed centred where it was taken out (only what was there was sent to it)
+  avatarOf(p) {
+    const g = this.g, a = p.avatar;
+    if (a && !a.dead && g.entities.includes(a)) return a;
+    const at = a ? a.netPos || a.pos : g.player.pos, n = p.avatar = new GuestAvatar(g, p, at[0], at[1], at[2]);
+    if (a) n.look = a.look;
+    g.entities.push(n);
+    return n;
+  }
   onMsg(p, m) {
     const g = this.g;
-    if (m instanceof Uint8Array) return;
+    if (m instanceof Uint8Array || this.peers.get(p.id) !== p) return; // (a message still on its way from a guest that was let go)
     switch (m.t) {
       case 'state': {
-        p.state = m; const a = p.avatar; if (!a || !Array.isArray(m.pos)) return;
+        p.state = m; if (!p.joined || !Array.isArray(m.pos) || !m.pos.slice(0, 3).every(Number.isFinite)) return;
+        const a = this.avatarOf(p);
         a.netPos = m.pos.slice(0, 3); a.lerpN = 2; a.netYaw = m.yaw; a.netHead = m.yaw; a.netPitch = m.pitch; a.sneaking = !!m.sneak;
-        if (m.swing) a.swingT = 6; a.heldId = m.held ?? null; a.armorItems = (m.armor || []).map((id) => (id == null ? null : { id, count: 1 }));
+        if (m.swing) a.swingT = 6; a.heldId = p2pItem(m.held); a.armorItems = (Array.isArray(m.armor) ? m.armor : []).map((id) => (p2pItem(id) == null ? null : { id, count: 1 }));
         a.creative = m.mode === 'creative'; a.spectator = m.mode === 'spectator'; a.deadGuest = !!m.dead; a.flying = !!m.flying; a.netSwim = !!m.swim;
-        if (m.look) a.look = m.look;
+        if (m.look) a.look = p2pLook(m.look);
         break;
       }
       case 'chunk': {
         // a chunk the host's world changed: from memory (loaded) or the save
         const w = g.world, k = ckey(m.cx, m.cz), ch = w.chunks.get(k);
-        const reply = (rec) => p.link.send(p2pFrame(1, m.id, rec ? p2pPackChunk(rec) : new Uint8Array(0)));
+        // (a piece that didn't go: not the rest either - the guest's request times out, as for a reply that didn't go)
+        const reply = (rec) => { for (const f of p2pFrames(m.id, rec ? p2pPackChunk(rec) : new Uint8Array(0), p.link.maxSize())) if (!p.link.send(f)) break; };
         if (ch && ch.modified) reply(encodeChunk(ch));
         else if (w.savedChunks && w.savedChunks.has(k)) reply(w.savedChunks.get(k));
         else DB.getChunk(w.savedStore, m.cx, m.cz).then((r) => reply(r || (ch ? encodeChunk(ch) : null)), () => reply(null));
@@ -191,8 +252,10 @@ class LocalHost {
         const e = g.entities.find((q) => q.p2pId === m.id && !q.dead), a = p.avatar;
         // (an item just dropped waits its pickup delay, as for the host)
         if (!e || !a || (e.pickup > 0) || Math.hypot(e.pos[0] - a.pos[0], e.pos[1] - a.pos[1], e.pos[2] - a.pos[2]) > 4) break;
-        if (e instanceof ItemEntity && e.stack) { p.link.send({ t: 'give', stack: e.stack }); e.dead = true; Sound.ev && Sound.ev('entity.item.pickup', e.pos, 0.2, 1.5); }
-        else if (e instanceof ExperienceOrb) { p.link.send({ t: 'xp', n: e.value || e.v || 1 }); e.dead = true; }
+        // (taken only once the give went: send no longer throws, and a stack too large for the connection, or behind
+        // 8 MB still to go, was taken off the ground and lost - it stays there now)
+        if (e instanceof ItemEntity && e.stack) { if (p.link.send({ t: 'give', stack: e.stack })) { e.dead = true; Sound.ev && Sound.ev('entity.item.pickup', e.pos, 0.2, 1.5); } }
+        else if (e instanceof ExperienceOrb) { if (p.link.send({ t: 'xp', n: e.value || e.v || 1 })) e.dead = true; }
         break;
       }
       case 'hit': {
@@ -211,9 +274,13 @@ class LocalHost {
     if (!this.peers.size) { this.blocks.length = 0; return; }
     if (this.blocks.length) {
       const list = this.blocks.splice(0);
-      this.toAll({ t: 'B', list });
+      for (const p of this.peers.values()) if (p.joined) p2pSendList(p.link, 'B', list);
     }
-    if (g.tickCount % 2 === 0) for (const p of this.peers.values()) if (p.joined && p.avatar) p.link.send(this.snapshot(p));
+    // (a snapshot is the latest state: none while the guest's connection is still sending older data. They went into
+    // the queue regardless, up to 8 MB - over a slow or relayed connection minutes of them, so every player and mob was
+    // seen where it had been long ago, or not at all. One a second still goes: a browser whose count of what waits never
+    // came down would otherwise have shown that guest nobody at all)
+    if (g.tickCount % 2 === 0) for (const p of this.peers.values()) if (p.joined && p.avatar && (p.link.backlog() < 128 << 10 || g.tickCount % 20 === 0)) g.guard('p2p snapshot', () => this.sendSnapshot(p));
     if (g.tickCount % 10 === 0) {
       for (const [k, be] of g.blockEntities) {
         if (!beKey(k)) continue;
@@ -223,13 +290,23 @@ class LocalHost {
     }
     if (g.tickCount % 40 === 0) this.toAll({ t: 'env', time: g.worldTime, weather: g.weather, rain: g.rainTarget, difficulty: g.difficulty });
   }
-  // the entities near a guest: mobs, items, orbs, and the other players
+  // a snapshot in as many messages as the connection's message size needs (all but the last say more: 1; the guest
+  // puts them together). One too large for it threw, and that guest got none
+  sendSnapshot(p) {
+    const s = this.snapshot(p), j = JSON.stringify(s), lim = p.link.maxSize() - 256;
+    if (p2pBytes(j) <= lim) { p.link.send(j); return; }
+    const parts = [], cut = (l) => { if (l.length < 2 || p2pBytes(JSON.stringify(l)) <= lim) parts.push(l); else { const h = l.length >> 1; cut(l.slice(0, h)); cut(l.slice(h)); } };
+    cut(s.list);
+    parts.forEach((l, i) => p.link.send(i < parts.length - 1 ? { t: 'E', list: l, more: 1 } : { t: 'E', list: l }));
+  }
+  // the entities near a guest: mobs, items, orbs (within 64 blocks), and the other players wherever they are (vanilla
+  // tracks players out to the view distance; at 64 blocks two guests apart lost sight of each other)
   snapshot(p) {
     const g = this.g, a = p.avatar, R2 = 64 * 64, ents = [];
     for (const e of g.entities) {
       if (e.dead || e === a) continue;
       const dx = e.pos[0] - a.pos[0], dz = e.pos[2] - a.pos[2];
-      if (dx * dx + dz * dz > R2) continue;
+      if (dx * dx + dz * dz > R2 && !(e instanceof GuestAvatar)) continue;
       if (!e.p2pId) e.p2pId = this.nextEnt++;
       const r = [e.p2pId, 0, +e.pos[0].toFixed(2), +e.pos[1].toFixed(2), +e.pos[2].toFixed(2), +(e.yaw || 0).toFixed(2)];
       if (e instanceof GuestAvatar) { r[1] = 'player'; r.push({ name: e.name, look: e.look || null, held: e.heldId ?? null, armor: (e.armorItems || []).map((s) => s && s.id), sneak: !!e.sneaking, swing: e.swingT > 0, pitch: e.netPitch || 0, swim: !!e.netSwim }); }
@@ -303,7 +380,7 @@ class LocalGuest {
   async onWelcome(m) {
     const g = this.g, id = 'p2p~' + this.code;
     this.meta = {
-      id, name: m.name + '（本地房间）', seed: String(m.seed), gen: m.gen || 2, mode: m.mode, flat: false, difficulty: m.difficulty, hardcore: m.hardcore, cheats: false,
+      id, name: m.name + '（本地房间）', seed: String(m.seed), gen: m.gen || 2, mode: m.mode, flat: !!m.flat, structures: m.structures !== false, difficulty: m.difficulty, hardcore: m.hardcore, cheats: false,
       time: m.time, weather: m.weather, rainTarget: m.rain, spawn: m.spawn, tutorial: -1, dims: { overworld: { blockEntities: Object.fromEntries(this.wbes || []), mobs: [] } },
       player: m.saved || null, created: Date.now(), lastPlayed: Date.now(),
     };
@@ -320,7 +397,18 @@ class LocalGuest {
   onMsg(m) {
     const g = this.g;
     if (m instanceof Uint8Array) {
-      if (m[0] === 1) { const id = new DataView(m.buffer, m.byteOffset).getUint32(1), r = this.reqs.get(id); if (r) { this.reqs.delete(id); r(m.length > 5 ? p2pUnpackChunk(m.subarray(5)) : null); } }
+      const id = m.length >= 5 ? new DataView(m.buffer, m.byteOffset).getUint32(1) : -1, r = this.reqs.get(id);
+      if (m[0] === 1) { if (r) { this.reqs.delete(id); r(m.length > 5 ? p2pUnpackChunk(m.subarray(5)) : null); } }
+      // a chunk in pieces (p2pFrames): put together at the last one
+      else if (m[0] === 2 && r && m.length > 6) {
+        const ps = this.pieces || (this.pieces = new Map()), l = ps.get(id) || []; l.push(m.slice(6));
+        if (!m[5]) { ps.set(id, l); return; }
+        ps.delete(id); this.reqs.delete(id);
+        const all = new Uint8Array(l.reduce((s, b) => s + b.length, 0)); let o = 0; for (const b of l) { all.set(b, o); o += b.length; }
+        // (its length as its header says, or nothing: a piece lost on the way gave a chunk of shifted blocks)
+        const dv = all.length >= 12 ? new DataView(all.buffer) : null;
+        r(dv && 12 + dv.getUint32(0) * 2 + dv.getUint32(4) * 2 + dv.getUint32(8) * 4 === all.length ? p2pUnpackChunk(all) : null);
+      }
       return;
     }
     switch (m.t) {
@@ -341,7 +429,12 @@ class LocalGuest {
         break;
       }
       case 'be': if (beKey(m.k) && m.data) { const be = g.blockEntities.get(m.k); if (be) { for (const k in m.data) be[k] = m.data[k]; } else g.blockEntities.set(m.k, m.data); this.beSnap.set(m.k, beJson(g.blockEntities.get(m.k))); } break;
-      case 'E': this.onEntities(m.list); break;
+      case 'E': {
+        if (!Array.isArray(m.list)) break;
+        if (m.more) { (this.eParts || (this.eParts = [])).push(...m.list); break; }
+        const list = this.eParts ? this.eParts.concat(m.list) : m.list; this.eParts = null;
+        this.onEntities(list); break;
+      }
       case 'env': g.worldTime = m.time; g.weather = m.weather; g.rainTarget = m.rain; g.difficulty = m.difficulty; break;
       case 'hurt': {
         const p = g.player; if (!p || p.deathTime > 0) break;
@@ -349,7 +442,15 @@ class LocalGuest {
         try { p.hurt(m.dmg, { type: m.kind === 'player' ? 'player' : m.kind || 'mob', attacker: from, entity: from }); } catch (e) { p.hurt(m.dmg, { type: 'generic' }); }
         break;
       }
-      case 'give': { const st = fixSavedStack({ ...m.stack }); const left = g.player.inv.add(st); Sound.ev && Sound.ev('entity.item.pickup', null, 0.2, 1.5); if (left && left.count) this.send({ t: 'drop', stack: left, pos: g.player.pos.slice(0, 3) }); break; }
+      // what didn't fit goes back to the host's world (inv.add returns the count left: the old check, left.count, was
+      // never true - the rest was lost); an item this game doesn't have goes back whole
+      case 'give': {
+        if (!m.stack || typeof m.stack !== 'object') break;
+        const st = knownStack({ ...m.stack }, g, 'p2p give'), left = st ? g.player.inv.add(st) : m.stack.count | 0;
+        if (st && left < st.count) Sound.ev && Sound.ev('entity.item.pickup', null, 0.2, 1.5);
+        if (left > 0) this.send({ t: 'drop', stack: { ...(st || m.stack), count: left }, pos: g.player.pos.slice(0, 3) });
+        break;
+      }
       case 'xp': g.addXp(m.n | 0); Sound.ev && Sound.ev('entity.experience_orb.pickup', null, 0.1, 1); break;
       case 'chat': g.ui.message(m.sys ? m.text : `<${m.name}> ${m.text}`, m.sys ? '#FFFF55' : '#FFFFFF'); break;
       case 'mark': Marks.add(String(m.name).slice(0, 16), (m.pos || []).map((v) => v | 0)); g.ui.message(`${m.name} 标记了一个位置`, '#FFD24A'); break;
@@ -359,15 +460,23 @@ class LocalGuest {
   }
   // the host's entities, as mirrors: made, moved, removed
   onEntities(list) {
-    const g = this.g, seen = new Set();
+    const g = this.g, seen = new Set(), live = new Set(g.entities);
     for (const r of list) {
+      if (!Array.isArray(r)) continue;
       const [id, type, x, y, z, yaw, d] = r;
+      if (![x, y, z].every(Number.isFinite) || (type === 'player' && !(d && typeof d === 'object'))) continue;
+      // (a dropped item as this game has it, or not at all: the mirror's stack was taken as sent, with no check -
+      // an item of a newer version threw wherever it was drawn or read)
+      const st = type === 'item' ? d && knownStack({ id: d.id, count: d.n || 1, dmg: 0 }, g, 'p2p item') : null;
+      if (type === 'item' && !st) continue;
       seen.add(id);
       let e = this.mirrors.get(id);
-      if (e && e.mirrorType !== type) { e.dead = true; e = null; }
+      // a mirror no longer in the world (its tick threw 5 times running - tickEntity drops those -, or it finished
+      // dying): made again. It was kept and moved, never drawn - a player seen once and then never again
+      if (e && (e.dead || !live.has(e) || e.mirrorType !== type)) { if (e.mirrorType === type && e.deathTime > 0 && d && d.dt) continue; e.dead = true; e = null; }
       if (!e) {
         if (type === 'player') e = new NetPlayer(g, x, y, z, d.name);
-        else if (type === 'item') { e = new ItemEntity(g, x, y, z, { id: d.id, count: d.n || 1 }, [0, 0, 0]); e.tick = netItemTick; e.pickup = 1e9; }
+        else if (type === 'item') { e = new ItemEntity(g, x, y, z, st, [0, 0, 0]); e.tick = netItemTick; e.pickup = 1e9; }
         else if (type === 'xp') { e = new ExperienceOrb(g, x, y, z, d.v || 1); e.tick = netItemTick; }
         else { try { e = createMob(g, type, x, y, z); } catch (err) { e = null; } if (!e) continue; }
         e.p2pMirror = true; e.p2pId = id; e.mirrorType = type; e.remote = true; e.alwaysTick = true; e.persistent = false;
@@ -378,14 +487,14 @@ class LocalGuest {
         g.entities.push(e); this.mirrors.set(id, e);
       }
       e.netPos = [x, y, z]; e.lerpN = 3; e.netYaw = yaw;
-      if (type === 'player') { e.name = d.name; e.look = d.look; e.heldId = d.held; e.armorItems = (d.armor || []).map((i) => (i == null ? null : { id: i, count: 1 })); e.sneaking = d.sneak; if (d.swing && !(e.swingT > 0)) e.swingT = 6; e.netPitch = d.pitch; e.netHead = yaw; e.netSwim = d.swim; }
+      if (type === 'player') { e.name = String(d.name || '?').slice(0, 32); e.look = p2pLook(d.look); e.heldId = p2pItem(d.held); e.armorItems = (Array.isArray(d.armor) ? d.armor : []).map((i) => (p2pItem(i) == null ? null : { id: i, count: 1 })); e.sneaking = d.sneak; if (d.swing && !(e.swingT > 0)) e.swingT = 6; e.netPitch = d.pitch; e.netHead = yaw; e.netSwim = d.swim; }
       else if (d && type !== 'item' && type !== 'xp') {
         e.netHead = yaw + (d.h || 0); e.netPitch = d.p; e.limbSwing = d.ls; e.limbAmt = d.la; e.prevLimb = d.ls;
         if (d.baby) e.baby = true; e.sheared = !!d.sh; e.woolColor = d.wc; if (d.sz !== undefined) e.size = d.sz; if (d.fuse !== undefined) e.fuse = d.fuse;
-        if (d.ht > (e.hurtTime || 0)) e.hurtTime = d.ht; if (d.dt && !e.deathTime) e.deathTime = 1; if (d.sw) e.swingT = d.sw; e.heldId = d.held ?? null; if (d.name) e.customName = d.name;
-      } else if (type === 'item' && e.stack && (e.stack.id !== d.id || e.stack.count !== d.n)) e.stack = { id: d.id, count: d.n, dmg: 0 };
+        if (d.ht > (e.hurtTime || 0)) e.hurtTime = d.ht; if (d.dt && !e.deathTime) e.deathTime = 1; if (d.sw) e.swingT = d.sw; e.heldId = p2pItem(d.held); if (d.name) e.customName = d.name;
+      } else if (type === 'item' && (!e.stack || e.stack.id !== st.id || e.stack.count !== st.count)) e.stack = st;
     }
-    for (const [id, e] of this.mirrors) if (!seen.has(id)) { if (!(e.deathTime > 0)) e.dead = true; this.mirrors.delete(id); }
+    for (const [id, e] of this.mirrors) if (!seen.has(id)) { if (!(e.deathTime > 0)) e.dead = true; this.mirrors.delete(id); this.picks.delete(id); }
   }
   // this player, ten times a second
   sendState(final) {
@@ -397,19 +506,24 @@ class LocalGuest {
   // the guest's own tick: the player and the mirrors; the host simulates the world
   tick() {
     const g = this.g, p = g.player;
-    if (g.tickCount % 2 === 0) this.sendState();
+    // (each part on its own: a throw in one skipped the rest of the tick - the dead mirrors stayed in the world, as
+    // game.js's tick returns before its own clean-up for a guest)
+    if (g.tickCount % 2 === 0) g.guard('p2p state', () => this.sendState());
     for (const e of g.entities) if (!e.dead) g.tickEntity(e);
     g.entities = g.entities.filter((e) => !e.dead);
     g.guard('particles', () => g.particles.tick());
-    if (g.dim === 'overworld' && g.weather > 0.2 && g.tickCount % 2 === 0) g.rainParticles();
-    // items and orbs within reach: asked for (the host gives them if they are still there)
+    if (g.dim === 'overworld' && g.weather > 0.2 && g.tickCount % 2 === 0) g.guard('rain', () => g.rainParticles());
+    // items and orbs within reach: asked for (the host gives them if they are still there); an item only with room for
+    // it (vanilla: a full inventory leaves it on the ground - asked for anyway it came, went back, and came again)
+    const fits = (st) => { const ms = maxStack(st.id); for (let i = 0; i < 36; i++) { const s = p.inv.slots[i]; if (!s || (sameKind(s, st) && s.count < ms && !ITEMS[s.id].durability)) return true; } return false; };
     for (const [id, e] of this.mirrors) {
-      if (!(e instanceof ItemEntity || e instanceof ExperienceOrb) || p.deathTime > 0) continue;
+      if (!(e instanceof ItemEntity || e instanceof ExperienceOrb) || e.dead || p.deathTime > 0 || g.mode === 'spectator') continue;
       if (Math.hypot(e.pos[0] - p.pos[0], e.pos[1] + 0.25 - (p.pos[1] + 0.9), e.pos[2] - p.pos[2]) > 1.6) continue;
+      if (e instanceof ItemEntity && !(e.stack && ITEMS[e.stack.id] && fits(e.stack))) continue;
       const t = this.picks.get(id) || 0; if (performance.now() - t < 600) continue;
       this.picks.set(id, performance.now()); this.send({ t: 'pickup', id });
     }
-    if (this.outBlocks.length) this.send({ t: 'b', list: this.outBlocks.splice(0) });
+    if (this.outBlocks.length && this.link) p2pSendList(this.link, 'b', this.outBlocks.splice(0));
     // block entities this player changed (a chest it put things in): to the host
     if (g.tickCount % 10 === 0) for (const [k, be] of g.blockEntities) {
       if (!beKey(k)) continue;
@@ -423,7 +537,7 @@ class LocalGuest {
       const id = this.nextReq++;
       this.reqs.set(id, res);
       if (!this.send({ t: 'chunk', id, cx, cz })) { this.reqs.delete(id); res(null); }
-      setTimeout(() => { if (this.reqs.has(id)) { this.reqs.delete(id); res(null); } }, 20000);
+      setTimeout(() => { if (this.reqs.has(id)) { this.reqs.delete(id); if (this.pieces) this.pieces.delete(id); res(null); } }, 20000); // (with the pieces that came)
     });
   }
 }
@@ -467,12 +581,16 @@ class LocalGuest {
     const hp = this.player; this.player = best;
     try { return te.call(this, e); } finally { this.player = hp; }
   };
-  // while a room is open nothing pauses the world (the others go on playing)
+  // while a room is open nothing pauses the world (the others go on playing). For the tick the screen's pauses is an
+  // own property false, put back as it was after: a screen whose pauses is a getter only (物品图鉴) can't be assigned -
+  // the throw skipped the whole tick, so the host's world stood still for everyone while it was open (telemetry
+  // 11-02/03: 94 devices, 21,464 times; iOS 'Attempted to assign to readonly property', 18)
   const tick = Game.prototype.tick;
   Game.prototype.tick = function () {
     const sc = this.ui && this.ui.screen, hold = sc && sc.pauses && (this.p2pHost || this.p2pGuest);
-    if (hold) sc.pausesWas = sc.pauses, sc.pauses = false;
-    try { tick.call(this); } finally { if (hold) sc.pauses = sc.pausesWas; }
+    const own = hold ? Object.getOwnPropertyDescriptor(sc, 'pauses') : null;
+    if (hold) try { Object.defineProperty(sc, 'pauses', { value: false, writable: true, configurable: true }); } catch (e) { }
+    try { tick.call(this); } finally { if (hold) try { if (own) Object.defineProperty(sc, 'pauses', own); else delete sc.pauses; } catch (e) { } }
     if (this.p2pHost && this.state === 'play') this.guard('p2p host', () => this.p2pHost.tick());
   };
   // chat: a guest's goes to the host; the host's (not commands) to the guests
@@ -505,6 +623,15 @@ class LocalGuest {
     if (this.p2pGuest) { const G = this.p2pGuest; G.leave(); this.p2pGuest = null; this.worldMeta = null; this.startTitle(); return; }
     if (this.p2pHost) this.p2pHost.close();
     return q.call(this);
+  };
+  // the other players' names over their heads, as on a server (vanilla's name tags: a fixed size, faint through walls,
+  // dimmed while sneaking - net.js drawNames). A local room drew none: a friend behind a hill or a wall was nowhere to
+  // be found ("玩家进入不会显示模型看不到名字", "房主看不到房间成员名字和实体", feedback 11-01 / 11-02)
+  const den = Game.prototype.drawEntities;
+  Game.prototype.drawEntities = function (a, env) {
+    const r = den.call(this, a, env);
+    if ((this.p2pHost || this.p2pGuest) && !this.net && !this.ui.hideHud && this.state === 'play') try { NetClient.prototype.drawNames.call({ g: this }, a); } catch (err) { this.reportError('name tags', err, true); }
+    return r;
   };
   // a guest's own tick (the world is the host's): in game.js tick, where the server branch is
   // saving a guest's world does nothing here (the host keeps it)

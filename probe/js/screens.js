@@ -95,14 +95,15 @@ class TitleScreen extends MenuScreen {
     const u = this.game.ui, cx = u.w / 2, l = Math.floor(u.h / 4 + 48), g = this.game;
     this.widgets = [
       { x: cx - 100, y: l, w: 200, h: 20, label: '单人游戏', onClick: () => singleGate(g, () => g.ui.open(new WorldListScreen(g)), this) },
-      { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', onClick: () => g.ui.open(new MultiplayerScreen(g, this)), tip: ['加入公开房间、用邀请码加入朋友的房间，或者自己开一个（4–10 人）', '本地版：多人界面里有「直接连接（局域网）」入口', '房间功能需要登录（识别码），本地登录会被服务端来源校验拒绝'] },
+      { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', onClick: () => g.ui.open(new MultiplayerScreen(g, this)), tip: ['加入公开房间、用邀请码加入朋友的房间，或者自己开一个（4–10 人）'] },
       { x: cx - 100, y: l + 48, w: 98, h: 20, label: '皮肤和装饰', gold: true, tip: ['换皮肤（也可以用正版玩家的皮肤）、穿上原创披风、帽子和宠物'], onClick: () => g.ui.open(new WardrobeScreen(g, this)) },
       { x: cx + 2, y: l + 48, w: 98, h: 20, label: '反馈问题', tip: ['遇到 bug、卡顿，或者有建议，发给我们'], onClick: () => g.ui.open(new FeedbackScreen(g, this, null)) },
       { x: cx - 124, y: l + 84, w: 20, h: 20, icon: 'icon_language', tip: ['游戏说明'], onClick: () => g.ui.open(new HelpScreen(g, this)) },
       { x: cx - 100, y: l + 84, w: 98, h: 20, label: '选项…', onClick: () => g.ui.open(new OptionsScreen(g, this)) },
       { x: cx + 2, y: l + 84, w: 98, h: 20, label: '退出游戏', onClick: () => quitGame(g) },
-      { x: cx + 104, y: l + 84, w: 20, h: 20, icon: 'icon_accessibility', tip: ['全屏'], onClick: () => toggleFullscreen() },
-    ];
+      // (no 全屏 where the page can't go full screen: iPhones - see toggleFullscreen)
+      fsSupported() ? { x: cx + 104, y: l + 84, w: 20, h: 20, icon: 'icon_accessibility', tip: ['全屏'], onClick: () => toggleFullscreen() } : null,
+    ].filter(Boolean);
     // the account (top left) and, until everything is unlocked, the way to unlock it (top right)
     if (Account.loggedIn) this.widgets.push({ x: 4, y: 4, w: Math.min(120, Font.width(Account.name) + 30), h: 18, label: fitText(Account.name, 110), tip: ['账号：游戏名、识别码、退出登录'], onClick: () => g.ui.open(new AccountScreen(g, this)) });
     else this.widgets.push({ x: 4, y: 4, w: 60, h: 18, gold: true, label: '登录', tip: ['登录后可以联机、云存档、换皮肤和披风'], onClick: () => g.ui.open(new LoginScreen(g, () => g.ui.open(new TitleScreen(g)))) });
@@ -141,7 +142,9 @@ class TitleScreen extends MenuScreen {
 class WorldListScreen extends MenuScreen {
   constructor(game) {
     super(game, '选择世界'); this.titleY = 8; this.worlds = null; this.sel = -1; this.scroll = 0; this.filter = ''; this.icons = {};
-    DB.listWorlds().then(w => { this.worlds = w; this.layout(); });
+    // (storage that fails - blocked, full, a broken database: said, instead of 加载世界列表中 for ever)
+    DB.listWorlds().then(w => { this.worlds = w; this.layout(); })
+      .catch((e) => { console.error(e); this.worlds = []; this.loadErr = '读取存档失败: ' + String(e && e.message || e); this.layout(); });
   }
   shown() { return (this.worlds || []).filter(w => !this.filter || w.name.toLowerCase().includes(this.filter.toLowerCase())); }
   layout() {
@@ -186,6 +189,7 @@ class WorldListScreen extends MenuScreen {
     if (!ui.input.value && document.activeElement !== ui.input) Font.draw(c, '搜索世界', this.search.x + 4, this.search.y + 6, '#707070');
     if (DB.backend === 'memory') Font.center(c, '注意：当前浏览器禁止本地存储，存档在关闭页面后会丢失', cx, bottom + 2, '#FF5555');
     if (!this.worlds) { Font.center(c, '加载世界列表中', cx, top + 20, '#FFFFFF'); return; }
+    if (this.loadErr) Font.center(c, fitText(this.loadErr, ui.w - 8), cx, top + 20, '#FF5555');
     const list = this.shown(), rowH = 36, x0 = Math.floor(cx - this.rowW / 2) + 2;
     const vis = Math.floor((bottom - top - 4) / rowH);
     this.scroll = clamp(this.scroll, 0, Math.max(0, list.length - vis));
@@ -332,10 +336,19 @@ class CreateWorldScreen extends MenuScreen {
   }
   back() { this.game.ui.hideInput(); this.game.ui.open(this.parent); }
   create() {
-    this.game.ui.hideInput();
+    const g = this.game;
+    g.ui.hideInput();
     const hc = this.mode === 'hardcore';
-    this.game.createWorld(this.name.trim() || '新的世界', this.seed.trim(), hc ? 'survival' : this.mode, this.flat,
-      { hardcore: hc, difficulty: hc ? 3 : this.difficulty, cheats: !hc && this.cheats, structures: this.structures, bonus: this.bonus });
+    this.error = null;
+    // (a world that could not be made - storage refused, the generator threw: this screen again with why, instead of
+    // nothing happening or the loading screen for ever)
+    g.createWorld(this.name.trim() || '新的世界', this.seed.trim(), hc ? 'survival' : this.mode, this.flat,
+      { hardcore: hc, difficulty: hc ? 3 : this.difficulty, cheats: !hc && this.cheats, structures: this.structures, bonus: this.bonus })
+      .catch((e) => {
+        console.error(e);
+        this.error = '创建世界失败: ' + String(e && e.message || e);
+        if (g.state !== 'play' && g.state !== 'loading') g.ui.open(this);
+      });
   }
   drawExtra(ui) {
     const c = ui.ctx, t0 = this.tabs[0], t2 = this.tabs[2];
@@ -350,6 +363,7 @@ class CreateWorldScreen extends MenuScreen {
       if (sel) { const lw = Math.min(Font.width(t.label), t.w - 4); c.fillStyle = '#FFFFFF'; c.fillRect(Math.floor(t.x + (t.w - lw) / 2), t.y + t.h - 2, lw, 1); }
     });
     ui.tile(ui.sepName('footer'), 0, ui.h - 35, ui.w, 2);
+    if (this.error) Font.center(c, fitText(this.error, ui.w - 8), ui.w / 2, ui.h - 46, '#FF5555');
     if (this.field) {
       Font.draw(c, this.fieldLabel[0], this.field.x, this.fieldLabel[1], '#FFFFFF');
       ui.nine('text_field_hl', this.field.x, this.field.y, this.field.w, this.field.h, 1);
@@ -385,12 +399,21 @@ class OptionsScreen extends MenuScreen {
       sub(6, '资源包…', null),
       sub(7, '辅助功能设置…', () => new OptionsListScreen(g, this, '辅助功能设置', 'access')),
       sub(8, '遥测数据…', () => new TelemetryScreen(g, this)),
-      sub(9, '制作人员名单与致谢…', () => new HelpScreen(g, this)),
+      sub(9, '制作人员名单与致谢…', () => creditsRoll(g, this)),
       { x: cx - 100, y: u.h - 27, w: 200, h: 20, label: '完成', onClick: () => this.done() },
     ];
   }
   done() { this.game.saveSettings(); this.game.ui.open(this.parent); }
   onEsc() { this.done(); }
+}
+// 选项 → 制作人员名单与致谢: the credits roll (dims.js CreditsScreen) - the button opened 游戏说明 (players' feedback
+// 11-01 to 11-03, 4+). As vanilla's from the options: without the End poem; and a click or a tap goes back (a phone has
+// no Esc, and the whole roll takes minutes)
+function creditsRoll(g, parent) {
+  const sc = new CreditsScreen(g, () => g.ui.open(parent)), L = sc.lines, i = L.findIndex((l) => l.t === '============');
+  if (i > 9) sc.lines = [...L.slice(0, 9), ...L.slice(i - 1)]; // (the blank lines and the logo, then the credits)
+  sc.pauses = g.state === 'play'; sc.onEsc = () => sc.finish(); sc.mouseDown = () => sc.finish();
+  return sc;
 }
 
 // vanilla OptionsSubScreen: header title, OptionsList (rows of two 150-wide buttons, 25 tall) on the list background, 完成
@@ -411,7 +434,8 @@ class OptionsListScreen extends MenuScreen {
     ];
     // changing one of the options a preset sets makes the preset "custom"
     const own = (fn) => (v) => { s.preset = 'custom'; fn(v); };
-    const fpsLabel = () => '最大帧率：' + (s.maxFps ? s.maxFps + ' fps' : '无限制');
+    // (maxFps 0 is 60 on a 90/120 Hz phone or tablet, -1 the display's own rate there - perf.js FramePacer.playLimit)
+    const fpsLabel = () => '最大帧率：' + (s.maxFps > 0 ? s.maxFps + ' fps' : s.maxFps !== -1 && this.game.pacer && this.game.pacer.auto60 ? '自动（60 fps）' : '无限制');
     return [
       bt(() => '画质预设：' + (PRESET_NAMES[s.preset] || '自定义') + (s.preset === 'auto' && s.autoPreset ? '（' + PRESET_NAMES[s.autoPreset] + '）' : ''), () => {
         const order = ['auto', 'low', 'medium', 'high', 'ultra'];
@@ -423,13 +447,13 @@ class OptionsListScreen extends MenuScreen {
       bt(() => '渲染分辨率：' + Math.round(s.resScale * 100) + '%', own(() => { s.resScale = s.resScale >= 1 ? 0.5 : s.resScale + 0.25; })),
       sl(() => '渲染距离：' + s.renderDist + '个区块', (s.renderDist - 2) / 14, own(v => s.renderDist = Math.round(2 + v * 14)), true),
       // vanilla: 10 - 260 in steps of 10, the top end is "unlimited"
-      sl(fpsLabel, s.maxFps ? (s.maxFps - 10) / 250 : 1, v => { const f = Math.round(v * 25) * 10 + 10; s.maxFps = f >= 260 ? 0 : f; }),
+      sl(fpsLabel, s.maxFps > 0 ? (s.maxFps - 10) / 250 : 1, v => { const f = Math.round(v * 25) * 10 + 10; s.maxFps = f >= 260 ? (s.maxFps === -1 ? -1 : 0) : f; }),
       bt(() => '垂直同步：' + onoff(s.vsync !== false), () => s.vsync = s.vsync === false, { tip: ['开：帧与显示器刷新同步，不撕裂', '关：帧率可超过刷新率（浏览器需带 --disable-gpu-vsync 启动才能显示出来）'] }),
       bt(() => '动态分辨率：' + onoff(s.dynRes), own(() => s.dynRes = !s.dynRes), { tip: ['显卡跟不上时自动降低渲染分辨率（最低 50%），恢复后再调回'] }),
       bt(() => '云：' + (s.clouds ? '高品质' : '关'), own(() => s.clouds = !s.clouds)),
       sl(() => '亮度：' + (s.gamma < 0.01 ? '昏暗' : s.gamma > 0.99 ? '明亮' : Math.round(s.gamma * 100) + '%'), s.gamma, v => s.gamma = v),
       bt(() => '界面尺寸：' + (s.guiScale || '自动'), () => { s.guiScale = (s.guiScale + 1) % 5; setTimeout(() => g.ui.resize(), 0); }),
-      bt(() => '全屏：' + onoff(!!document.fullscreenElement), () => toggleFullscreen()),
+      fsSupported() ? bt(() => '全屏：' + onoff(!!fsElement()), () => toggleFullscreen()) : bt('全屏：不支持', () => { }, { enabled: false, tip: ['这个浏览器不支持网页全屏'] }),
       bt(() => '视角摇晃：' + onoff(s.bobbing), () => s.bobbing = !s.bobbing),
       bt('平滑光照：开', () => { }, { enabled: false }),
       bt('复制性能报告', () => copyText(PerfMon.report(g, null, 0)).then(ok => g.ui.message(ok ? '性能报告已复制到剪贴板' : '无法写入剪贴板，报告已输出到浏览器控制台', '#FFFF55')),
@@ -598,8 +622,15 @@ class ChatScreen extends MenuScreen {
   // vanilla's ChatScreen.mouseScrolled; there was no scrolling at all (players' feedback 2026-10-31)
   wheel(ui, dy) { ui.chatOff = clamp((ui.chatOff || 0) - Math.sign(dy) * (ui.wheelShift ? 1 : 7), 0, Math.max(0, ui.chat.length - 20)); ui.wheelShift = false; }
   layout() {
-    const u = this.game.ui;
-    u.showInput(2, u.h - 14, u.w - 4, 12, this.prefill, (v) => { u.close(); if (v.trim()) { this.hist.push(v); runCommand(this.game, v.trim()); } }, { onEsc: () => u.close(), max: 256 });
+    const u = this.game.ui, send = (v) => { u.close(); if (v.trim()) { this.hist.push(v); runCommand(this.game, v.trim()); } };
+    // (on a touch screen a 发送 button at the end of the line, and the keyboard's return key reads 发送: iOS players
+    // found no way to send - feedback 2026-11-01 12:58)
+    const tb = navigator.maxTouchPoints > 0 || (typeof touchOn === 'function' && touchOn(this.game)), bw = tb ? 34 : 0;
+    this.widgets = tb ? [{ x: u.w - 2 - bw, y: u.h - 15, w: bw, h: 14, label: '发送', onClick: () => send(u.input.value) }] : [];
+    // (laid out again - the window resized, as Android's on-screen keyboard coming up does - the text typed so far
+    // stays: it went back to the prefill, "安卓打字时聊天框文字被清空", feedback 2026-11-01 09:15)
+    const v = this.shownOnce && u.input.style.display === 'block' ? u.input.value : this.prefill; this.shownOnce = true;
+    u.showInput(2, u.h - 14, u.w - 4 - (bw ? bw + 2 : 0), 12, v, send, { onEsc: () => u.close(), max: 256, enter: 'send' });
     const el = u.input, prev = el.onkeydown;
     el.onkeydown = (e) => {
       if (e.key === 'ArrowUp' && this.hi > 0) { this.hi--; el.value = this.hist[this.hi]; e.preventDefault(); }
@@ -614,8 +645,16 @@ class ChatScreen extends MenuScreen {
     else if (parts[0] === '/summon' && parts.length === 2) { const m = Object.keys(MOB_TYPES).filter(k => k.startsWith(parts[1])); if (m.length) el.value = '/summon ' + m[0]; }
     else if (parts.length === 1) { const m = ['/gamemode', '/time', '/weather', '/give', '/tp', '/summon', '/kill', '/locate', '/tpdim', '/spawnpoint', '/seed', '/clear', '/xp', '/help'].filter(k => k.startsWith(v)); if (m.length) el.value = m[0] + ' '; }
   }
-  draw(ui) { const c = ui.ctx; c.fillStyle = 'rgba(0,0,0,0.5)'; c.fillRect(2, ui.h - 14, ui.w - 4, 12); }
+  draw(ui) { const c = ui.ctx, b = this.widgets[0]; c.fillStyle = 'rgba(0,0,0,0.5)'; c.fillRect(2, ui.h - 14, ui.w - 4 - (b ? b.w + 2 : 0), 12); if (b) ui.button(b); }
 }
+
+// leaving a world for the title (single player, a room on the server, a local room) takes its chat along, like vanilla's
+// disconnect (the lines typed stay for ↑): a room's messages were still there in the single-player world entered next
+// (players' feedback 2026-11-01 10:09)
+(() => {
+  const st = Game.prototype.startTitle;
+  Game.prototype.startTitle = function (...a) { if (this.ui) { this.ui.chat.length = 0; this.ui.chatOff = 0; } return st.apply(this, a); };
+})();
 
 // a command as typed, made what a server accepts: runs of spaces outside quotes one space, none at the ends (a taken
 // suggestion leaves a space after it; the server's parser refuses "/gamemode creative " and double spaces - the
@@ -763,7 +802,7 @@ Game.prototype.setMode = function (m, quiet) {
 // container closes it (toy.closeBrowser); elsewhere the page tries, and if it is still here a moment later, says how
 async function quitGame(g) {
   const sc = g.ui.screen;
-  if (document.fullscreenElement) document.exitFullscreen().catch(() => { });
+  if (fsElement()) fsExit();
   try {
     if (typeof Toy !== 'undefined' && await Promise.race([Toy.inToy(), new Promise((r) => setTimeout(() => r(false), 1500))]))
       await Promise.race([Toy.closeBrowser(), new Promise((r) => setTimeout(r, 1500))]);
@@ -772,8 +811,24 @@ async function quitGame(g) {
   setTimeout(() => { if (!document.hidden && g.ui.screen === sc && sc) sc.quitTip = performance.now(); }, 600);
 }
 
+// the page full screen and back. iPhone WebKit has no element full screen at all (only a <video> can), iPads and older
+// Safari only the webkit-prefixed one: requestFullscreen called where it is missing threw - telemetry 11-02/03: 878
+// devices, the iOS Bilibili app and Safari. Where there is none (or the frame may not: fullscreenEnabled false) the
+// 全屏 buttons say so and the key tells the player instead of doing nothing
+const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+function fsSupported() {
+  const de = document.documentElement;
+  return !!(de.requestFullscreen || de.webkitRequestFullscreen) && (document.fullscreenEnabled ?? document.webkitFullscreenEnabled) !== false;
+}
+function fsExit() {
+  const ex = document.exitFullscreen || document.webkitExitFullscreen;
+  try { const r = ex && ex.call(document); if (r && r.catch) r.catch(() => { }); } catch (e) { }
+}
 function toggleFullscreen() {
-  if (!document.fullscreenElement) {
-    document.documentElement.requestFullscreen().then(() => { if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Escape']).catch(() => { }); }).catch(() => { });
-  } else document.exitFullscreen();
+  if (fsElement()) { fsExit(); return; }
+  const de = document.documentElement, req = de.requestFullscreen || de.webkitRequestFullscreen;
+  const no = () => { if (typeof game !== 'undefined' && game.ui) game.ui.message('这个浏览器不支持网页全屏', '#FFFF55'); };
+  if (!req || !fsSupported()) { no(); return; }
+  const lock = () => { if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Escape']).catch(() => { }); };
+  try { const r = req.call(de); if (r && r.then) r.then(lock, () => { }); } catch (e) { no(); }
 }

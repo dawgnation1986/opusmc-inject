@@ -352,7 +352,7 @@ class AccountScreen extends FormScreen {
       { x: cx + 2, y: 112, w: 148, h: 20, label: '皮肤和装饰…', gold: true, onClick: () => g.ui.open(new WardrobeScreen(g, this)) },
       { x: cx - 150, y: 136, w: 148, h: 20, label: '退出登录', onClick: async () => { await Account.logout(); this.say('已退出登录'); this.layout(); } },
       { x: cx + 2, y: 136, w: 148, h: 20, label: confirmDel ? '再点一次：永久删除' : '删除账号', color: confirmDel ? '#FF6060' : undefined, tip: ['删除账号、云存档、解锁记录，不能恢复', '这台设备上的存档不受影响'], onClick: () => this.del() },
-      ...(!Companion.shown ? [] : [{ x: cx - 150, y: 184, w: 300, h: 20, label: 'AI 伙伴…', tip: ['会聊天、懂你在游戏里做什么的 AI 小伙伴（用你自己的 DeepSeek 密钥）'], onClick: () => g.ui.open(new CompanionScreen(g, this)) }]),
+      ...(!Companion.shown ? [] : [{ x: cx - 150, y: 184, w: 300, h: 20, label: 'AI 伙伴…', tip: ['会聊天、懂你在游戏里做什么的 AI 小伙伴（全服免费，每天有次数）'], onClick: () => g.ui.open(new CompanionScreen(g, this)) }]),
       { x: cx - 150, y: 160, w: 148, h: 20, label: '诊断', tip: ['显示 B站 返回的原始数据（排查问题用）'], onClick: () => g.ui.open(new ToyDiagScreen(g, this)) },
       ...(Account.data.super ? [{ x: cx + 2, y: 160, w: 148, h: 20, gold: true, label: '管理员…', tip: ['临时昵称、全服公告、昵称颜色、管理员披风'], onClick: () => g.ui.open(new AdminScreen(g, this)) }] : []),
       { x: cx - 100, y: u.h - 30, w: 200, h: 20, label: '完成', onClick: () => this.back() },

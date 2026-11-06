@@ -80,8 +80,9 @@ class Game {
       while (acc >= 50 && n < 5) { try { this.tick(); } catch (e) { this.reportError('tick', e); } acc -= 50; n++; }
       if (n === 5) acc = 0;
       // while a pausing screen is open nothing ticks: freeze the interpolation too, or the view
-      // keeps sliding between the last two tick positions
-      const paused = this.state === 'play' && this.ui.screen && this.ui.screen.pauses;
+      // keeps sliding between the last two tick positions. (In a room - a server's or a local one - the world goes on
+      // ticking under such a screen, net.js / p2p.js: the interpolation goes on with it)
+      const paused = this.state === 'play' && this.ui.screen && this.ui.screen.pauses && !(this.net || this.p2pHost || this.p2pGuest);
       if (paused) { if (this.pauseA == null) this.pauseA = acc / 50; } else this.pauseA = null;
       const r0 = performance.now();
       PerfMon.gpuBegin(this.renderer.gl);
@@ -115,9 +116,19 @@ class Game {
     this.renderer.renderDist = s.renderDist; this.renderer.gamma = s.gamma; this.renderer.showClouds = s.clouds;
     Sound.setVolume(s.volume);
     const rs = s.resScale * DynRes.scale;
-    if (this.renderer.resScale !== rs) { this.renderer.resScale = rs; this.resize(); }
+    // (only the 3D canvas changes size: the interface's canvas was laid out again too, every dynamic-resolution step -
+    // the HUD blinked)
+    if (this.renderer.resScale !== rs) { this.renderer.resScale = rs; this.sizeCanvas(); }
   }
-  resize() { this.renderer.resize(); if (this.ui) this.ui.resize(); }
+  resize() { this.sizeCanvas(); if (this.ui) this.ui.resize(); }
+  // the 3D canvas to the window's size and the resolution scale (Renderer.resize). A new size clears the canvas: canvasGen
+  // counts them, for the frames that draw no world and leave its last picture up (render: frozen, halfWorld) - a canvas
+  // resized and back between two frames is cleared too, its size alone doesn't tell
+  sizeCanvas() {
+    const c = this.renderer.canvas, w = c.width, h = c.height;
+    this.renderer.resize();
+    if (c.width !== w || c.height !== h) this.canvasGen = (this.canvasGen || 0) + 1;
+  }
 
   // ---- worlds -----------------------------------------------------------------
   setupWorld(seed, gen2) {
@@ -139,7 +150,7 @@ class Game {
     this.renderer.clearSections();
   }
   startTitle() {
-    this.state = 'title';
+    this.state = 'title'; this.saveQ = null; // (an autosave spread over frames - autosaveStart - held the world it left)
     if (this.ui) this.ui.pinned = null; this.pendingPin = null;
     // the title background is a vanilla-terrain world: the panorama's seed and camera, so the panorama is on
     // screen at once and fades into the live world when it is built (panorama.js)
@@ -202,7 +213,21 @@ class Game {
     return this.loadWorld(id);
   }
   async loadWorld(id) {
-    const meta = await DB.getWorld(id);
+    // (a read that fails - the browser's storage refused or gone - was an unhandled rejection: the click did nothing and
+    // said nothing. The reason is shown, with another try)
+    let meta;
+    try { meta = await DB.getWorld(id); }
+    catch (e) {
+      this.reportError('读取世界', e, true);
+      // (取消 goes back to the screen the world was opened from - through retries that failed again too - but never to a
+      // loading screen: cloudsave.js shows one while it downloads a newer copy, and it would have stayed up for good)
+      const sc = this.ui.screen, back = sc && sc.loadBack !== undefined ? sc.loadBack : sc instanceof LoadingScreen ? null : sc;
+      const cs = new ConfirmScreen(this, '无法读取这个世界', String(e && e.message || e).slice(0, 60), '重试', (yes) => {
+        if (yes) this.loadWorld(id); else this.ui.open(back || (this.state === 'title' ? new TitleScreen(this) : null));
+      });
+      cs.loadBack = back; this.ui.open(cs);
+      return;
+    }
     if (!meta) return;
     this.ui.open(new LoadingScreen(this, '正在载入世界…'));
     this.worldMeta = meta;
@@ -268,9 +293,12 @@ class Game {
     cv.width = cv.height = 64;
     const c = cv.getContext('2d'); c.imageSmoothingQuality = 'high';
     c.drawImage(src, (src.width - s) / 2, (src.height - s) / 2, s, s, 0, 0, 64, 64);
-    try { this.worldMeta.icon = cv.toDataURL('image/png'); DB.putWorld(this.worldMeta); } catch (e) { }
+    // (the write's own failure is not worth a word - the icon is taken again next time - but it was an unhandled rejection)
+    try { this.worldMeta.icon = cv.toDataURL('image/png'); Promise.resolve(DB.putWorld(this.worldMeta)).catch(() => { }); } catch (e) { }
   }
   async saveWorld(quiet) {
+    // (an autosave being spread over frames is overtaken: this save encodes and writes all of it - autosaveStart)
+    this.saveQ = null;
     if (!this.worldMeta || this.state !== 'play') return;
     const p = this.player;
     const lists = this.collectDimSave();
@@ -565,9 +593,9 @@ class Game {
   frame(dt, now) {
     if (!this.world) return;
     if (this.state === 'title') {
-      this.titleYaw = (this.titleYaw || 0) + dt * 0.00004;
+      // (under a blurred menu the scene is frozen - render: it turns on, and the panorama fades, from where it stopped)
+      if (!this.titleFrozen) { this.titleYaw = (this.titleYaw || 0) + dt * 0.00004; this.updatePanorama(dt); }
       this.updateChunks(this.chunkBudget());
-      this.updatePanorama(dt);
       // once the spawn area exists, float the camera a little above its highest point
       if (this.titleGround && this.world.isLoaded(Math.floor(this.titleCam[0]), Math.floor(this.titleCam[2]))) {
         let top = 0;
@@ -613,8 +641,39 @@ class Game {
     if (this.state !== 'play') return;
     this.updateChunks(this.chunkBudget());
     if (!this.net) this.chunkWatchdog(Math.floor(this.player.pos[0]) >> 4, Math.floor(this.player.pos[2]) >> 4, now);
-    if (now - this.lastSave > 45000) { this.lastSave = now; this.saveWorld(true); }
+    if (this.saveQ) this.autosaveStep();
+    else if (now - this.lastSave > 45000) { this.lastSave = now; this.autosaveStart(); }
     // mouse look handled in input; continuous mining handled in tick
+  }
+  // The 45 s autosave: the modified chunks of the dimension the player is in are encoded a few a frame first - each as
+  // collectDimSave would (into the world's saved records and the dimension's list to write, no longer modified) - and
+  // then saveWorld writes them with the rest. It encodes again any changed meanwhile (modified again), so what it writes
+  // is the world at that moment; until then nothing was written, the last save stands. All at once it took 19 - 20 ms
+  // on a desktop for 60 chunks (0.33 ms each - random ticks alone mark the chunks around the player), a hitch every 45 s
+  // several times that on a phone; now at most ~1.8 ms a frame over ~12 frames, then 0.2 ms. Leaving, hiding the page,
+  // changing dimension save at once as before (saveWorld drops the queue), the chunks already encoded with the rest
+  autosaveStart() {
+    const w = this.world, q = [];
+    if (this.worldMeta && !this.net && !this.p2pGuest && w && w.savedChunks && this.dirtySaved) for (const ch of w.chunks.values()) if (ch.modified) q.push(ch);
+    if (q.length) this.saveQ = { w, dirty: this.dirtySaved, q, i: 0 }; else this.saveWorld(true);
+  }
+  autosaveStep() {
+    const S = this.saveQ, w = this.world;
+    // (another world or dimension meanwhile: what was encoded waits in that dimension's list for the next save, the
+    // switch encoded the rest - dims.js)
+    if (w !== S.w || this.dirtySaved !== S.dirty || this.state !== 'play') { this.saveQ = null; return; }
+    const t0 = performance.now();
+    do {
+      const ch = S.q[S.i++], k = ckey(ch.cx, ch.cz);
+      if (!ch.modified || w.chunks.get(k) !== ch) continue; // (unloaded since: encoded then)
+      const rec = encodeChunk(ch);
+      w.savedChunks.set(k, rec); if (w.savedIndex) w.savedIndex.add(k); S.dirty.add(k); ch.modified = false;
+    } while (S.i < S.q.length && performance.now() - t0 < 1.5);
+    if (S.i < S.q.length) return;
+    // (one changed again since it was encoded is encoded and listed again by collectDimSave: not from the list too, or
+    // it was written twice)
+    for (const ch of S.q) if (ch.modified && w.chunks.get(ckey(ch.cx, ch.cz)) === ch) S.dirty.delete(ckey(ch.cx, ch.cz));
+    this.saveQ = null; this.saveWorld(true);
   }
 
   // vanilla's FOV modifier: flying x1.1, movement speed (sprinting 1.3x -> (1.3 + 1) / 2), the bow drawn; it moves
@@ -639,6 +698,10 @@ class Game {
     this.world.time++;
     this.worldTime += this.net && this.timeRate != null ? this.timeRate : 1; // a server's clock may be stopped
     const p = this.player;
+    // an item this game doesn't have in the inventory (put there from an old world's chest, a room's, a bad drop): every
+    // use of the hand threw with it each tick and the hand wasn't drawn - "interaction: reading 'tool'", "render: reading
+    // 'block'" (telemetry 11-02/03). It goes (entity.js knownStack)
+    for (let i = 0, s = p.inv.slots; i < s.length; i++) if (s[i] && !ITEMS[s[i].id]) s[i] = knownStack(s[i], this, 'inventory');
     // weather
     if (this.dim !== 'overworld') { /* no weather outside the overworld */ }
     else if (!this.net && !this.p2pGuest && --this.weatherTimer < 0) { this.rainTarget = this.rainTarget ? 0 : 1; this.weatherTimer = this.rainTarget ? 6000 + Math.random() * 12000 : 12000 + Math.random() * 36000; }
@@ -716,14 +779,22 @@ class Game {
   chunkWatchdog(pcx, pcz, now) {
     const w = this.world;
     if (!w || w.remote || now - (this.wdT || 0) < 1000) return;
+    // (frames back after a hidden tab / an app in the background: nothing could arrive meanwhile - start the wait
+    // again instead of reporting, and throwing away, the work still on its way)
+    const gap = now - (this.wdT || 0) > 3000;
     this.wdT = now;
-    const missing = [];
-    for (let dx = -3; dx <= 3; dx++) for (let dz = -3; dz <= 3; dz++) if (!w.chunks.has(ckey(pcx + dx, pcz + dz))) missing.push(ckey(pcx + dx, pcz + dz));
+    const missing = [], R = this.state === 'title' ? 6 : this.settings.renderDist, R2 = (R + 1.5) * (R + 1.5);
+    // (only chunks that are ever made: generation stops at R + 1.5 - at a view distance of 2 the 7 x 7's corners never
+    // come, and they were reported, and asked for again, every 8 s for good)
+    for (let dx = -3; dx <= 3; dx++) for (let dz = -3; dz <= 3; dz++) if (dx * dx + dz * dz <= R2 && !w.chunks.has(ckey(pcx + dx, pcz + dz))) missing.push(ckey(pcx + dx, pcz + dz));
     // (the same chunks still missing, however many others arrived meanwhile: the nearest come first, so these
     // are not just slow)
     const sig = pcx + ',' + pcz + ':' + missing.join(',');
-    if (!missing.length || sig !== this.wdSig) { this.wdSig = sig; this.wdSince = now; return; }
+    if (!missing.length || sig !== this.wdSig || gap) { this.wdSig = sig; this.wdSince = now; return; }
     if (now - this.wdSince < 8000) return;
+    // (generation still moving - terrain2.js genProgressT, a job finished in the last 4 s - is not a stall: these wait
+    // behind work still being done, on a slow phone for more than 8 s, and were reported, their jobs thrown away)
+    if (now - (this.genProgressT || 0) < 4000) { this.wdSince = now; return; }
     this.wdSince = now;
     this.reportError('区块加载停住了，重新请求 ' + missing.length + ' 个区块', new Error('chunk stall'), true);
     const cw = this.chunkWorker, gone = [];
@@ -761,9 +832,9 @@ class Game {
       const x = Math.floor(p.pos[0] + (Math.random() - 0.5) * 24), y = Math.floor(p.pos[1] + (Math.random() - 0.5) * 16), z = Math.floor(p.pos[2] + (Math.random() - 0.5) * 24);
       const id = w.getBlock(x, y, z);
       if (id === 21) {
-        const m = w.getMeta(x, y, z);
+        const m = w.getMeta(x, y, z), D = DIRS[m]; // (a meta past the 6 sides - an imported or a room's torch: as a standing one)
         let fx = x + 0.5, fy = y + 0.7, fz = z + 0.5;
-        if (m) { fx += DIRS[m][0] * 0.27 * -1 + DIRS[m][0] * 0.38 * 0; fx = x + 0.5 + DIRS[m][0] * 0.38 - DIRS[m][0] * 0.32 * 0.6 * 1; fz = z + 0.5 + DIRS[m][2] * 0.38 - DIRS[m][2] * 0.32 * 0.6; fy = y + 0.92; }
+        if (m && D) { fx = x + 0.5 + D[0] * 0.38 - D[0] * 0.32 * 0.6; fz = z + 0.5 + D[2] * 0.38 - D[2] * 0.32 * 0.6; fy = y + 0.92; }
         this.particles.spawn('flame', fx, fy, fz, 0, 0.002, 0).life = 12;
         this.particles.spawn('smoke', fx, fy + 0.05, fz, 0, 0.01, 0).size = 0.06;
       } else if (id === LAVA && w.getBlock(x, y + 1, z) === 0 && Math.random() < 0.05) {
@@ -935,7 +1006,9 @@ class Game {
     const be = this.blockEntities.get(k);
     if (be && !(BLOCKS[id] && BLOCKS[id].chestLike) && id !== 20 && id !== 117) {
       const drops = be.type === 'brewing' ? [...(be.bottles || []), be.ingredient, be.fuel] : be.items ? be.items : be.slots ? be.slots : [be.input, be.fuel, be.output]; // (items: a campfire's food)
-      for (const s of drops) if (s) this.dropItem(x + 0.5, y + 0.5, z + 0.5, { ...s });
+      // (stacks only: a command block's output is its last message - the text was spread into a "stack" with no item
+      // and dropped each time one with an output broke or changed mode, then threw every frame: telemetry 11-02/03)
+      for (const s of drops) if (s && typeof s === 'object') this.dropItem(x + 0.5, y + 0.5, z + 0.5, { ...s });
       this.blockEntities.delete(k);
       if (this.ui.screen && (this.ui.screen.be === be || (this.ui.screen.owns && this.ui.screen.owns(be)))) this.ui.close();
     }
@@ -1020,7 +1093,7 @@ class Game {
     const solidBelow = SOLIDCUBE[below] || (BLOCKS[below].slab && (w.getMeta(x, y - 1, z) & 3) !== 0) || BLOCKS[below].stairs && (w.getMeta(x, y - 1, z) & 4) === 0 || below === 63;
     const b = BLOCKS[id];
     switch (b.key) {
-      case 'torch': if (!meta) return solidBelow; return !!SOLIDCUBE[w.getBlock(x + DIRS[meta][0], y, z + DIRS[meta][2])];
+      case 'torch': if (!meta || !DIRS[meta]) return solidBelow; return !!SOLIDCUBE[w.getBlock(x + DIRS[meta][0], y, z + DIRS[meta][2])];
       case 'ladder': return !!SOLIDCUBE[w.getBlock(x + DIRS[meta][0], y, z + DIRS[meta][2])];
       case 'wheat': return below === 63;
       case 'sugar_cane': return below === 38 || below === 2 || below === 3 || below === 9 || below === 97;
@@ -1046,6 +1119,21 @@ class Game {
     if (!water) { this.onFizz(x, y - 1, z); return; }
     if (b && !REPLACEABLE[id] && this.mode !== 'creative') this.dropBlockLoot(x, y, z, id, this.world.getMeta(x, y, z), null);
     else if (b && b.drops && id !== 39 && id !== 40) this.dropBlockLoot(x, y, z, id, 0, null);
+  }
+  // the blocks onRandomTick does something for, 1 by id (World.randomTick picks only these, and skips sections holding none):
+  // the cases below; past 1023 every *_leaves, *_sapling and mangrove_propagule (its default case); mobs_animals.js
+  // BLOCK_RANDOM_TICK's keys (its wrapper). A new random tick goes in here too. Made on the first tick, when every script
+  // has added its own. (Of ~2500 calls a tick in a 9 x 9 chunk area all but 23 were stone, deepslate, water... through
+  // two wrappers and the switch for nothing: 0.98 -> 0.25 ms a tick on a desktop, handlers included)
+  randomTickTable() {
+    if (this.rtTable) return this.rtTable;
+    const t = new Uint8Array(MAX_BLOCKS), extra = typeof BLOCK_RANDOM_TICK !== 'undefined' ? BLOCK_RANDOM_TICK : {};
+    for (const id of [2, 15, 34, 35, 37, 38, 47, 50, 63, 64, 65, 66, 67, 126, 171]) t[id] = 1;
+    for (let i = 0; i < MAX_BLOCKS; i++) {
+      const b = BLOCKS[i], k = b && b.key;
+      if (k && (Object.prototype.hasOwnProperty.call(extra, k) || (i >= 1024 && (k.endsWith('_leaves') || k.endsWith('_sapling') || k === 'mangrove_propagule')))) t[i] = 1;
+    }
+    return (this.rtTable = t);
   }
   onRandomTick(x, y, z, id, ch) {
     const w = this.world;
@@ -1350,7 +1438,7 @@ class Game {
   // feedback 2026-11-01/02), up out of blocks if in them
   // the full opaque block at the player's eyes, or 0
   inWallBlock() {
-    const p = this.player, w = this.world; if (!p) return 0;
+    const p = this.player, w = this.world; if (!p || !w) return 0; // (no world while joining a room: the HUD asked - "render: reading 'getBlock'")
     const y = Math.floor(p.pos[1] + p.eye()), r = p.w * 0.4;
     for (const [dx, dz] of [[-r, -r], [r, -r], [-r, r], [r, r]]) {
       const id = w.getBlock(Math.floor(p.pos[0] + dx), y, Math.floor(p.pos[2] + dz));
@@ -1373,7 +1461,8 @@ class Game {
 
   // ---- items & drops ---------------------------------------------------------------------
   dropItem(x, y, z, stack, vel) {
-    if (!stack || stack.count <= 0) return;
+    stack = knownStack(stack, this, 'drop'); // (no item this game has, or none of it: nothing drops - entity.js knownStack)
+    if (!stack) return;
     const e = new ItemEntity(this, x, y, z, { ...stack, dmg: stack.dmg || 0 }, vel); // the whole stack (enchantments, name, potion ...)
     this.entities.push(e);
     return e;
@@ -1496,8 +1585,10 @@ class Game {
     if (b.shape === SH_BOXES || b.shape === SH_MODEL) return b.boxes(m).map(a => a.map(v => v / 16));
     if (b.shape === SH_CROSS || b.shape === SH_CROP) return [[0.15, 0, 0.15, 0.85, b.key === 'wheat' ? 0.25 + (m & 7) / 10 : 0.8, 0.85]];
     if (b.shape === SH_TORCH) {
-      if (!m) return [[0.4, 0, 0.4, 0.6, 0.6, 0.6]];
-      const D = DIRS[m]; const cx = 0.5 + D[0] * 0.35, cz = 0.5 + D[2] * 0.35;
+      // (a meta past the 6 sides - an imported or a room's torch: the standing box; "render: reading '0'", telemetry 11-02/03)
+      const D = DIRS[m];
+      if (!m || !D) return [[0.4, 0, 0.4, 0.6, 0.6, 0.6]];
+      const cx = 0.5 + D[0] * 0.35, cz = 0.5 + D[2] * 0.35;
       return [[cx - 0.15, 0.2, cz - 0.15, cx + 0.15, 0.8, cz + 0.15]];
     }
     if (b.shape === SH_CACTUS) return [[1 / 16, 0, 1 / 16, 15 / 16, 1, 15 / 16]];
@@ -2256,18 +2347,40 @@ class Game {
   }
 
   render(a, now) {
-    const r = this.renderer, gl = r.gl;
+    const r = this.renderer, gl = r.gl, sc = this.ui.screen;
     this.lastA = a;
     // a pausing menu over the blurred world: nothing moves, so the world is drawn once (and again only
-    // when the window or the video settings change) instead of every frame under the CSS blur
-    const frozen = this.state === 'play' && this.ui.screen && this.ui.screen.pauses;
+    // when the window or the video settings change) instead of every frame under the CSS blur. The title scene too, under
+    // a blurred menu (the agreement, the options, onboarding): the user's decision 11-03, 150 - 580 draw calls a frame (by
+    // scene; 0.6 - 0.9 ms of CPU on a desktop, 0.25 now) for a picture nobody sees sharply (its turning and the panorama's
+    // fade wait meanwhile: frame). The screen wants the blur
+    // and the last frame had it (ui.blurOn): the frame a blurred menu closes the world is drawn at once. (Not while the
+    // panorama tool renders its faces: panoCam.) On the title the scene is drawn again while it is still filling in - its
+    // sections' count in the key - so a menu opened at once, the agreement on a first visit, doesn't keep an empty sky.
+    // The picture stays on screen because nothing at all is drawn into the canvas that frame: an untouched WebGL canvas
+    // keeps showing its last frame (preserveDrawingBuffer is off). A new size clears it (canvasGen, sizeCanvas): drawn then
+    const frozen = (this.state === 'play' && sc && sc.pauses) || (this.state === 'title' && sc && sc.blurBg && this.ui.blurOn && !this.panoCam);
     if (frozen) {
-      const key = innerWidth + 'x' + innerHeight + ':' + devicePixelRatio + ':' + JSON.stringify(this.settings);
-      if (this.frozenKey === key && this.frozenFrames >= 2) { this.ui.draw(); return; }
+      const key = innerWidth + 'x' + innerHeight + ':' + devicePixelRatio + ':' + r.resScale + ':' + (this.state === 'title' ? r.sections.size : '') + ':' + JSON.stringify(this.settings);
+      if (this.frozenKey === key && this.frozenFrames >= 2 && this.drawnGen === this.canvasGen) { this.titleFrozen = this.state === 'title'; this.halfWorld = false; this.ui.draw(); return; }
       this.frozenFrames = this.frozenKey === key ? (this.frozenFrames || 0) + 1 : 0;
       this.frozenKey = key;
     } else this.frozenKey = null;
-    r.resize();
+    this.titleFrozen = false;
+    // touch devices (a phone or tablet, or touch controls on) with an inventory-type screen open (it doesn't pause: the
+    // world goes on behind it): the world is drawn every other frame and the screen over it every frame - the user's
+    // decision 11-03, for the battery. A skipped frame is the frozen one above: only the interface is drawn, the world's
+    // last picture stays (drawn again at once when the canvas was resized since). Measured on a desktop at 8 chunks:
+    // 1.3 -> 0.8 ms of CPU and 2.3 -> 1.5 ms of GPU a frame, half the draw calls. (The canvas is sized on a skipped
+    // frame too: a resize asked for between frames - a phone turned, render.js inFrame - waits for a frame, and the
+    // interface, laid out at once, stood over the old picture stretched to the new shape for one frame)
+    this.halfWorld = this.state === 'play' && sc instanceof ContainerScreen && !sc.pauses && ((this.pacer && this.pacer.touch) || touchOn(this));
+    if (this.halfWorld) {
+      this.oddFrame = !this.oddFrame;
+      if (this.oddFrame) this.sizeCanvas();
+      if (this.oddFrame && this.drawnGen === this.canvasGen && !this.wantScreenshot) { this.ui.draw(); return; }
+    } else this.oddFrame = false;
+    this.sizeCanvas(); this.drawnGen = this.canvasGen;
     r.yOff = this.world && this.dim === 'overworld' ? (this.world.minY || 0) : 0;
     gl.viewport(0, 0, r.canvas.width, r.canvas.height);
     if (!this.world || this.state === 'boot') { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); this.ui.draw(); return; }
@@ -2430,13 +2543,47 @@ class Game {
       finally { r.shRec = null; r.shRecOnly = false; }
     }
   }
+  // vanilla Entity.shouldRenderAtSqrDistance and its overrides: how far an entity is drawn, in blocks. vs = 64 x the view
+  // scale (LevelRenderer.allChanged: clamp(view distance / 8, 1, 2.5)); the size is the box's mean edge, (w + h + w) / 3,
+  // a size that is no number counts as 1 (vanilla's NaN)
+  entityViewDist(e, vs) {
+    const s = (e.w + e.h + e.w) / 3;
+    if (e instanceof Mob || e instanceof ItemEntity) return (s === s ? s : 1) * vs;
+    if (e instanceof Arrow && !e.snowball) return (s === s ? s * 10 : 1) * vs; // AbstractArrow: x 10
+    // ThrowableProjectile (snowballs and eggs are arrows here, pearls, potions), AbstractHurtingProjectile (fireballs,
+    // wither skulls), EyeOfEnder, ArmorStand: x 4, without the view scale
+    if (e instanceof Arrow || e instanceof Fireball || e instanceof DragonFireball || e instanceof ThrownPearl || e instanceof EyeOfEnder ||
+      (typeof WitherSkull !== 'undefined' && e instanceof WitherSkull) || (typeof ThrownPotion !== 'undefined' && e instanceof ThrownPotion) ||
+      (typeof ArmorStand !== 'undefined' && e instanceof ArmorStand)) return (s > 0 ? s * 4 : 4) * 64;
+    if (typeof ShulkerBullet !== 'undefined' && e instanceof ShulkerBullet) return 128;
+    if ((typeof FireworkRocket !== 'undefined' && e instanceof FireworkRocket) || (typeof FishingHook !== 'undefined' && e instanceof FishingHook)) return 64;
+    if (typeof LeashKnot !== 'undefined' && e instanceof LeashKnot) return 32;
+    if (typeof ItemFrame !== 'undefined' && e instanceof ItemFrame) return 16 * vs;
+    return (s === s ? s : 1) * vs;
+  }
   drawEntityList(list, a, env, cam) {
-    const r = this.renderer, gl = r.gl;
+    const r = this.renderer, gl = r.gl, vs = 64 * clamp(r.renderDist / 8, 1, 2.5), rd2 = (r.renderDist * 16) ** 2;
+    // inside water, lava or powder snow the frame is cleared to the fog colour, and the entity program's fog goes by level
+    // distance: an entity whose every part is past the fog's end is drawn in exactly that colour - nothing to see, but a
+    // draw call or more each (a sea of fish and squid around a diver: 183 of 400 mobs drawn under water at 8 chunks, 30 now).
+    // Not with the shader pack: its passes go by the depth buffer (light shafts, the haze), what is behind would change
+    const fogged = !r.fxOn && (this.headInWater || this.headInLava || this.headInPowder), fog2 = fogged ? (env.fogFar + 4) ** 2 : Infinity;
     // (each entity on its own: one that fails to draw is skipped, the rest of the picture still comes)
     for (const e of list) try {
       const ip = e.ipos(a);
-      const dx = ip[0] - cam[0], dz = ip[2] - cam[2];
-      if (dx * dx + dz * dz > (r.renderDist * 16) ** 2) continue;
+      const dx = ip[0] - cam[0], dz = ip[2] - cam[2], h2 = dx * dx + dz * dz;
+      if (h2 > rd2) continue;
+      // (vanilla Entity.shouldRenderAtSqrDistance, the user's decision 11-03: a mob shows within 64 x its size x the view
+      // scale - a zombie 67 blocks up to 8 chunks of view distance, 100 at 12 - a dropped item 16 / 24 / 40. Every entity
+      // was drawn out to the view distance: 400 mobs spread to 180 blocks at 12 chunks, all 400 drawn, ~5000 of the
+      // frame's draw calls and 4.0 - 4.5 ms of it on a desktop; now ~200 and 3.0 - 3.3 ms (at 8 chunks 206 - 272 -> 92 -
+      // 129 mobs). Before the frustum and the light, which the ones beyond it paid for every frame too. The ender
+      // dragon and ghasts (vanilla's reach for them is past any view distance) and the other players stay, fog or not)
+      if (!(e instanceof EnderDragon || e instanceof Ghast || (e.type === 'player' && e !== this.player))) {
+        if (h2 > fog2) continue;
+        const lim = this.entityViewDist(e, vs);
+        if (h2 + (ip[1] - cam[1]) ** 2 >= lim * lim) continue;
+      }
       const big = e instanceof EnderDragon ? 14 : e instanceof Ghast ? 5 : 2;
       if (!aabbInFrustum(r.planes, ip[0] - big, ip[1] - big, ip[2] - big, ip[0] + big, ip[1] + 3 + big, ip[2] + big)) continue;
       const l = e.lightAt();
@@ -2467,7 +2614,8 @@ class Game {
           }
         }
       } else if (e instanceof ItemEntity) {
-        const st = e.stack, def = ITEMS[st.id];
+        const st = e.stack, def = st && ITEMS[st.id];
+        if (!def) continue;
         const t = (e.age + a) / 20;
         const bob = Math.sin(t * 2 + e.bobOff) * 0.1 + 0.1;
         const n = st.count > 16 ? 3 : st.count > 1 ? 2 : 1;
@@ -2702,6 +2850,7 @@ class Game {
   }
   drawItemModel(id, m, l, env, ctx, st) {
     const def = ITEMS[id], r = this.renderer;
+    if (!def) return; // (an item this game doesn't have - a room's, another version's: nothing to draw instead of an error a frame)
     const b = def.block !== undefined ? BLOCKS[def.block] : null;
     const vim = r.itemModel(id);
     const flat = vim ? (vim.gen || (!b && !vim.mesh)) : (!b || def.flat || b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door);
@@ -2814,50 +2963,88 @@ class Game {
   // below the eye) to 10 above it; rain.png spans the quad's width and repeats every 4 blocks,
   // each column scrolls at its own random speed; snow falls slowly and drifts sideways.
   // Columns fade with distance and take the lightmap colour of where they are.
-  drawWeather(env, a) {
-    if (this.weather < 0.02) return;
-    const r = this.renderer, gl = r.gl, p = this.player, w = this.world;
-    const ip = p.ipos(a), px = Math.floor(ip[0]), pz = Math.floor(ip[2]), camY = ip[1] + p.eye(), cy = Math.floor(camY);
-    const R = 10, ticks = this.tickCount;
-    const lm = r._lmData;
-    const rain = [], snow = [];
+  // What a column is - where it starts and ends, rain or snow, its light, its random speed - is worked out once a tick (or
+  // when the eye moves into another block: weatherCols); each frame only writes the vertices, into one array kept for
+  // it, sent with bufferSubData. All of it every frame cost 0.66 ms and 236 KB of garbage a frame on a desktop (437
+  // columns while raining; a phone takes several times that, and a collection every few seconds); now 0.03 ms and ~40
+  // bytes on a frame between ticks, 0.47 ms and ~10 KB on one that works the columns out - 0.16 ms a frame at 60 Hz.
+  // The same vertices as before, to the bit
+  weatherCols(px, pz, cy, ticks, R) {
+    const w = this.world, N = (2 * R + 1) * (2 * R + 1);
+    let C = this.wxCols;
+    if (!C || C.N !== N) C = this.wxCols = { N, n: 0, tick: -1, px: 0, pz: 0, cy: 0, w: null, cx: new Float64Array(N), cz: new Float64Array(N), y0: new Int32Array(N), y1: new Int32Array(N),
+      sx: new Float64Array(N), sz: new Float64Array(N), cold: new Uint8Array(N), li: new Uint16Array(N), k: new Float64Array(N), i3: new Uint8Array(N), u0: new Float64Array(N),
+      // rain or snow, or neither, by column for as long as its surface stays (the biome's temperature at that height:
+      // the noise behind it was most of a rebuild's time and garbage), 64 x 64 columns by world position
+      gx: new Int32Array(4096), gz: new Int32Array(4096), gy: new Int32Array(4096).fill(-1e9), gf: new Uint8Array(4096) };
+    if (C.tick === ticks && C.px === px && C.pz === pz && C.cy === cy && C.w === w) return C;
+    if (C.w !== w) C.gy.fill(-1e9);
+    C.tick = ticks; C.px = px; C.pz = pz; C.cy = cy; C.w = w;
+    let n = 0;
     for (let dz = -R; dz <= R; dz++) for (let dx = -R; dx <= R; dx++) {
       const x = px + dx, z = pz + dz;
       if (!w.isLoaded(x, z)) continue;
       // a column roofed higher than the scan below starts (a cave, a deep mine) gets no rain: the scan alone missed
       // the roof and it rained in deep caves (players' feedback 2026-10-31); vanilla goes by the heightmap
-      if (w.surfaceY(x, z) + 1 > cy + R) continue;
+      const sy = w.surfaceY(x, z);
+      if (sy + 1 > cy + R) continue;
       // height of the first motion-blocking block in this column
       let ground = cy + R;
       while (ground > cy - R - 1 && !BLOCKS[w.getBlock(x, ground - 1, z)].solid && !IS_FLUID[w.getBlock(x, ground - 1, z)]) ground--;
       const y0 = Math.max(cy - R, ground), y1 = Math.max(cy + R, ground);
       if (y0 === y1) continue;
+      const gi = ((z & 63) << 6) | (x & 63);
+      if (C.gx[gi] !== x || C.gz[gi] !== z || C.gy[gi] !== sy) { C.gx[gi] = x; C.gz[gi] = z; C.gy[gi] = sy; C.gf[gi] = this.dryAt(x, z) ? 2 : this.isCold(x, z) ? 1 : 0; }
+      if (C.gf[gi] === 2) continue;
       // column direction: the quad faces the player
-      const f = dz, f1 = dx, f2 = Math.hypot(f, f1) || 1, sx = -f1 / f2 * 0.5, sz = f / f2 * 0.5;
-      const d3 = Math.hypot(x + 0.5 - ip[0], z + 0.5 - ip[2]) / R;
-      const alpha = ((1 - d3 * d3) * 0.5 + 0.5) * this.weather;
-      if (alpha <= 0) continue;
-      const ly = Math.max(cy, ground), L = w.getLight(x, ly, z);
-      if (this.dryAt(x, z)) continue;
-      const cold = this.isCold(x, z);
-      const rnd = RNG(((x * x * 3121 + x * 45238971) ^ (z * z * 418711 + z * 13761)) >>> 0);
-      const cx = x + 0.5, cz = z + 0.5;
-      let u0 = 0, vOff;
-      if (!cold) {
-        const i3 = (ticks + x * x * 3121 + x * 45238971 + z * z * 418711 + z * 13761) & 31;
-        vOff = -((i3 + a) / 32) * (3 + rnd());
-      } else {
-        vOff = -(((ticks & 511) + a) / 512) + rnd();
-        u0 = rnd() + 0.01 * Math.sin(ticks * 0.05 + x);
-      }
+      const f2 = Math.hypot(dz, dx) || 1;
+      const ly = Math.max(cy, ground), L = w.getLight(x, ly, z), cold = C.gf[gi] === 1;
+      // the column's own random numbers: the first two of RNG(seed) (util.js mulberry32), without making one each time
+      const a1 = ((((x * x * 3121 + x * 45238971) ^ (z * z * 418711 + z * 13761)) >>> 0 | 0) + 0x6D2B79F5) | 0;
       let sl = L >> 4, bl = L & 15;
-      if (cold) { const k = ((L >> 4) * 3 + 15) / 4; sl = Math.min(15, Math.round(k)); bl = Math.min(15, Math.round(((L & 15) * 3 + 15) / 4)); }
-      const li = (sl * 16 + bl) * 4, lc = lm ? [lm[li] / 255, lm[li + 1] / 255, lm[li + 2] / 255] : [1, 1, 1];
-      const q = [cx - sx, y1, cz - sz, u0, y0 * 0.25 + vOff, cx + sx, y1, cz + sz, u0 + 1, y0 * 0.25 + vOff,
-        cx + sx, y0, cz + sz, u0 + 1, y1 * 0.25 + vOff, cx - sx, y0, cz - sz, u0, y1 * 0.25 + vOff];
-      // (with the shader pack rain and snow are fainter, the haze carries the weather)
-      (cold ? snow : rain).push([q, lc, alpha * (r.fxOn ? (cold ? 0.6 : 0.4) : 1)]);
+      if (cold) {
+        sl = Math.min(15, Math.round(((L >> 4) * 3 + 15) / 4)); bl = Math.min(15, Math.round(((L & 15) * 3 + 15) / 4));
+        C.k[n] = mulberryAt(a1); C.u0[n] = mulberryAt((a1 + 0x6D2B79F5) | 0) + 0.01 * Math.sin(ticks * 0.05 + x);
+      } else { C.k[n] = 3 + mulberryAt(a1); C.i3[n] = (ticks + x * x * 3121 + x * 45238971 + z * z * 418711 + z * 13761) & 31; }
+      C.cx[n] = x + 0.5; C.cz[n] = z + 0.5; C.y0[n] = y0; C.y1[n] = y1; C.sx[n] = -dx / f2 * 0.5; C.sz[n] = dz / f2 * 0.5;
+      C.cold[n] = cold ? 1 : 0; C.li[n] = (sl * 16 + bl) * 4;
+      n++;
     }
+    C.n = n;
+    return C;
+  }
+  drawWeather(env, a) {
+    if (this.weather < 0.02) return;
+    const r = this.renderer, gl = r.gl, p = this.player, w = this.world;
+    // (the eye between ticks, as p.ipos(a) - without its new array)
+    const ix = lerp(p.prev[0], p.pos[0], a), iz = lerp(p.prev[2], p.pos[2], a), camY = lerp(p.prev[1], p.pos[1], a) + p.eye();
+    const px = Math.floor(ix), pz = Math.floor(iz), cy = Math.floor(camY);
+    const R = 10, ticks = this.tickCount, C = this.weatherCols(px, pz, cy, ticks, R);
+    const lm = r._lmData, wt = this.weather, fxOn = r.fxOn;
+    if (!r.weatherData || r.weatherData.length < C.N * 36) r.weatherData = new Float32Array(C.N * 36);
+    const V = r.weatherData;
+    // rain first, then snow, each in the columns' order (the quads blend over each other)
+    let o = 0, nRain = 0;
+    for (let pass = 0; pass < 2; pass++) for (let i = 0; i < C.n; i++) {
+      const cold = C.cold[i];
+      if (cold !== pass) continue;
+      const cx = C.cx[i], cz = C.cz[i], ex = cx - ix, ez = cz - iz;
+      const alpha = ((1 - (ex * ex + ez * ez) / (R * R)) * 0.5 + 0.5) * wt;
+      if (alpha <= 0) continue;
+      let u0 = 0, vOff;
+      if (!cold) vOff = -((C.i3[i] + a) / 32) * C.k[i];
+      else { vOff = -(((ticks & 511) + a) / 512) + C.k[i]; u0 = C.u0[i]; }
+      const li = C.li[i], lr = lm ? lm[li] / 255 : 1, lg = lm ? lm[li + 1] / 255 : 1, lb = lm ? lm[li + 2] / 255 : 1;
+      // (with the shader pack rain and snow are fainter, the haze carries the weather)
+      const al = alpha * (fxOn ? (cold ? 0.6 : 0.4) : 1);
+      const y0 = C.y0[i], y1 = C.y1[i], sx = C.sx[i], sz = C.sz[i], v0 = y0 * 0.25 + vOff, v1 = y1 * 0.25 + vOff;
+      o = weatherVert(V, o, cx - sx, y1, cz - sz, u0, v0, lr, lg, lb, al);
+      o = weatherVert(V, o, cx + sx, y1, cz + sz, u0 + 1, v0, lr, lg, lb, al);
+      o = weatherVert(V, o, cx + sx, y0, cz + sz, u0 + 1, v1, lr, lg, lb, al);
+      o = weatherVert(V, o, cx - sx, y0, cz - sz, u0, v1, lr, lg, lb, al);
+      if (!cold) nRain++;
+    }
+    const nSnow = o / 36 - nRain;
     if (!r.weatherProg) {
       r.weatherProg = compile(gl, `#version 300 es
 layout(location=0) in vec3 a_pos; layout(location=1) in vec2 a_uv; layout(location=2) in vec4 a_col;
@@ -2867,6 +3054,7 @@ precision highp float; uniform sampler2D u_tex; in vec2 v_uv; in vec4 v_col; out
 void main(){ vec4 t = texture(u_tex, v_uv); if (t.a * v_col.a < 0.01) discard; o = t * v_col; }`);
       r.weatherVao = gl.createVertexArray(); gl.bindVertexArray(r.weatherVao);
       r.weatherBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, r.weatherBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, V.byteLength, gl.DYNAMIC_DRAW); r.weatherCap = V.length; // (its size once: then only written into)
       gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
       gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 36, 12);
       gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 36, 20);
@@ -2876,18 +3064,13 @@ void main(){ vec4 t = texture(u_tex, v_uv); if (t.a * v_col.a < 0.01) discard; o
     gl.useProgram(P.p); gl.uniformMatrix4fv(P.u.u_vp, false, r.vp); gl.uniform1i(P.u.u_tex, 0);
     gl.bindVertexArray(r.weatherVao);
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false); gl.disable(gl.CULL_FACE);
-    for (const [list, texName] of [[rain, 'rain'], [snow, 'snowfall']]) {
-      if (!list.length) continue;
-      const arr = new Float32Array(list.length * 36);
-      let o = 0;
-      for (const [q, lc, al] of list) for (let k = 0; k < 4; k++) {
-        arr[o++] = q[k * 5]; arr[o++] = q[k * 5 + 1]; arr[o++] = q[k * 5 + 2]; arr[o++] = q[k * 5 + 3]; arr[o++] = q[k * 5 + 4];
-        arr[o++] = lc[0]; arr[o++] = lc[1]; arr[o++] = lc[2]; arr[o++] = al;
-      }
+    if (o) {
       gl.bindBuffer(gl.ARRAY_BUFFER, r.weatherBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, arr, gl.DYNAMIC_DRAW);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, r.entityTex[texName]);
-      gl.drawElements(gl.TRIANGLES, list.length * 6, gl.UNSIGNED_INT, 0);
+      if (r.weatherCap < V.length) { gl.bufferData(gl.ARRAY_BUFFER, V.byteLength, gl.DYNAMIC_DRAW); r.weatherCap = V.length; }
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, V, 0, o);
+      gl.activeTexture(gl.TEXTURE0);
+      if (nRain) { gl.bindTexture(gl.TEXTURE_2D, r.entityTex.rain); gl.drawElements(gl.TRIANGLES, nRain * 6, gl.UNSIGNED_INT, 0); }
+      if (nSnow) { gl.bindTexture(gl.TEXTURE_2D, r.entityTex.snowfall); gl.drawElements(gl.TRIANGLES, nSnow * 6, gl.UNSIGNED_INT, nRain * 24); }
     }
     gl.depthMask(true); gl.enable(gl.CULL_FACE); gl.disable(gl.BLEND);
     // vanilla rain sounds: from a random spot where rain lands nearby (quieter when it's above you)
@@ -2908,11 +3091,41 @@ void main(){ vec4 t = texture(u_tex, v_uv); if (t.a * v_col.a < 0.01) discard; o
     // a screen closed with Esc: the lock is taken when the key comes up - taken while it was down, the browser read
     // that same Esc as leaving the lock and the pause screen opened again (Mac, players' feedback 2026-10-31)
     if (this.escHeld && performance.now() - this.escHeld < 1500) { this.escCapture = true; return; }
-    const c = this.canvas, swallow = (p) => { if (p && p.catch) p.catch(() => { }); };
-    try {
-      const r = c.requestPointerLock(this.settings.rawInput !== false ? { unadjustedMovement: true } : undefined);
-      if (r && r.catch) r.catch(() => { try { swallow(c.requestPointerLock()); } catch (e) { } });
-    } catch (e) { try { swallow(c.requestPointerLock()); } catch (e2) { } }
+    const c = this.canvas, ua = navigator.userActivation;
+    // (already locked, or a request still on its way: asking again sent a change event without the lock - main.js then
+    // opened the pause menu under a mouse that got locked a moment later - or, Chrome's first raw-input request still
+    // pending, "Pointer lock pending": a refusal, and the game went on with the mouse free)
+    if (document.pointerLockElement === c || performance.now() - (this.lockAsked || 0) < 1000) return;
+    if (!this.lockHooked) {
+      this.lockHooked = true;
+      document.addEventListener('pointerlockchange', () => { this.lockAsked = 0; this.lockSoftAt = 0; if (document.pointerLockElement !== c) this.lockLostAt = performance.now(); });
+      // A refusal that says nothing about the browser - asked with no click or key behind it (a screen closed with Esc,
+      // a world that took over ~5 s to load), or again within the moment the browser holds off after the player left
+      // the lock with Esc - doesn't count toward playing with the mouse free (main.js counts every pointerlockerror,
+      // this listener comes after its own): the pause menu or "click to continue" asks for a click instead. Counted, it
+      // left PC players with the cursor out and leaving the window, onto a second screen ("鼠标锁不住、指针露出来",
+      // feedback 10-30 to 11-03, ~45). A browser that refuses a click still gets the free mouse.
+      document.addEventListener('pointerlockerror', () => {
+        // (Firefox, Safari: no promise to settle, the request is over with this event - the next click asks again)
+        if (this.lockNoPromise) this.lockAsked = 0;
+        if (this.lockSoftAt && performance.now() - this.lockSoftAt < 1500) { this.lockSoftAt = 0; this.lockFails = Math.max(0, (this.lockFails || 0) - 1); }
+      });
+    }
+    const ask = (raw) => {
+      const now = performance.now(), soft = (ua && !ua.isActive) || now - (this.lockLostAt || -1e9) < 2000;
+      this.lockAsked = now; this.lockSoftAt = soft ? now : 0;
+      let r;
+      try { r = raw ? c.requestPointerLock({ unadjustedMovement: true }) : c.requestPointerLock(); }
+      catch (e) { this.lockAsked = 0; if (raw) { this.rawLockOff = true; ask(false); } return; }
+      this.lockNoPromise = !(r && r.then);
+      if (r && r.then) r.then(() => { this.lockAsked = 0; }, (e) => {
+        this.lockAsked = 0;
+        // raw input (unadjustedMovement) isn't on every system: asked again without it at once, still inside the click,
+        // and not asked for again this session (each refusal was a pointerlockerror too)
+        if (raw && e && e.name === 'NotSupportedError') { this.rawLockOff = true; ask(false); this.lockSoftAt = performance.now(); }
+      });
+    };
+    ask(this.settings.rawInput !== false && !this.rawLockOff);
   }
   releasePointer() { if (document.pointerLockElement) document.exitPointerLock(); }
 }
@@ -2924,6 +3137,18 @@ Player.prototype.loadedHere = function () {
   return w.isLoaded(x, z) && w.getChunk(x >> 4, z >> 4).lit;
 };
 
+// one output of util.js RNG (mulberry32) for a state already stepped: RNG(seed)()'s first is mulberryAt((seed | 0) +
+// 0x6D2B79F5 | 0), the next one 0x6D2B79F5 further (the weather's per-column numbers, with no generator made for them)
+function mulberryAt(a) {
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+// one weather vertex (position, uv, colour) into V at o; the next offset
+function weatherVert(V, o, x, y, z, u, v, cr, cg, cb, ca) {
+  V[o] = x; V[o + 1] = y; V[o + 2] = z; V[o + 3] = u; V[o + 4] = v; V[o + 5] = cr; V[o + 6] = cg; V[o + 7] = cb; V[o + 8] = ca;
+  return o + 9;
+}
 function rayBox(o, d, x0, y0, z0, x1, y1, z1) {
   let tmin = -Infinity, tmax = Infinity, face = -1;
   const mins = [x0, y0, z0], maxs = [x1, y1, z1];

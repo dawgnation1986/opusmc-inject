@@ -199,7 +199,18 @@ class CheckinScreen extends MenuScreen {
   // the panel, its header, the scene, the bar; the slope's height at x; each day's stop on it
   geo() {
     const u = this.game.ui, n = Checkin.count(Checkin.st);
-    const W = Math.min(u.w - 8, 440), H = Math.min(u.h - 8, 270), x = Math.floor((u.w - W) / 2), y = Math.floor((u.h - H) / 2);
+    const W = Math.min(u.w - 8, 440);
+    let H = Math.min(u.h - 8, 270), x = Math.floor((u.w - W) / 2), y = Math.floor((u.h - H) / 2);
+    // inside Bilibili on a phone the container's capsule (… and ✕) floats over the top right corner whatever the safe
+    // area says (mobile.js closeRect): the panel - its × and the snowflakes - kept clear of it: moved left where the
+    // screen has room, else down and a little shorter (players, 11-06: the two ✕ on top of each other)
+    if (typeof Stage !== 'undefined' && Stage.inToy && !Stage.rot) {
+      const k = u.dpr / u.scale, cw = Math.ceil(110 * k), ch = Math.ceil(50 * k);
+      if (x + W > u.w - cw && y < ch) {
+        if (u.w - cw - W >= 4) x = u.w - cw - W;
+        else { y = ch + 2; H = Math.min(270, u.h - y - 4); }
+      }
+    }
     const P = { x, y, w: W, h: H };
     const bar = { x: x + 4, y: y + H - 50, w: W - 8, h: 46 };
     const scene = { x: x + 4, y: y + 34, w: W - 8, h: bar.y - (y + 34) };
