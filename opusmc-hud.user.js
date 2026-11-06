@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpusMC 生存辅助（彗星 Comet 客户端）
 // @namespace    https://github.com/bigpixel
-// @version      1.3.1
+// @version      1.3.2
 // @description  网页版 MC 运行时注入：还原彗星客户端（Comet Client）的 ClickGUI —— 400x250 双栏面板、分类侧栏、搜索、模块设置面板、收藏 / 键位绑定，以及彗星式 HUD（Watermark / Info / TargetHud / ArrayList / 通知）。功能：Aura（可自选攻击生物）、TriggerBot、刀刀暴击、AutoSprint、AutoRespawn、ESP、Tracers、Nametags、ItemESP、TargetESP、FullBright、Ambience、飞行（双击空格）/ 加速 / 自动跳跃、快速破坏 / 瞬间破坏 / 自动进食 / 水下呼吸、雷达、罗盘。适配 OpusMC / OpusCraft / 本地离线版。
 // @author       BigPixel
 // @match        https://opuscraft.pages.dev/*
@@ -79,19 +79,6 @@
         const acc = W.localStorage.getItem(KEY);
         if (acc && acc.indexOf('"token":"') !== -1) GM_setValue('cometAccountSync', acc);
       } else if (onLocal) {
-        // [诊断] 油猴直发一次伪装请求，验证 GM 通道与服务端白名单是否放行（3 秒后弹结果）
-        setTimeout(function () {
-          if (typeof GM_xmlhttpRequest !== 'function') { alert('[伪装测试] GM_xmlhttpRequest 不可用（脚本权限丢了）'); return; }
-          GM_xmlhttpRequest({
-            method: 'POST',
-            url: 'https://xz.honghemc.cn:8443/api/ai/status',
-            headers: { Origin: 'https://www.bilibili.com', Referer: 'https://www.bilibili.com/' },
-            data: '{}',
-            timeout: 15000,
-            onload: function (r) { alert('[伪装测试] HTTP ' + r.status + '：' + String(r.responseText).slice(0, 160)); },
-            onerror: function () { alert('[伪装测试] 请求直接失败——扩展权限问题（Edge 扩展页把 Tampermonkey 的开发者模式打开）'); },
-          });
-        }, 3000);
         const cur = W.localStorage.getItem(KEY);
         const hasToken = cur && cur.indexOf('"token":"') !== -1;
         if (!hasToken && typeof GM_getValue === 'function') {
