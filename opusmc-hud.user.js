@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         OpusMC 生存辅助（彗星 Comet 客户端）
 // @namespace    https://github.com/bigpixel
-// @version      1.3.2
-// @description  网页版 MC 运行时注入：还原彗星客户端（Comet Client）的 ClickGUI —— 400x250 双栏面板、分类侧栏、搜索、模块设置面板、收藏 / 键位绑定，以及彗星式 HUD（Watermark / Info / TargetHud / ArrayList / 通知）。功能：Aura（可自选攻击生物）、TriggerBot、刀刀暴击、AutoSprint、AutoRespawn、ESP、Tracers、Nametags、ItemESP、TargetESP、FullBright、Ambience、飞行（双击空格）/ 加速 / 自动跳跃、快速破坏 / 瞬间破坏 / 自动进食 / 水下呼吸、雷达、罗盘。适配 OpusMC / OpusCraft / 本地离线版。
+// @version      1.3.3
+// @description  网页版 MC 运行时注入：还原彗星客户端（Comet Client）的 ClickGUI —— 400x250 双栏面板、分类侧栏、搜索、模块设置面板、收藏 / 键位绑定，以及彗星式 HUD（Watermark / Info / TargetHud / ArrayList / 通知）。界面提供两套主题：默认（深色）与液态玻璃（Apple Liquid Glass 风格的半透明磨砂 + 高光边缘）。功能：Aura（可自选攻击生物）、TriggerBot、刀刀暴击、AutoSprint、AutoRespawn、ESP、Tracers、Nametags、ItemESP、TargetESP、FullBright、Ambience、飞行（双击空格）/ 加速 / 自动跳跃、快速破坏 / 瞬间破坏 / 自动进食 / 水下呼吸、雷达、罗盘。适配 OpusMC / OpusCraft / 本地离线版。
 // @author       BigPixel
 // @match        https://opuscraft.pages.dev/*
 // @match        https://www.bilibilitoy.com/*
 // @match        https://www.bilibili.com/toy/*
 // @match        http://localhost:8777/*
+// @match        *://*/game.html*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
@@ -29,7 +30,7 @@
   }
   W.__cometInstalled = true;
 
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.3';
   const REF_POLL_MS = 800;
   const REF_POLL_MAX_TRIES = 375;
 
@@ -92,7 +93,7 @@
     } catch (err) { console.warn('[Comet] 账号同步失败', err); }
   }
 
-  const state = { game: null, player: null, flavor: '' };
+  const state = { game: null, player: null, flavor: '', mpSeen: false };
 
   // ---------- 配置 ----------
   const CFG_KEY = '__cometCfg';
@@ -107,6 +108,7 @@
     favorites: stored.favorites || {},
     hudPos: stored.hudPos || {},
     guiOffset: stored.guiOffset || { x: 0, y: 0 },
+    theme: stored.theme === 'glass' ? 'glass' : 'default',
     servers: stored.servers || [{ name: '官方', url: 'https://xz.honghemc.cn:8443' }],
     serverIdx: stored.serverIdx || 0,
     mcAddr: stored.mcAddr || 'ws://localhost:25565',
@@ -230,6 +232,8 @@
 
   function cnName(e) {
     try {
+      // 联机玩家：NetPlayer 上有服务器下发的真实 ID
+      if (e && e.type === 'player' && typeof e.name === 'string' && e.name && e.name !== '?') return e.name;
       // 掉落物显示实际物品名（圆石 / 木头 …），而不是类名 ItemEntity
       if (e && e.stack && typeof e.stack.id !== 'undefined') {
         const nm = itemName(e.stack.id);
@@ -304,7 +308,7 @@
       ],
     },
     {
-      id: 'crit', name: 'Criticals', cn: '刀刀暴击', cat: 'combat', desc: '每次攻击都判定为暴击（伤害 ×1.5）',
+      id: 'crit', name: 'Criticals', cn: '刀刀暴击', cat: 'combat', desc: '每次攻击都判定为暴击（伤害 ×1.5，单机有效；联机伤害由服务器计算）',
     },
     {
       id: 'autosprint', name: 'AutoSprint', cn: '自动疾跑', cat: 'movement', desc: '自动保持疾跑',
@@ -727,6 +731,27 @@
     return best;
   }
 
+  // 联机（服务器权威）：game.net 存在时世界和伤害都由服务器计算
+  function isMP(g) {
+    try { return !!(g && g.net); } catch (e) { return false; }
+  }
+
+  // 攻击：单机直接算伤害；联机必须发包（本地调用 g.attack 只会打到本地副本）
+  function attackEntity(g, e) {
+    const net = g.net;
+    if (net && typeof net.send === 'function' && e && e.netId != null) {
+      net.send({ t: 'attack', id: e.netId });
+      net.send({ t: 'swing' });
+      const p = state.player;
+      if (p && typeof p.swing === 'function') p.swing();
+      if (p) p.attackT = 0;
+      if (typeof g.attackCd === 'number') g.attackCd = 4;
+      return true;
+    }
+    g.attack(e);
+    return false;
+  }
+
   function tickAura(g, p) {
     const range = getS('aura', 'range') ?? 4.5;
     const target = findAuraTarget(g, p, range);
@@ -738,7 +763,7 @@
     try { strength = g.attackStrength(0.5); } catch (e) { return; }
     if (typeof strength !== 'number' || strength < (getS('aura', 'strength') ?? 0.9)) return;
     try {
-      g.attack(target);
+      attackEntity(g, target);
       lastTarget = target;
       lastTargetAt = performance.now();
     } catch (e) { /* noop */ }
@@ -760,7 +785,7 @@
     try { strength = g.attackStrength(0.5); } catch (err) { return; }
     if (strength < (getS('triggerbot', 'strength') ?? 0.9)) return;
     try {
-      g.attack(e);
+      attackEntity(g, e);
       lastTarget = e;
       lastTargetAt = performance.now();
     } catch (err) { /* noop */ }
@@ -922,6 +947,15 @@
     if (!g || !p) return;
     if (g.state && g.state !== 'play') return;
 
+    // 联机提示：服务器权威，移动/伤害由服务器判定
+    const mp = isMP(g);
+    if (mp && !state.mpSeen) {
+      state.mpSeen = true;
+      pushNotification('联机模式', '战斗已改为发包；飞行/加速/瞬间破坏/刀刀暴击受服务器判定');
+    } else if (!mp && state.mpSeen) {
+      state.mpSeen = false;
+    }
+
     if (modOn('autosprint') && p.health > 0 && !p.sneaking && !p.usingItem) {
       try {
         const inp = g.readInput ? g.readInput() : null;
@@ -959,7 +993,16 @@
       const br = g.breaking;
       if (modOn('instantbreak') && br && Array.isArray(br.pos) && br.progress > 0) {
         try {
-          g.breakBlock(br.pos[0], br.pos[1], br.pos[2], false);
+          const net = g.net;
+          if (net && typeof net.dig === 'function' && g.target) {
+            // 联机：先开挖再立刻完成，让服务器按 dig 包结算
+            net.dig(0, g.target);
+            net.dig(2, g.target);
+            net.digging = null;
+            if (typeof g.netBreak === 'function') g.netBreak(g.target.pos);
+          } else {
+            g.breakBlock(br.pos[0], br.pos[1], br.pos[2], false);
+          }
           g.breaking = null;
           g.attackCd = Math.max(Number(g.attackCd) || 0, 5);
         } catch (e) { /* noop */ }
@@ -1613,6 +1656,166 @@
       position: fixed; left: 50%; top: 8px; width: 300px; height: 24px; margin-left: -150px;
       z-index: 2147483645; pointer-events: none; border-radius: 5px;
     }
+
+    /* ---------- 主题切换（默认 / 液态玻璃） ---------- */
+    .cm-theme {
+      position: absolute; left: 12.5px; top: 198px; width: 70px; height: 17px; box-sizing: border-box;
+      display: flex; padding: 1.5px; gap: 1px; border-radius: 5px;
+      border: .5px solid rgba(55,55,55,.84); background: rgba(55,55,55,.1);
+    }
+    .cm-theme .cm-topt {
+      flex: 1; display: flex; align-items: center; justify-content: center; border-radius: 3.5px;
+      font-size: 5.5px; font-weight: 700; letter-spacing: .2px; color: rgba(150,150,150,.85);
+      cursor: pointer; transition: background .18s ease, color .18s ease;
+    }
+    .cm-theme .cm-topt:hover { color: rgba(255,255,255,.85); }
+    .cm-theme .cm-topt.on { background: rgba(190,190,200,.22); color: #fff; }
+
+    /* ---------- 液态玻璃主题（Apple Liquid Glass 风格） ---------- */
+    #__comet_gui.glass .cm-dim {
+      background: radial-gradient(120% 120% at 50% 0%, rgba(10,10,14,.16), rgba(6,6,10,.44));
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
+    }
+    #__comet_gui.glass #__comet_panel {
+      background: linear-gradient(135deg, rgba(255,255,255,.26) 0%, rgba(255,255,255,.09) 36%, rgba(255,255,255,.15) 64%, rgba(255,255,255,.05) 100%);
+      border: .5px solid rgba(255,255,255,.42);
+      backdrop-filter: blur(30px) saturate(180%) brightness(1.05);
+      -webkit-backdrop-filter: blur(30px) saturate(180%) brightness(1.05);
+      box-shadow: 0 20px 60px rgba(0,0,0,.42), 0 2px 10px rgba(0,0,0,.22),
+        inset 0 1px 0 rgba(255,255,255,.52), inset 0 -1px 0 rgba(255,255,255,.14);
+    }
+    /* 镜面高光：贴在玻璃上的一层反光，不挡鼠标 */
+    .cm-sheen { display: none; }
+    #__comet_gui.glass .cm-sheen {
+      display: block; position: absolute; inset: 0; border-radius: 14.5px; pointer-events: none; z-index: 0;
+      background:
+        radial-gradient(90% 62% at 16% -10%, rgba(255,255,255,.34), transparent 62%),
+        radial-gradient(72% 52% at 102% 110%, rgba(255,255,255,.16), transparent 60%),
+        linear-gradient(200deg, rgba(255,255,255,.1) 0%, transparent 34%);
+    }
+    #__comet_gui.glass #__comet_panel > * { z-index: 1; }
+    #__comet_gui.glass .cm-pane {
+      border-color: rgba(255,255,255,.32);
+      background: linear-gradient(150deg, rgba(255,255,255,.18), rgba(255,255,255,.055));
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.34), 0 3px 12px rgba(0,0,0,.14);
+      backdrop-filter: blur(10px) saturate(150%);
+      -webkit-backdrop-filter: blur(10px) saturate(150%);
+    }
+    #__comet_gui.glass .cm-mods,
+    #__comet_gui.glass .cm-sets { background: rgba(255,255,255,.05); }
+
+    #__comet_gui.glass .cm-hlabel { color: rgba(255,255,255,.72); text-shadow: 0 1px 2px rgba(0,0,0,.35); }
+    #__comet_gui.glass .cm-cat { color: rgba(255,255,255,.62); }
+    #__comet_gui.glass .cm-cat:hover,
+    #__comet_gui.glass .cm-cat.sel { color: #fff; }
+    #__comet_gui.glass .cm-cat.sel .cm-line { opacity: .5; }
+    #__comet_gui.glass .cm-sec { color: rgba(255,255,255,.5); }
+    #__comet_gui.glass .cm-sec::before,
+    #__comet_gui.glass .cm-sec::after { background: rgba(255,255,255,.25); }
+
+    #__comet_gui.glass .cm-searchbox,
+    #__comet_gui.glass .cm-select,
+    #__comet_gui.glass .cm-text,
+    #__comet_gui.glass .cm-soon {
+      border-color: rgba(255,255,255,.34);
+      background: rgba(255,255,255,.1);
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.32);
+    }
+    #__comet_gui.glass .cm-theme { border-color: rgba(255,255,255,.34); background: rgba(255,255,255,.1); }
+    #__comet_gui.glass .cm-theme .cm-topt { color: rgba(255,255,255,.7); }
+    #__comet_gui.glass .cm-theme .cm-topt.on { background: rgba(255,255,255,.3); color: #fff; }
+    #__comet_gui.glass .cm-searchbox input,
+    #__comet_gui.glass .cm-text input { color: #fff; }
+    #__comet_gui.glass .cm-searchbox input::placeholder { color: rgba(255,255,255,.6); }
+    #__comet_gui.glass .cm-sdiv { background: rgba(255,255,255,.2); }
+    #__comet_gui.glass .cm-sico,
+    #__comet_gui.glass .cm-soon { color: rgba(255,255,255,.7); }
+
+    #__comet_gui.glass .cm-row {
+      background: rgba(255,255,255,.1);
+      border-color: rgba(255,255,255,.1);
+      color: rgba(255,255,255,.72);
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.22);
+    }
+    #__comet_gui.glass .cm-row:hover { background: rgba(255,255,255,.2); }
+    #__comet_gui.glass .cm-row.sel {
+      background: rgba(255,255,255,.24); border-color: rgba(255,255,255,.46); animation: none;
+    }
+    #__comet_gui.glass .cm-row.on { color: #fff; }
+    #__comet_gui.glass .cm-row .cm-bind {
+      border-color: rgba(255,255,255,.35); background: rgba(255,255,255,.12); color: #fff;
+    }
+    #__comet_gui.glass .cm-row .cm-star { color: rgba(255,255,255,.45); }
+    #__comet_gui.glass .cm-row .cm-gear { color: rgba(255,255,255,.55); }
+
+    #__comet_gui.glass .cm-stitle { color: #fff; }
+    #__comet_gui.glass .cm-sdesc,
+    #__comet_gui.glass .cm-set .cm-sldesc { color: rgba(255,255,255,.62); }
+    #__comet_gui.glass .cm-divider { background: rgba(255,255,255,.16); }
+    #__comet_gui.glass .cm-set { color: rgba(255,255,255,.86); }
+    #__comet_gui.glass .cm-set .cm-sicon { color: rgba(255,255,255,.6); }
+    #__comet_gui.glass .cm-value { color: rgba(255,255,255,.62); }
+    #__comet_gui.glass .cm-value b { color: #fff; }
+    #__comet_gui.glass .cm-track { background: rgba(255,255,255,.18); }
+    #__comet_gui.glass .cm-track .cm-fill { background: rgba(255,255,255,.85); }
+    #__comet_gui.glass .cm-track .cm-knob { background: #fff; }
+    #__comet_gui.glass .cm-switch {
+      border-color: rgba(255,255,255,.4); background: rgba(255,255,255,.1);
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.28);
+    }
+    #__comet_gui.glass .cm-switch i { background: rgba(255,255,255,.45); }
+    #__comet_gui.glass .cm-switch.on { border-color: rgba(255,255,255,.72); }
+    #__comet_gui.glass .cm-switch.on i { background: #fff; }
+
+    #__comet_gui.glass .cm-options {
+      background: rgba(24,24,30,.55);
+      border-color: rgba(255,255,255,.34);
+      backdrop-filter: blur(20px) saturate(170%);
+      -webkit-backdrop-filter: blur(20px) saturate(170%);
+      box-shadow: 0 8px 24px rgba(0,0,0,.42), inset 0 .5px 0 rgba(255,255,255,.28);
+    }
+    #__comet_gui.glass .cm-option:hover { background: rgba(255,255,255,.18); }
+    #__comet_gui.glass .cm-option .cm-otxt { color: #fff; }
+    #__comet_gui.glass .cm-option .cm-obox { border-color: rgba(255,255,255,.5); }
+    #__comet_gui.glass .cm-btn {
+      border-color: rgba(255,255,255,.34); background: rgba(255,255,255,.12); color: #fff;
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.34);
+    }
+    #__comet_gui.glass .cm-btn:hover { background: rgba(255,255,255,.22); }
+    #__comet_gui.glass .cm-results {
+      border-color: rgba(255,255,255,.34);
+      background: rgba(18,18,24,.5);
+      backdrop-filter: blur(24px) saturate(170%);
+      -webkit-backdrop-filter: blur(24px) saturate(170%);
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.26);
+    }
+    #__comet_gui.glass .cm-resrow { background: rgba(255,255,255,.08); color: rgba(255,255,255,.8); }
+    #__comet_gui.glass .cm-resrow:hover { background: rgba(255,255,255,.18); }
+    #__comet_gui.glass .cm-resrow .cm-rcat { color: rgba(255,255,255,.55); }
+    #__comet_gui.glass .cm-rempty { color: rgba(255,255,255,.6); }
+
+    #__comet_hudstage.glass .cm-hudbox,
+    #__comet_hudstage.glass .cm-hudicon,
+    #__comet_hudstage.glass .cm-arr,
+    #__comet_hudstage.glass .cm-note,
+    #__comet_hudstage.glass .cm-target {
+      border-color: rgba(255,255,255,.34);
+      background: linear-gradient(135deg, rgba(255,255,255,.22), rgba(255,255,255,.07));
+      backdrop-filter: blur(18px) saturate(175%);
+      -webkit-backdrop-filter: blur(18px) saturate(175%);
+      box-shadow: inset 0 .5px 0 rgba(255,255,255,.45), 0 4px 16px rgba(0,0,0,.28);
+    }
+    #__comet_hudstage.glass .cm-hudbox,
+    #__comet_hudstage.glass .cm-arr,
+    #__comet_hudstage.glass .cm-note,
+    #__comet_hudstage.glass .cm-target { color: #fff; }
+    #__comet_hudstage.glass .cm-hudbox .cm-hlbl,
+    #__comet_hudstage.glass .cm-hudbox .cm-hsep { color: rgba(255,255,255,.68); }
+    #__comet_hudstage.glass .cm-note .cm-ndesc { color: rgba(255,255,255,.7); }
+    #__comet_hudstage.glass .cm-target .cm-tface {
+      border-color: rgba(255,255,255,.32); background: rgba(255,255,255,.14);
+    }
   `;
   const styleEl = document.createElement('style');
   styleEl.textContent = css;
@@ -1653,7 +1856,23 @@
   const soon = mk('div', 'cm-soon', '敬请期待...');
   const results = mk('div', 'cm-results');
 
-  panel.append(side, header, modsPane, setsPane, soon, results, hlabel, searchBox);
+  // 主题切换：默认（深色）/ 液态玻璃（Apple Liquid Glass 风格）
+  const themeOpts = [];
+  const themeBox = mk('div', 'cm-theme');
+  [['default', '默认'], ['glass', '玻璃']].forEach(([id, label]) => {
+    const el = mk('span', 'cm-topt', label);
+    el.dataset.theme = id;
+    el.addEventListener('mousedown', (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      if (ev.button === 0) setTheme(id);
+    });
+    themeOpts.push(el);
+    themeBox.append(el);
+  });
+
+  const sheen = mk('div', 'cm-sheen');
+
+  panel.append(sheen, side, header, modsPane, setsPane, soon, themeBox, results, hlabel, searchBox);
   stage.append(panel);
   gui.append(dim, stage);
 
@@ -1673,6 +1892,19 @@
     const y = Math.floor((vh - 250) / 2 + cfg.guiOffset.y);
     panel.style.left = x + 'px';
     panel.style.top = y + 'px';
+  }
+
+  // ---------- 主题 ----------
+  function applyTheme() {
+    const glass = cfg.theme === 'glass';
+    gui.classList.toggle('glass', glass);
+    try { hudStage.classList.toggle('glass', glass); } catch (e) { /* noop */ }
+    for (const el of themeOpts) el.classList.toggle('on', el.dataset.theme === cfg.theme);
+  }
+  function setTheme(id) {
+    cfg.theme = id === 'glass' ? 'glass' : 'default';
+    saveCfg();
+    applyTheme();
   }
 
   // ---------- 侧栏 ----------
@@ -2219,6 +2451,9 @@
         <span class="cm-hsep">»</span>
         <span class="cm-hico">◷</span>
         <span class="cm-hval" id="__c_wm_time">00:00</span>
+        <span class="cm-hsep" id="__c_wm_netsep" style="display:none">»</span>
+        <span class="cm-hico" id="__c_wm_netico" style="display:none">⇄</span>
+        <span class="cm-hval" id="__c_wm_net" style="display:none">联机</span>
       </div>
     </div>
     <div class="cm-hud cm-info" id="__c_info">
@@ -2248,6 +2483,9 @@
   const elWmUser = $h('__c_wm_user');
   const elWmFps = $h('__c_wm_fps');
   const elWmTime = $h('__c_wm_time');
+  const elWmNet = $h('__c_wm_net');
+  const elWmNetIco = $h('__c_wm_netico');
+  const elWmNetSep = $h('__c_wm_netsep');
   const elInfo = $h('__c_info');
   const elIx = $h('__c_ix');
   const elIy = $h('__c_iy');
@@ -2323,6 +2561,13 @@
     if (elWmTime) {
       const d = new Date();
       elWmTime.textContent = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+    if (elWmNet) {
+      const mp = isMP(state.game);
+      const disp = mp ? '' : 'none';
+      elWmNet.style.display = disp;
+      if (elWmNetIco) elWmNetIco.style.display = disp;
+      if (elWmNetSep) elWmNetSep.style.display = disp;
     }
 
     const rp = state.player ? readPos(state.player) : null;
@@ -2488,6 +2733,8 @@
     modules: MODULES,
     notify: pushNotification,
     toggleMenu,
+    setTheme,
+    getTheme() { return cfg.theme; },
     toggleHud(v) {
       cfg.states.hud = v == null ? !modOn('hud') : !!v;
       saveCfg();
@@ -2556,6 +2803,7 @@
     updateHeaderLabel();
     layoutPanel();
     applyHudPos();
+    applyTheme();
     refreshHud();
 
     installOriginSpoof();

@@ -285,7 +285,7 @@ final class EndGenerator
         $put(-1, 2, 0, self::TORCH, 1);
         $put(1, 2, 0, self::TORCH, 2);
         $put(0, 3, 0, self::BEDROCK);
-        $put(0, 4, 0, self::DRAGON_EGG);
+        // 龙蛋不在这里放 —— 原版是龙死后才出现，由 killDragon() 补上
     }
 
     /**
@@ -318,6 +318,28 @@ final class EndGenerator
                 }
             }
         }
+    }
+
+    /**
+     * 10 根柱子的顶端坐标（相对末地中心），给服务端放水晶用。
+     *
+     * 返回的是水晶该待的 y：柱顶那块末地石在 topY+1，水晶坐在它上面，
+     * 所以这里是 topY+2。
+     *
+     * @return array<int, array{0:int,1:int,2:int}>
+     */
+    public static function pillarTops(): array
+    {
+        $out = [];
+        for ($i = 0; $i < 10; $i++) {
+            $angle = $i * 2.0 * M_PI / 10.0;
+            $px = (int) round(cos($angle) * 42.0);
+            $pz = (int) round(sin($angle) * 42.0);
+            $topY = 76 + ($i % 3) * 9;
+            $out[] = [$px, $topY + 1, $pz];   // 柱顶没有末地石了，水晶直接坐上去
+        }
+
+        return $out;
     }
 
     /**
@@ -371,24 +393,8 @@ final class EndGenerator
                 }
             }
 
-            // 顶端盖一层末地石，水晶待会儿放这上面
-            $capY = $topY + 1;
-            if ($capY > 127) {
-                $capY = 127;
-            }
-            for ($dx = -$radius; $dx <= $radius; $dx++) {
-                for ($dz = -$radius; $dz <= $radius; $dz++) {
-                    if ($dx * $dx + $dz * $dz > $radius * $radius) {
-                        continue;
-                    }
-                    $lx = $px + $dx - $baseX;
-                    $lz = $pz + $dz - $baseZ;
-                    if ($lx < 0 || $lx > 15 || $lz < 0 || $lz > 15) {
-                        continue;
-                    }
-                    $blocks[$capY][($lz << 4) | $lx] = self::END_STONE;
-                }
-            }
+            // 柱顶什么都不放 —— 原版水晶直接坐在黑曜石柱最上面那格，
+            // 不需要末地石垫底。之前盖了一层反而像给柱子扣了个盖子。
         }
     }
 

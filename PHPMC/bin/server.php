@@ -50,6 +50,7 @@ require __DIR__ . '/../src/AnvilTrait.php';
 require __DIR__ . '/../src/PortalTrait.php';
 require __DIR__ . '/../src/FluidTrait.php';
 require __DIR__ . '/../src/RedstoneTrait.php';
+require __DIR__ . '/../src/EndTrait.php';
 require __DIR__ . '/../src/RecipeTable.php';
 require __DIR__ . '/../src/ItemIds.php';
 require __DIR__ . '/../src/CraftingTrait.php';

@@ -288,6 +288,7 @@ trait PortalTrait
             }
 
             $p->portalDim = $want;
+            $p->portalDimAt = microtime(true);
             // 客户端收到 0x07 会把世界整个丢掉重建，区块缓存必须跟着清
             $p->sentChunks = [];
             $p->chunkQueue = [];
@@ -321,6 +322,14 @@ trait PortalTrait
                 ->double($p->x)->double($p->y)->double($p->z)
                 ->float($p->yaw)->float($p->pitch)->byte(0));
             $this->queueChunks($p);
+
+            // 进末地：把水晶实体发给他
+            if ($want === 1) {
+                $this->spawnEndCrystals();
+                $this->sendEndCrystalsTo($p);
+                $this->spawnDragon();
+                $this->sendDragonSpawn($p);
+            }
 
             $this->log("  维度自动切到 {$want} -> {$p->username} @ {$p->x},{$p->z}");
         }
