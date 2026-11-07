@@ -15,6 +15,8 @@
 import net from 'node:net';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
+import { VERSION, BLOCK_NAMES, BIOME_NAMES, MC_ITEM_NAMES, MC_ITEM_IDS, MC_MOBS,
+  chunkToOpus, packPosBytes, unpackPos } from './chunk-format.mjs';
 
 const MC_HOST = process.argv[2] || 'localhost';
 const MC_PORT = +(process.argv[3] || 24443);
@@ -71,6 +73,7 @@ class Writer {
   i16(v) { const b = Buffer.alloc(2); b.writeInt16BE(v | 0); this.parts.push(b); return this; }
   u16(v) { const b = Buffer.alloc(2); b.writeUInt16BE(v & 0xFFFF); this.parts.push(b); return this; }
   u8(v) { this.parts.push(Buffer.from([v & 0xFF])); return this; }
+  i8(v) { const b = Buffer.alloc(1); b.writeInt8(v | 0); this.parts.push(b); return this; }
   bool(v) { this.parts.push(Buffer.from([v ? 1 : 0])); return this; }
   f32(v) { const b = Buffer.alloc(4); b.writeFloatBE(v); this.parts.push(b); return this; }
   f64(v) { const b = Buffer.alloc(8); b.writeDoubleBE(v); this.parts.push(b); return this; }
@@ -93,8 +96,10 @@ function wsEncode(opcode, data) {
   else { head = Buffer.alloc(10); head[0] = 0x80 | opcode; head[1] = 127; head.writeUInt32BE(0, 2); head.writeUInt32BE(len, 6); }
   return Buffer.concat([head, data]);
 }
-// 解帧（服务端收到的帧应带 mask；返回 {payloads, closed}，未收全的留在 buf）
-function wsDecode(bufRef) {
+// 解帧（服务端收到的帧应带 mask；未收全的留在 buf）
+// frames 传入数组 = 逐帧模式（OpusMC 的 JSON 文本帧，一个 chunk 里多条消息绝不能拼）；
+// 不传 = 字节流模式（PHPMC 的 MC 字节流，帧边界 != 包边界，必须拼接后按 VarInt 分帧）。
+function wsDecode(bufRef, frames) {
   let payload = Buffer.alloc(0), closed = false;
   for (;;) {
     const buf = bufRef.buf, len = buf.length;
@@ -113,7 +118,8 @@ function wsDecode(bufRef) {
     bufRef.buf = buf.subarray(off + plen);
     if (opcode === 0x8) { closed = true; break; }
     if (opcode === 0x9) { bufRef.pong = wsEncode(0xA, data); continue; } // 服务端要回 pong
-    payload = Buffer.concat([payload, data]); // 0x0/0x1/0x2 一律当字节流拼
+    if (frames) frames.push({ opcode, data });
+    else payload = Buffer.concat([payload, data]); // 0x0/0x1/0x2 一律当字节流拼（仅 PHPMC 侧）
   }
   return { payload, closed };
 }
@@ -140,19 +146,15 @@ function wrapServerSocket(socket) {
       if (rest.length) { st.buf = Buffer.concat([st.buf, rest]); }
       return; // 升级帧本身不带消息
     }
-    // 客户端消息是 JSON 文本帧 —— 必须逐帧分派（wsDecode 会把同 chunk 的多帧拼成一个
-    // payload，两个 JSON 拼在一起 parse 必炸；只有 MC 字节流才是拼接语义）
-    let closed = false;
+    // 客户端消息是 JSON 文本帧 —— 必须逐帧分派。
+    // v2.2.1 根因：旧代码外层循环看着像「逐帧」，但 wsDecode 内部会把同 chunk 的所有帧
+    // concat 成一个 payload，多个 JSON 拼在一起 parse 必炸 -> 整批交互消息静默丢失。
+    // 这就是「放置/攻击/容器点击全没反应」而 tick 正常（tick 每 100ms 单独一帧）的原因。
     const frames = [];
-    for (;;) {
-      const r = wsDecode(st);
-      if (r.closed) { closed = true; break; }
-      if (r.payload.length) frames.push(r.payload);
-      if (st.buf.length === 0) break; // wsDecode 已把未完成的留在 buf；防死循环
-    }
+    const r = wsDecode(st, frames);
     if (st.pong) { socket.write(st.pong); st.pong = null; }
-    if (closed) { socket.end(); st.handlers.close && st.handlers.close(); return; }
-    for (const f of frames) if (st.handlers.message) st.handlers.message(f);
+    if (r.closed) { socket.end(); st.handlers.close && st.handlers.close(); return; }
+    for (const f of frames) if (f.opcode === 0x1 && st.handlers.message) st.handlers.message(f.data);
   });
   socket.on('close', () => st.handlers.close && st.handlers.close());
   return {
@@ -223,10 +225,32 @@ const MC = {
   keepAlive(id) { return framePacket(0x00, new Writer().varInt(id).build()); },
   chat(text) { return framePacket(0x01, new Writer().string(text).build()); },
   posGround(onGround) { return framePacket(0x03, new Writer().bool(onGround).build()); },
-  dig(status, x, y, z, face) { // 0x07：u8 status + long packedPos + u8 face
-    const packed = ((BigInt(x | 0) & 0x3FFFFFFn) << 38n) | ((BigInt(z | 0) & 0x3FFFFFFn) << 12n) | (BigInt(y | 0) & 0xFFFn);
-    return framePacket(0x07, new Writer().bytes((() => { const b = Buffer.alloc(8); b.writeBigInt64BE(BigInt.asIntN(64, packed)); return b; })()).u8(status).u8(face).build());
+  dig(status, x, y, z, face) { // 0x07：u8 status + long packedPos + u8 face（坐标用 PHPMC 布局）
+    return framePacket(0x07, new Writer().bytes(packPosBytes(x, y, z)).u8(status).u8(face).build());
   },
+  place(x, y, z, face, itemId, cx = 8, cy = 8, cz = 8) { // 0x08：long + face + slot + 3 个光标字节
+    return framePacket(0x08, new Writer().bytes(packPosBytes(x, y, z)).u8(face)
+      .i16(itemId).u8(1).i16(0).u8(0).u8(cx).u8(cy).u8(cz).build());
+  },
+  useItem(itemId) { // 0x08 的 (-1,-1) 特例：吃/喝/用物品
+    return framePacket(0x08, new Writer().bytes(packPosBytes(-1, -1, -1)).u8(255)
+      .i16(itemId).u8(1).i16(0).u8(0).u8(0).u8(0).u8(0).build());
+  },
+  swing() { return framePacket(0x0A); },                        // 0x0A Animation：无 body
+  held(slot) { return framePacket(0x09, new Writer().i16(slot).build()); },
+  click(id, slot, button, action, mode, carried) { // 0x0E Click Window：末尾是光标上的物品栈
+    const w = new Writer().i8(id).i16(slot).u8(button).i16(action).u8(mode);
+    const n = carried && MC_ITEM_IDS.get(String(carried.n || ''));
+    if (!n) w.i16(-1);
+    else w.i16(n).u8(carried.c || 1).i16(carried.d || 0).u8(0);
+    return framePacket(0x0E, w.build());
+  },
+  useEntity(eid, action, x = 0, y = 0, z = 0) { // 0x02：1=攻击 0=交互 2=对某点交互
+    const w = new Writer().varInt(eid).varInt(action);
+    if (action === 2) w.f32(x).f32(y).f32(z);
+    return framePacket(0x02, w.build());
+  },
+  closeWindow(id) { return framePacket(0x0D, new Writer().i8(id).build()); },
   posLook(x, y, z, yaw, pitch, onGround) {
     return framePacket(0x06, new Writer().f64(x).f64(y).f64(z).f32(yaw).f32(pitch).bool(onGround).build());
   },
@@ -277,11 +301,18 @@ const MC = {
         if (held > 0) out.equip = { id: eid, item: { n: MC_ITEM_NAMES[held] || null, c: 1 } };
         return;
       }
-      case 0x0D: { r.varInt(); r.varInt(); return; }                                  // Collect Item
+      case 0x0D: { out.collect = { id: r.varInt(), by: r.varInt() }; return; }        // Collect Item
       case 0x0E: { // Spawn Object：eid + type + int×3 + yaw/pitch + int data + (data>0: vel×3)
-        r.varInt(); r.u8(); r.i32(); r.i32(); r.i32(); r.u8(); r.u8();
+        const eid = r.varInt(), type = r.u8();
+        const x = r.i32() / 32, y = r.i32() / 32, z = r.i32() / 32;
+        r.u8(); r.u8();
         const data = r.i32();
         if (data > 0) { r.i16(); r.i16(); r.i16(); }
+        if (type === 2) { // 掉落物：物品栈由紧随其后的 0x1C(index 10) 给
+          entPos.set(eid, { x, y, z, yawDeg: 0, pitchDeg: 0 });
+          out.spawn = { type: 'item', id: eid, x, y, z };
+          log(`掉落物 0x0E：eid=${eid} @ ${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)}`);
+        }
         return;
       }
       case 0x0F: { // Spawn Mob：eid + uByte type + int×3(×32) + yaw/pitch/head + vel×3 + metadata
@@ -348,7 +379,12 @@ const MC = {
         return;
       }
       case 0x1B: { r.i32(); r.i32(); r.bool(); return; }                              // Attach Entity
-      case 0x1C: { r.varInt(); skipMetadata(r); return; }                             // Entity Metadata
+      case 0x1C: { // Entity Metadata：掉落物的物品栈在 index 10 / type 5
+        const eid = r.varInt();
+        out.entityMeta = { id: eid, item: null };
+        scanMetadata(r, (idx, type, v) => { if (idx === 10 && type === 5) out.entityMeta.item = v; });
+        return;
+      }
       case 0x1F: { r.f32(); r.varInt(); r.varInt(); return; }                         // Set Experience
       case 0x21: { // Chunk Data —— PHPMC 特例：primaryBitmask 是 short
         if (!global.__chunkDumped) {
@@ -356,18 +392,15 @@ const MC = {
           log('0x21 原始字节(前24): ' + r.b.subarray(0, 24).toString('hex') + ' | 总长 ' + r.b.length);
         }
         out.chunk = { cx: r.i32(), cz: r.i32() };
-        r.bool();
+        out.chunk.groundUp = r.bool();  // false = 增量段更新（PHPMC 目前停用，但必须能识别）
         out.chunk.mask = r.u16();   // 协议清单 §3：primaryBitMask 是 ushort
         const size = r.varInt();
         out.chunk.data = r.raw(size);   // 保留原始字节供 M2 区块翻译
         out.chunk.size = size;
         return;
       }
-      case 0x23: { // Block Change：packedPos(long) + varInt blockId（=(id<<4)|meta 的 raw state）
-        const packed = r.i64();
-        const bx = Number(BigInt.asIntN(26, BigInt(packed) >> 38n));
-        const bz = Number(BigInt.asIntN(26, (BigInt(packed) << 26n) >> 38n));
-        const by = Number((BigInt(packed) >> 26n) & 0xFFFn);
+      case 0x23: { // Block Change：PHPMC 坐标布局 x<<38|y<<26|z（原代码按标准 1.8 解，y/z 全错）
+        const [bx, by, bz] = unpackPos(r.raw(8).readBigInt64BE(0));
         out.block = { x: bx, y: by, z: bz, s: r.varInt() };
         return;
       }
@@ -382,27 +415,21 @@ const MC = {
         if (reason === 1 || reason === 2) out.rain = { on: reason === 1 };
         return;
       }
-      case 0x2D: { // Open Window：uByte id + string type + string title + uByte slots (+bool horse)
-        r.u8(); r.string(); r.string(); r.u8();
+      case 0x2D: { out.winOpen = { id: r.u8(), type: r.string(), title: r.string(), slots: r.u8() }; return; }
+      case 0x2F: { const id = r.i8(), slot = r.i16(); out.wslot = { id, slot, item: readSlot(r) }; return; }
+      case 0x30: {
+        const id = r.i8(), n = r.i16(), items = [];
+        for (let i = 0; i < n; i++) items.push(readSlot(r));
+        out.winItems = { id, items };
         return;
       }
-      case 0x2F: { // Set Slot：byte win + short slot + short item + (item>=0: byte count + short dmg + nbt)
-        r.i8(); r.i16(); const it = r.i16();
-        if (it >= 0) { r.i8(); r.i16(); if (r.u8() === 1) skipNbt(r); }
-        return;
-      }
-      case 0x30: { // Window Items：byte win + short count + slots（每个可能带 NBT）
-        r.i8();
-        const n = r.i16();
-        for (let i = 0; i < n; i++) {
-          const it = r.i16();
-          if (it >= 0) { r.i8(); r.i16(); if (r.u8() === 1) skipNbt(r); }
-        }
-        return;
-      }
-      case 0x31: { r.u8(); r.i16(); r.i16(); return; }                                // Window Property
+      case 0x31: { out.winProp = { id: r.u8(), k: r.i16(), v: r.i16() }; return; }
       case 0x32: { r.u8(); r.i16(); r.bool(); return; }                               // Confirm Transaction
-      case 0x33: { r.i64(); r.string(); r.string(); r.string(); r.string(); return; } // Update Sign
+      case 0x33: { // Update Sign：坐标也是 PHPMC 布局
+        const [bx, by, bz] = unpackPos(r.raw(8).readBigInt64BE(0));
+        out.sign = { x: bx, y: by, z: bz, lines: [r.string(), r.string(), r.string(), r.string()] };
+        return;
+      }
       case 0x35: { // Update Tile Entity：packedPos(long) + uByte action + NBT blob（1.8 无 present 字节）
         if (!global.__teDumped) {
           global.__teDumped = true;
@@ -438,29 +465,47 @@ const MC = {
   },
 };
 
+// Slot Data：short id(-1=空) + byte count + short dmg + byte nbtPresent(+NBT)
+function readSlot(r) {
+  const id = r.i16();
+  if (id < 0) return null;
+  const count = r.i8(), dmg = r.i16();
+  const flag = r.u8();
+  if (flag === 0x0A) { r.o -= 1; skipNbt(r); } // PHPMC slotBytes：直接写 NBT 根标签，没有 present 字节
+  else if (flag === 1) skipNbt(r);              // 标准 1.8：present=1 + NBT 根标签
+  // 0x00 = 无 NBT。少跳 NBT 会让后面所有槽位错位，快捷栏记账就成 0（放置被服务端拒）
+  return { id, count, dmg };
+}
+function slotToClient(s) { return s ? { n: MC_ITEM_NAMES[s.id] || 'stone', c: s.count, d: s.dmg } : null; }
 // metadata（watch：byte 类型<<5|索引 + 值，0x00 结尾）——按 1.8 标准
-function skipMetadata(r) {
+function skipMetadata(r) { scanMetadata(r, () => {}); }
+function scanMetadata(r, onEntry) {
   for (;;) {
     const h = r.u8();
     if (h === 0x7F) return; // 1.8 结束符（文档 §4.0）；0x00 是 index0/type0 的合法条目
-    const type = (h >> 5) & 7;
+    const type = (h >> 5) & 7, idx = h & 0x1F;
+    let v = null;
     switch (type) {
-      case 0: r.i8(); break;
-      case 1: r.i16(); break;
-      case 2: r.i32(); break;
-      case 3: r.f32(); break;
-      case 4: r.string(); break;
-      case 5: r.i16(); r.i8(); r.i16(); if (r.u8() === 1) skipNbt(r); break; // item（可带 NBT）
-      case 6: r.i32(); r.i32(); r.i32(); break;
-      case 7: r.f32(); r.f32(); r.f32(); break;
+      case 0: v = r.i8(); break;
+      case 1: v = r.i16(); break;
+      case 2: v = r.i32(); break;
+      case 3: v = r.f32(); break;
+      case 4: v = r.string(); break;
+      case 5: v = readSlot(r); break;   // 掉落物的物品栈在 index 10
+      case 6: v = [r.i32(), r.i32(), r.i32()]; break;
+      case 7: v = [r.f32(), r.f32(), r.f32()]; break;
       default: throw new Error('metadata 未知类型 ' + type);
     }
+    onEntry(idx, type, v);
   }
 }
 // NBT 跳过（PHPMC Nbt::write：named root = type + u16 名长 + 名字 + entries + 0x00）
+// 坑：绝不能写 `r.o += r.u16()` —— += 先取旧 r.o，u16() 又推进 2 字节，赋值会把那 2 字节抹掉，
+// 名字长度永远少跳 2 字节，0x35 每次都剩下一堆字节（v2.0.0 端到端实测抓到）。
 function skipNbt(r) {
   const t = r.u8();
-  r.o += r.u16(); // 跳过根标签的名字
+  const nameLen = r.u16();
+  r.o += nameLen;
   skipNbtPayload(r, t);
 }
 function skipNbtPayload(r, typeId) {
@@ -475,7 +520,7 @@ function skipNbtPayload(r, typeId) {
     case 7: { const n = r.i32(); r.o += n; break; }
     case 8: { const n = r.u16(); r.o += n; break; }
     case 9: { const it = r.u8(); const n = r.i32(); for (let i = 0; i < n; i++) skipNbtPayload(r, it); break; }
-    case 10: { for (;;) { const t2 = r.u8(); if (t2 === 0) break; r.o += r.u16(); skipNbtPayload(r, t2); } break; }
+    case 10: { for (;;) { const t2 = r.u8(); if (t2 === 0) break; const nl = r.u16(); r.o += nl; skipNbtPayload(r, t2); } break; }
     case 11: { const n = r.i32(); r.o += n * 4; break; }
     case 12: { const n = r.i32(); r.o += n * 8; break; }
     default: throw new Error('NBT 未知类型 ' + typeId);
@@ -493,13 +538,22 @@ let chatLines = [];
 const entPos = new Map();      // eid -> {x, y, z, yawDeg, pitchDeg}
 const playerNames = new Map(); // uuidHex -> name（0x38 action=0）
 function uuidHex(buf) { return buf.toString('hex'); }
-// MC 实体 type id（1.8）-> OpusMC NET_MOBS 名字；不在表里的 spawn 客户端会自动忽略
-const MC_MOBS = {
-  90: 'pig', 91: 'sheep', 92: 'cow', 93: 'chicken', 54: 'zombie', 51: 'skeleton',
-  50: 'creeper', 52: 'spider', 58: 'enderman', 61: 'blaze', 56: 'ghast',
-  57: 'zombified_piglin', 62: 'magma_cube', 120: 'villager', 99: 'iron_golem',
-  95: 'wolf', 96: 'cat', 98: 'ocelot', 100: 'horse', 31: 'horse',
+// MC_MOBS 已移到 ./chunk-format.mjs（按 1.8 真实 type id 校正，去掉客户端不支持的项）
+const WINDOW_KIND = {
+  'minecraft:chest': 'generic_9x3', 'minecraft:crafting_table': 'crafting',
+  'minecraft:furnace': 'furnace', 'minecraft:anvil': 'anvil',
+  'minecraft:brewing_stand': 'brewing_stand', 'minecraft:enchanting_table': 'enchanting_table',
+  'minecraft:dispenser': 'generic_9x3', 'minecraft:hopper': 'hopper',
 };
+const hotbar = new Array(9).fill(0); // 0x30/0x2F 里的 36..44 槽 -> 物品 id（0x08 放置要用）
+let heldSlot = 0, clickAction = 0;
+function recordHotbar(items, startSlot) {
+  for (let i = 0; i < items.length; i++) {
+    const s = startSlot + i;
+    if (s >= 36 && s < 45) hotbar[s - 36] = items[i] ? items[i].id : 0;
+  }
+}
+function heldItemId() { return hotbar[heldSlot] || 0; }
 
 function toClient(o) { if (client) client.sendText(o); }
 function toMc(buf) { if (mc) mc.sendBinary(buf); }
@@ -532,24 +586,61 @@ function mcToClient(id, r) {
   if (out.players) toClient({ t: 'players', list: out.players });
   if (out.spawn) toClient(Object.assign({ t: 'spawn' }, out.spawn));
   if (out.equip) toClient({ t: 'equip', id: out.equip.id, item: out.equip.item });
+  if (out.entityMeta && out.entityMeta.item) {
+    log(`掉落物 0x1C：eid=${out.entityMeta.id} item=${JSON.stringify(slotToClient(out.entityMeta.item))}`);
+    toClient({ t: 'meta', id: out.entityMeta.id, item: slotToClient(out.entityMeta.item) });
+  }
+  if (out.collect) toClient({ t: 'collect', id: out.collect.id, by: out.collect.by });
   if (out.remove) toClient({ t: 'remove', ids: out.remove });
   if (out.move) toClient(Object.assign({ t: 'move' }, out.move));
   if (out.head) toClient({ t: 'head', id: out.head.id, yaw: out.head.yaw });
   if (out.hurt) toClient({ t: 'hurt', id: out.hurt.id });
   if (out.anim) toClient({ t: 'anim', id: out.anim.id, a: out.anim.a });
   if (out.rain) toClient({ t: 'rain', on: out.rain.on });
-  if (out.respawn) { toClient({ t: 'respawn', dim: out.respawn.dim, minY: 0, mode: mcModeName }); log('维度切换：' + out.respawn.dim); }
+  if (out.respawn) {
+    // PHPMC 每 0.5s 比对坐标带，边界抖动会反复发 0x07；respawn 会清整个世界重建，
+    // 重复发就是「切维度特别慢」的主因。只在维度真变化时才转发。
+    if (out.respawn.dim === lastDim) log(`维度未变化(${lastDim})，跳过重复 respawn`);
+    else { lastDim = out.respawn.dim; toClient({ t: 'respawn', dim: out.respawn.dim, minY: 0, mode: mcModeName }); log('维度切换：' + out.respawn.dim); }
+  }
   if (out.health) toClient({ t: 'health', hp: out.health.hp, food: out.health.food, sat: out.health.sat });
   if (out.posLook) toClient({ t: 'pos', x: out.posLook.x, y: out.posLook.y, z: out.posLook.z, yaw: out.posLook.yaw, pitch: out.posLook.pitch });
   if (out.chunk) {
-    mcChunks++;
-    try {
-      const bin = chunkToOpus(out.chunk.cx, out.chunk.cz, out.chunk.mask, out.chunk.data);
-      if (client) client.sendBinary(bin);
-      if (mcChunks % 25 === 1) log(`区块已翻译下发 ${mcChunks}（${out.chunk.cx},${out.chunk.cz} ${bin.length}B）`);
-    } catch (e) { log(`区块翻译失败 ${out.chunk.cx},${out.chunk.cz}: ${e.message}`); }
+    if (out.chunk.mask === 0 && out.chunk.groundUp) {
+      toClient({ t: 'unload', cx: out.chunk.cx, cz: out.chunk.cz });
+    } else if (out.chunk.groundUp === false) {
+      // OpusMC type=1 会整块重建；增量段直接下发会抹掉其它段。
+      // PHPMC 的 ENABLE_SECTION_RESEND=false，正常走不到；真出现了记日志，别静默毁地形。
+      log(`⚠ 增量区块 (${out.chunk.cx},${out.chunk.cz}) mask=0x${out.chunk.mask.toString(16)} 已跳过（需要段缓存合并）`);
+    } else {
+      mcChunks++;
+      try {
+        const bin = chunkToOpus(out.chunk.cx, out.chunk.cz, out.chunk.mask, out.chunk.data, out.chunk.groundUp);
+        if (client) client.sendBinary(bin);
+        if (mcChunks % 25 === 1) log(`区块已翻译下发 ${mcChunks}（${out.chunk.cx},${out.chunk.cz} ${bin.length}B）`);
+      } catch (e) { log(`区块翻译失败 ${out.chunk.cx},${out.chunk.cz}: ${e.message}`); }
+    }
   }
-  if (out.kick) { toClient({ t: 'kick', reason: flattenChat(safeJson(out.kick)) }); log('PHPMC 断开: ' + out.kick); }
+  if (out.winOpen) {
+    // safeJson() 已经返回字符串；再套 flattenChat 会把标题洗成空串（GUI 只显示「暂不完整支持」）
+    const kind = out.winOpen.type === 'minecraft:chest'
+      ? (out.winOpen.slots > 27 ? 'generic_9x6' : 'generic_9x3')
+      : (WINDOW_KIND[out.winOpen.type] || 'generic_9x3');
+    log(`窗口 0x2D：id=${out.winOpen.id} type=${out.winOpen.type} -> ${kind} slots=${out.winOpen.slots} title="${safeJson(out.winOpen.title)}"`);
+    toClient({ t: 'open', id: out.winOpen.id, kind, n: out.winOpen.slots, title: safeJson(out.winOpen.title) });
+  }
+  if (out.winItems) {
+    if (out.winItems.id === 0) recordHotbar(out.winItems.items, 0);
+    log(`窗口 0x30：id=${out.winItems.id} 槽位=${out.winItems.items.length}`);
+    toClient({ t: 'win', id: out.winItems.id, items: out.winItems.items.map(slotToClient), carried: null });
+  }
+  if (out.wslot) {
+    if (out.wslot.id === 0) recordHotbar([out.wslot.item], out.wslot.slot);
+    toClient({ t: 'wslot', id: out.wslot.id, i: out.wslot.slot, item: slotToClient(out.wslot.item) });
+  }
+  if (out.winProp) toClient({ t: 'prop', id: out.winProp.id, k: out.winProp.k, v: out.winProp.v });
+  if (out.sign) toClient({ t: 'signs', list: [[out.sign.x, out.sign.y, out.sign.z, out.sign.lines]] });
+  if (out.kick) { toClient({ t: 'kick', reason: safeJson(out.kick) }); log('PHPMC 断开: ' + out.kick); }
 }
 let r_i64_cache = { dayTime: 1000 };
 setInterval(() => {
@@ -557,6 +648,7 @@ setInterval(() => {
 }, 10000);
 let mcChunks = 0;
 let mcModeName = 'survival';
+let lastDim = 'overworld';
 function flattenChat(j) {
   let s = j.text || '';
   if (Array.isArray(j.extra)) for (const ex of j.extra) s += flattenChat(ex);
@@ -585,10 +677,30 @@ function clientToMc(o) {
       break;
     }
     case 'drop': toMc(MC.dig(o.all ? 3 : 4, 0, 0, 0, 0)); break;             // 丢物品：status 3 整组 / 4 单个
-    case 'held': break;   // PHPMC 无 0x09（服务端自行记账），跳过
-    case 'settings': break; // rd 视距，M3 用于限制区块请求范围
+    case 'held': heldSlot = Math.max(0, Math.min(8, o.slot | 0)); toMc(MC.held(heldSlot)); break;
+    case 'swing': toMc(MC.swing()); break;
+    case 'place': { // 0x08：客户端不带物品名，用 0x30/0x2F 记下的快捷栏
+      const cx = Math.round((o.cx ?? 0.5) * 15), cy = Math.round((o.cy ?? 0.5) * 15), cz = Math.round((o.cz ?? 0.5) * 15);
+      const fallback = o.item && MC_ITEM_IDS.get(String(o.item));
+      const item = heldItemId() || fallback || 0;
+      log(`放置 0x08：@${o.x | 0},${o.y | 0},${o.z | 0} face=${o.face | 0} 物品=${item}（客户端=${o.item || '-'} 兜底=${fallback || '-'} hotbar=[${hotbar.join(',')}]）`);
+      toMc(MC.place(o.x | 0, o.y | 0, o.z | 0, o.face | 0, item, cx, cy, cz));
+      break;
+    }
+    case 'use': toMc(MC.useItem(heldItemId())); break;
+    case 'click': {
+      const pkt = MC.click(o.id | 0, o.slot | 0, o.button | 0, ++clickAction, o.mode | 0, o.carried);
+      toMc(pkt);
+      log(`点击 0x0E：win=${o.id} slot=${o.slot} mode=${o.mode} 字节=${pkt.length}`);
+      break;
+    }
+    case 'settings': break; // rd 视距
+    case 'attack': toMc(MC.useEntity(o.id | 0, 1)); break;                 // 0x02 攻击
+    case 'interact': toMc(MC.useEntity(o.id | 0, 2, o.x || 0, o.y || 0, o.z || 0)); break;
+    case 'wclose': toMc(MC.closeWindow(o.id | 0)); break;                    // 0x0D Close Window
+    case 'button': toMc(MC.click(o.id | 0, o.b | 0, 0, ++clickAction, 0, null)); break;
     case 'tpok': break;     // 1.8 无 teleport confirm
-    case 'click': case 'creative': case 'trade': case 'sign': break;         // 容器/创造/交易：M3
+    case 'creative': case 'trade': case 'sign': break;
     case 'error': break;
     default: break;
   }
@@ -604,20 +716,25 @@ const server = net.createServer((socket) => {
   client.onMessage((payload) => {
     let m;
     try { m = JSON.parse(payload.toString('utf8')); } catch (e) { return; }
-    if (m.t === 'hello') {
-      playerName = String(m.name || 'WebPlayer').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16) || 'WebPlayer';
-      log(`hello：玩家 ${playerName}（proto=${m.proto || '?'} rd=${m.rd || '?'}）—— 连接 PHPMC`);
-      connectMc(playerName);
-      return;
+    try {
+      if (m.t === 'hello') {
+        playerName = String(m.name || 'WebPlayer').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16) || 'WebPlayer';
+        log(`hello：玩家 ${playerName}（proto=${m.proto || '?'} rd=${m.rd || '?'}）—— 连接 PHPMC`);
+        connectMc(playerName);
+        return;
+      }
+      if (m.t === 'tick') { lastTick = m; clientToMc(m); return; }
+      clientToMc(m);
+    } catch (e) {
+      // 客户端消息里任何一个字段缺失都不该让整个中转 exit（v2.2.0：容器点击崩溃的根因）
+      log(`⚠ 客户端消息 ${m && m.t} 处理异常（已忽略，进程继续）: ${e.stack || e.message}`);
     }
-    if (m.t === 'tick') { lastTick = m; clientToMc(m); return; }
-    clientToMc(m);
   });
   client.onClose(() => { log('OpusMC 客户端断开'); client = null; if (mc) mc.close(); mc = null; mcState = 'idle'; });
 });
 let lastTick = null;
 
-server.listen(CLIENT_PORT, () => log(`中转就绪：OpusMC「直接连接」填 ws://localhost:${CLIENT_PORT} → PHPMC ${MC_SECURE ? 'wss' : 'ws'}://${MC_HOST}:${MC_PORT}`));
+server.listen(CLIENT_PORT, () => log(`[mc-proxy v${VERSION}] 中转就绪：OpusMC「直接连接」填 ws://localhost:${CLIENT_PORT} → PHPMC ${MC_SECURE ? 'wss' : 'ws'}://${MC_HOST}:${MC_PORT}`));
 
 // 连接 PHPMC（登录链路：握手 → LoginStart → Play）
 function connectMc(name = 'WebPlayer') {
@@ -628,7 +745,7 @@ function connectMc(name = 'WebPlayer') {
     // 先把方块状态表（4096 项）与群系表发给客户端——客户端 mapVanillaStateNear 自己映射
     toClient({ t: 'states', list: BLOCK_NAMES });
     toClient({ t: 'biomes', list: BIOME_NAMES });
-    log('wss 通道已建立，发送 states/biomes + 握手 + 登录');
+    log(`wss 通道已建立 v${VERSION}：发送 states/biomes + 握手 + 登录`);
     toMc(MC.handshake(MC_HOST, MC_PORT));
     toMc(MC.loginStart(name));
     mcState = 'login';
@@ -687,161 +804,4 @@ function drainMc() {
 }
 
 
-// ============================ M2：1.8 区块 → OpusMC chunk type 1 ============================
-// 客户端（net.js onBinary）：[u8 type=1][i32 cx LE][i32 cz LE][u8 n] 每段：
-//   [u16 paletteLen LE][u16 raw...]（raw = states 消息 list 的下标 = (id<<4)|meta，客户端 map[raw]，palette[0] 应为空气）
-//   [u8 索引×4096 或 u16×4096（paletteLen>256 时）]
-//   [u8 flags（bit0 有 sky / bit1 有 block）][sky 2048 nibble][block 2048 nibble]
-// 最后 [u8 biomes × 256]
-const WOOL = ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
-  'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black'];
-const WOODS = ['oak', 'spruce', 'birch', 'jungle', 'acacia', 'dark_oak'];
-// 1.8 方块 id → vanilla 名（states 消息的 4096 项表，下标 = (id<<4)|meta）
-const BLOCK_NAMES = (() => {
-  const a = new Array(4096).fill('minecraft:air');
-  const base = {
-    1: 'stone', 2: 'grass_block', 3: 'dirt', 4: 'cobblestone', 5: 'oak_planks', 7: 'bedrock',
-    8: 'water', 9: 'water', 10: 'lava', 11: 'lava', 12: 'sand', 13: 'gravel',
-    14: 'gold_ore', 15: 'iron_ore', 16: 'coal_ore', 17: 'oak_log', 18: 'oak_leaves',
-    20: 'glass', 24: 'sandstone', 35: 'white_wool', 41: 'gold_block', 42: 'iron_block',
-    45: 'bricks', 46: 'tnt', 47: 'bookshelf', 48: 'mossy_cobblestone', 49: 'obsidian',
-    50: 'torch', 53: 'oak_stairs', 54: 'chest', 56: 'diamond_ore', 57: 'diamond_block',
-    58: 'crafting_table', 61: 'furnace', 65: 'ladder', 66: 'rail', 67: 'cobblestone_stairs',
-    73: 'redstone_ore', 79: 'ice', 80: 'snow_block', 81: 'cactus', 82: 'clay',
-    85: 'oak_fence', 86: 'pumpkin', 87: 'netherrack', 88: 'soul_sand', 89: 'glowstone',
-    98: 'stone_bricks', 101: 'iron_bars', 102: 'glass_pane', 103: 'melon', 106: 'vine',
-    110: 'mycelium', 112: 'nether_bricks', 121: 'end_stone', 129: 'emerald_ore',
-    133: 'emerald_block', 152: 'quartz_ore', 155: 'quartz_block', 159: 'white_stained_glass',
-    161: 'oak_leaves', 162: 'oak_log', 165: 'slime_block', 168: 'prismarine',
-    169: 'sea_lantern', 170: 'hay_block', 172: 'terracotta', 173: 'coal_block',
-    174: 'packed_ice', 179: 'red_sandstone', 201: 'purpur_block', 206: 'end_stone_bricks',
-    26: 'bed', 30: 'cobweb', 31: 'short_grass', 32: 'dead_bush', 37: 'dandelion',
-    38: 'poppy', 39: 'brown_mushroom', 40: 'red_mushroom', 51: 'fire', 52: 'spawner',
-    55: 'redstone_wire', 59: 'wheat', 60: 'farmland', 63: 'oak_sign', 68: 'oak_wall_sign',
-    70: 'stone_button', 71: 'iron_door', 64: 'oak_door', 72: 'stone_button', 77: 'oak_button',
-    92: 'cake', 93: 'repeater', 94: 'repeater', 104: 'pumpkin_stem', 105: 'melon_stem',
-    125: 'oak_slab', 127: 'cocoa', 137: 'command_block', 144: 'skeleton_skull',
-    158: 'powered_rail', 27: 'powered_rail', 28: 'detector_rail',
-    178: 'comparator',
-    74: 'redstone_ore', 75: 'redstone_torch', 76: 'redstone_torch', 78: 'snow',
-    83: 'sugar_cane', 84: 'jukebox', 90: 'nether_portal', 91: 'jack_o_lantern', 96: 'oak_trapdoor',
-    97: 'infested_stone', 99: 'brown_mushroom_block', 100: 'red_mushroom_block',
-    107: 'oak_fence_gate', 108: 'brick_stairs', 109: 'stone_brick_stairs', 111: 'lily_pad',
-    113: 'nether_brick_fence', 114: 'nether_brick_stairs', 115: 'nether_wart',
-    116: 'enchanting_table', 117: 'brewing_stand', 118: 'cauldron', 119: 'end_portal',
-    120: 'end_portal_frame', 122: 'dragon_egg', 123: 'redstone_lamp', 124: 'redstone_lamp',
-    126: 'oak_slab', 128: 'sandstone_stairs', 130: 'ender_chest', 131: 'tripwire_hook',
-    132: 'tripwire', 134: 'spruce_stairs', 135: 'birch_stairs', 136: 'jungle_stairs',
-    138: 'beacon', 139: 'cobblestone_wall', 140: 'flower_pot', 141: 'carrots', 142: 'potatoes',
-    143: 'oak_button', 145: 'anvil', 146: 'trapped_chest', 147: 'light_weighted_pressure_plate',
-    148: 'heavy_weighted_pressure_plate', 149: 'comparator', 151: 'redstone_block',
-    153: 'hopper', 154: 'quartz_block', 156: 'activator_rail', 157: 'dropper',
-    166: 'barrier', 167: 'iron_trapdoor', 175: 'sunflower', 176: 'white_banner',
-    177: 'white_wall_banner', 180: 'red_sandstone_stairs', 182: 'red_sandstone_slab',
-    183: 'spruce_fence_gate', 184: 'birch_fence_gate', 185: 'jungle_fence_gate',
-    186: 'dark_oak_fence_gate', 187: 'acacia_fence_gate', 188: 'spruce_fence',
-    189: 'birch_fence', 190: 'jungle_fence', 191: 'dark_oak_fence', 192: 'acacia_fence',
-    193: 'spruce_door', 194: 'birch_door', 195: 'jungle_door', 196: 'acacia_door',
-    197: 'dark_oak_door', 198: 'end_rod', 199: 'chorus_plant', 200: 'chorus_flower',
-    202: 'purpur_pillar', 203: 'purpur_stairs', 204: 'purpur_slab', 205: 'purpur_slab',
-    207: 'beetroots', 208: 'dirt_path', 209: 'end_gateway', 210: 'repeating_command_block',
-    211: 'chain_command_block', 212: 'frosted_ice', 213: 'magenta_glazed_terracotta',
-    214: 'white_glazed_terracotta', 215: 'orange_glazed_terracotta',
-    216: 'yellow_glazed_terracotta', 217: 'lime_glazed_terracotta',
-    218: 'pink_glazed_terracotta', 219: 'gray_glazed_terracotta',
-    220: 'light_gray_glazed_terracotta', 221: 'cyan_glazed_terracotta',
-    222: 'purple_glazed_terracotta', 223: 'blue_glazed_terracotta',
-    224: 'brown_glazed_terracotta', 225: 'green_glazed_terracotta',
-    226: 'red_glazed_terracotta', 227: 'black_glazed_terracotta',
-  };
-  for (const [id, name] of Object.entries(base)) a[(+id) << 4] = 'minecraft:' + name;
-  for (let m = 0; m < 16; m++) {
-    a[(35 << 4) | m] = 'minecraft:' + WOOL[m] + '_wool';
-    a[(95 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass';
-    a[(160 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass_pane';
-    a[(171 << 4) | m] = 'minecraft:' + WOOL[m] + '_carpet';
-    a[(159 << 4) | m] = 'minecraft:' + WOOL[m] + '_terracotta';       // 1.8 染色陶瓦
-    a[(228 << 4) | m] = 'minecraft:' + WOOL[m] + '_concrete';
-    a[(229 << 4) | m] = 'minecraft:' + WOOL[m] + '_concrete_powder';
-    a[(230 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass';    // 230/231 旧表误置，覆盖为玻璃
-    a[(231 << 4) | m] = 'minecraft:' + WOOL[m] + '_stained_glass_pane';
-  }
-  for (let m = 0; m < 6; m++) {
-    a[(5 << 4) | m] = 'minecraft:' + WOODS[m] + '_planks';
-    a[(17 << 4) | m] = 'minecraft:' + WOODS[Math.min(m, 3)] + '_log';
-    a[(162 << 4) | m] = m === 0 ? 'minecraft:acacia_log' : m === 1 ? 'minecraft:dark_oak_log' : 'minecraft:oak_log';
-    a[(126 << 4) | m] = 'minecraft:' + WOODS[m] + '_slab';
-    a[(6 << 4) | m] = 'minecraft:' + WOODS[m] + '_sapling';
-  }
-  for (let m = 0; m < 4; m++) a[(18 << 4) | m] = 'minecraft:' + ['oak','spruce','birch','jungle'][m] + '_leaves';
-  a[(161 << 4) | 0] = 'minecraft:acacia_leaves'; a[(161 << 4) | 1] = 'minecraft:dark_oak_leaves';
-  a[(31 << 4) | 0] = 'minecraft:dead_bush'; a[(31 << 4) | 1] = 'minecraft:short_grass'; a[(31 << 4) | 2] = 'minecraft:fern';
-  const FLOWERS = ['poppy','blue_orchid','allium','azure_bluet','red_tulip','orange_tulip','white_tulip','pink_tulip','oxeye_daisy'];
-  for (let m = 0; m < FLOWERS.length; m++) a[(38 << 4) | m] = 'minecraft:' + FLOWERS[m];
-  const SLAB_KINDS = ['stone','sandstone','oak','cobblestone','bricks','stone_brick','nether_brick','quartz'];
-  for (let m = 0; m < 8; m++) { a[(44 << 4) | m] = 'minecraft:' + SLAB_KINDS[m] + '_slab'; a[(43 << 4) | m] = 'minecraft:' + SLAB_KINDS[m] + '_slab'; }
-  a[(12 << 4) | 1] = 'minecraft:red_sand';
-  const STONES = ['stone','granite','polished_granite','diorite','polished_diorite','andesite','polished_andesite'];
-  for (let m = 0; m < 7; m++) a[(1 << 4) | m] = 'minecraft:' + STONES[m];
-  a[(3 << 4) | 1] = 'minecraft:coarse_dirt'; a[(3 << 4) | 2] = 'minecraft:podzol';
-  a[(24 << 4) | 1] = 'minecraft:chiseled_sandstone'; a[(24 << 4) | 2] = 'minecraft:cut_sandstone';
-  a[(98 << 4) | 1] = 'minecraft:mossy_stone_bricks'; a[(98 << 4) | 2] = 'minecraft:cracked_stone_bricks'; a[(98 << 4) | 3] = 'minecraft:chiseled_stone_bricks';
-  const DP = ['sunflower','lilac','tall_grass','large_fern','rose_bush','peony'];
-  for (let m = 0; m < 6; m++) a[(175 << 4) | m] = 'minecraft:' + DP[m];
-  a[(21 << 4) | 0] = 'minecraft:lapis_ore'; a[(22 << 4) | 0] = 'minecraft:lapis_block';
-  a[(23 << 4) | 0] = 'minecraft:dispenser'; a[(25 << 4) | 0] = 'minecraft:note_block';
-  a[(29 << 4) | 0] = 'minecraft:sticky_piston'; a[(33 << 4) | 0] = 'minecraft:piston'; a[(34 << 4) | 0] = 'minecraft:piston_head';
-  a[(69 << 4) | 0] = 'minecraft:lever'; a[(178 << 4) | 0] = 'minecraft:daylight_detector';
-  return a;
-})();
-// MC 1.8 物品 id -> vanilla 名（手持 equip 用；1-255 复用方块名，256+ 工具/物品）
-const MC_ITEM_NAMES = (() => {
-  const m = {};
-  for (let id = 1; id < 256; id++) if (BLOCK_NAMES[id << 4] !== 'minecraft:air') m[id] = BLOCK_NAMES[id << 4].slice(10);
-  const tools = { 256:'iron_shovel',257:'iron_pickaxe',258:'iron_axe',259:'flint_and_steel',260:'apple',261:'bow',262:'arrow',263:'coal',264:'diamond',265:'iron_ingot',266:'gold_ingot',267:'iron_sword',268:'wooden_sword',269:'wooden_shovel',270:'wooden_pickaxe',271:'wooden_axe',272:'stone_sword',273:'stone_shovel',274:'stone_pickaxe',275:'stone_axe',276:'diamond_sword',277:'diamond_shovel',278:'diamond_pickaxe',279:'diamond_axe',280:'stick',281:'bowl',282:'mushroom_stew',283:'golden_sword',284:'golden_shovel',285:'golden_pickaxe',286:'golden_axe',287:'string',288:'feather',289:'gunpowder',290:'wooden_hoe',291:'stone_hoe',292:'iron_hoe',293:'diamond_hoe',294:'golden_hoe',295:'wheat_seeds',296:'wheat',297:'bread',306:'iron_helmet',307:'iron_chestplate',308:'iron_leggings',309:'iron_boots',310:'diamond_helmet',311:'diamond_chestplate',312:'diamond_leggings',313:'diamond_boots',318:'flint',319:'porkchop',320:'cooked_porkchop',322:'golden_apple',324:'oak_door',325:'bucket',326:'water_bucket',327:'lava_bucket',328:'minecart',329:'saddle',331:'redstone',332:'snowball',333:'oak_boat',334:'leather',335:'milk_bucket',336:'brick',337:'clay_ball',338:'sugar_cane',339:'paper',340:'book',341:'slime_ball',344:'egg',345:'compass',346:'fishing_rod',347:'clock',348:'glowstone_dust',352:'bone',353:'sugar',355:'bed',356:'repeater',357:'cookie',359:'shears',360:'melon_slice',361:'pumpkin_seeds',362:'melon_seeds',364:'cooked_beef',365:'chicken',366:'cooked_chicken',367:'rotten_flesh',368:'ender_pearl',369:'blaze_rod',371:'gold_nugget',372:'nether_wart',374:'glass_bottle',375:'spider_eye',377:'blaze_powder',378:'magma_cream',379:'brewing_stand',381:'ender_eye',384:'experience_bottle',388:'emerald',391:'carrot',392:'potato',393:'baked_potato',396:'golden_carrot',397:'skeleton_skull',398:'carrot_on_a_stick',399:'nether_star',400:'pumpkin_pie',404:'comparator',406:'quartz' };
-  Object.assign(m, tools);
-  return m;
-})();
-// 群系：全平原（M2 简化，地形颜色统一草原绿；1.8 群系细分后续加）
-const BIOME_NAMES = new Array(256).fill('minecraft:plains');
-
-// 1.8 区块（PHPMC：4096×u16 LE (id<<4)|meta，逐段 + 块光2048 + 天光2048，最后群系 256）
-function chunkToOpus(cx, cz, mask, data) {
-  const out = [Buffer.from([1, 0, 0, 0, 0, 0, 0, 0, 0, 0])];
-  out[0].writeInt32LE(cx, 1); out[0].writeInt32LE(cz, 5);
-  const sections = [];
-  let p = 0;
-  for (let s = 0; s < 16; s++) {
-    if (!(mask & (1 << s))) continue;
-    const palette = [0]; const palIdx = new Map(); const cells = new Uint8Array(4096);
-    for (let j = 0; j < 4096; j++) {
-      const v = data.readUInt16LE(p); p += 2;
-      const raw = (v >> 4 << 4) | (v & 15); // (id << 4) | meta —— v 本身就是这个编码
-      let ix = palIdx.get(v);
-      if (ix === undefined) { ix = palette.length; palette.push(v); palIdx.set(v, ix); }
-      cells[j] = ix;
-    }
-    const blockLight = data.subarray(p, p + 2048); p += 2048;
-    const skyLight = data.subarray(p, p + 2048); p += 2048;
-    sections.push({ palette, cells, blockLight, skyLight });
-  }
-  const biomes = data.subarray(p, p + 256);
-  out[0][9] = sections.length;
-  for (const sec of sections) {
-    const len = Buffer.alloc(2); len.writeUInt16LE(sec.palette.length);
-    const pal = Buffer.alloc(sec.palette.length * 2);
-    for (let i = 0; i < sec.palette.length; i++) pal.writeUInt16LE(sec.palette[i], i * 2);
-    // OpusMC 格式（net.js onBinary）：palette=1 的段不写索引数组（全段同方块）；>256 用 u16 索引
-    if (sec.palette.length === 1) {
-      out.push(len, pal, Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
-    } else if (sec.palette.length <= 256) {
-      out.push(len, pal, Buffer.from(sec.cells), Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
-    } else {
-      const wide = Buffer.alloc(4096 * 2);
-      for (let j = 0; j < 4096; j++) wide.writeUInt16LE(sec.cells[j], j * 2);
-      out.push(len, pal, wide, Buffer.from([3]), Buffer.from(sec.skyLight), Buffer.from(sec.blockLight));
-    }
-  }
-  out.push(biomes.length === 256 ? Buffer.from(biomes) : Buffer.alloc(256));
-  return Buffer.concat(out);
-}
+// v2.0.0：区块打包、方块/物品/生物名表已抽到 ./chunk-format.mjs

@@ -26,4 +26,4 @@ if errorlevel 1 (
   ping -n 3 127.0.0.1 >nul
 )
 
-start msedge "http://localhost:8777/game.html?rooms=https://xz.honghemc.cn:8443"
+start msedge "http://localhost:8777/game.html?rooms=http://localhost:8777"

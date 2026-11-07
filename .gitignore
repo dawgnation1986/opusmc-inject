@@ -19,3 +19,8 @@ Thumbs.db
 .DS_Store
 源码备份/
 mods/
+
+# 本地运行产物 / 项目记忆（不入库）
+.tmp-online/
+.workbuddy/
+nul
