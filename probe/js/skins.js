@@ -148,6 +148,9 @@ class WardrobeScreen extends FormScreen {
   // a sign-in reward not owned yet: to the sign-in card (checkin.js), else a line saying how
   toCheckin(id) {
     if (this.giftOf(id) && typeof NewsBoard !== 'undefined') { NewsBoard.open(this.game, this, false); return; }
+    const inf = typeof Cosmetics !== 'undefined' && Cosmetics.info(id);
+    if (inf && inf.go === 'mods' && typeof openModsScreen === 'function') { openModsScreen(this.game, this); return; }
+    if (inf && inf.how) { this.say(inf.how[0]); return; }
     if (typeof CheckinScreen !== 'undefined' && typeof Checkin !== 'undefined' && Checkin.shown()) this.game.ui.open(new CheckinScreen(this.game, this));
     else this.say('签到活动奖励：活动期间每天登录签到，累计签到就能领');
   }
@@ -157,6 +160,9 @@ class WardrobeScreen extends FormScreen {
   giftOf(id) { return !!id && typeof NewsBoard !== 'undefined' && (NewsBoard.list || []).some((x) => x.gift === id && !x.draft); }
   evHow(id) {
     if (this.giftOf(id)) return ['公告里的礼物', '点一下去领取'];
+    // (one given some other way - cosmetics.js LIST: how)
+    const inf = typeof Cosmetics !== 'undefined' && Cosmetics.info(id);
+    if (inf && inf.how) return inf.how;
     const st = typeof Checkin !== 'undefined' && Checkin.st, R = st && st.event && Array.isArray(st.event.rewards) ? st.event.rewards : [];
     const i = R.indexOf(id);
     return [i >= 0 ? '签到第 ' + (i + 1) + ' 天' : '签到活动奖励', ...(typeof Checkin !== 'undefined' && Checkin.shown() ? ['点一下去签到'] : [])];

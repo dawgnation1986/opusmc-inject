@@ -68,10 +68,49 @@ Game.prototype.drawFarmMob = function (e, ip, a, env, l) {
 };
 // mobs named Dinnerbone or Grumm are drawn upside down (vanilla's easter egg)
 function upsideDown(e, m) { if (e.customName === 'Dinnerbone' || e.customName === 'Grumm') { M4.translate(m, 0, e.h + 0.1, 0); M4.rotZ(m, Math.PI); } }
+
+// ---- babies of the old-style humanoids with vanilla's baby models (zombie_baby#main ... and their _baby textures); the
+// old model at half size was only a small adult - vanilla's babies have a big head and short limbs ----------------------
+const BABY_HUMANOID = {
+  zombie: { layer: 'zombie_baby#main', tex: () => 'entity/zombie/zombie_baby', zombie: true },
+  zombie_villager: { layer: 'zombie_villager_baby#main', tex: (e) => ['entity/zombie_villager/zombie_villager_baby', 'entity/zombie_villager/baby/' + (e.vtype || 'plains')], zombie: true },
+  zombified_piglin: { layer: 'zombified_piglin_baby#main', tex: () => 'entity/piglin/zombified_piglin_baby', zombie: true },
+  piglin: { layer: 'piglin_baby#main', tex: () => 'entity/piglin/piglin_baby' },
+};
+Game.prototype.drawBabyHumanoid = function (e, ip, a, env, l) {
+  const r = this.renderer, B = BABY_HUMANOID[e.type], md = EM.get(r, B.layer);
+  if (!md || e.invisible || (e.hasEffect && e.hasEffect('invisibility'))) return false; // (invisible: the old path, which keeps armour and items)
+  const t = B.tex(e), tex = typeof t === 'string' ? r.etex(t) : r.etexMix(t);
+  if (!tex) return true;
+  let m = M4.create();
+  if (e.displayMatrix) m = M4.copy(e.displayMatrix);
+  else { M4.translate(m, ip[0], ip[1], ip[2]); const by = e.prevBodyYaw !== undefined ? e.prevBodyYaw + angDelta(e.bodyYaw, e.prevBodyYaw) * a : e.bodyYaw; M4.rotY(m, by); }
+  if (e.deathTime > 0) M4.rotZ(m, Math.min(1, Math.sqrt((e.deathTime + a) / 20)) * Math.PI / 2);
+  upsideDown(e, m);
+  EM.reset(md); emHumanoid(md, e, a, { zombie: B.zombie });
+  // (vanilla PiglinModel ADMIRING_ITEM: head down, left arm up with the gold in the off hand)
+  const admire = e.type === 'piglin' && e.admire > 0, P = md.parts;
+  if (admire && P.head && P.left_arm) { P.head.xRot = 0.5; P.head.yRot = 0; P.left_arm.yRot = 0.5; P.left_arm.xRot = -0.9; }
+  const overlay = e.hurtTime > 0 || e.deathTime > 0 ? [1, 0, 0, 0.4] : null, lt = [l[0], e.fire > 0 ? 1 : l[1]];
+  // what it holds, as drawMob gives it (a server's mob: its own item)
+  const held = e.heldId != null ? e.heldId : e.type === 'zombified_piglin' ? item('golden_sword') : e.type === 'piglin' ? e.holding || null : null; // (vanilla baby piglins get no spawn weapon)
+  const st = held != null ? { id: held, count: 1, dmg: 0 } : null;
+  const att = st ? (admire ? { left_arm: (am) => this.drawHeldItem(am, st, true, lt, env, e, null) } : { right_arm: (am) => this.drawHeldItem(am, st, false, lt, env, e, null) }) : null;
+  r.drawEM(md, tex, m, lt, env, { overlay, attach: att });
+  if (e.armorItems && e.armorItems.some((s) => s)) drawVArmor(this, r, { layerKey: () => B.layer, armorItems: e.armorItems }, md, m, lt, env, overlay);
+  if (e.deathTime === 0 && !e.displayMatrix) {
+    const fx = Math.floor(ip[0]), fz = Math.floor(ip[2]);
+    let gy = Math.floor(ip[1] + 0.01);
+    for (let k = 0; k < 4 && gy > 0 && !SOLIDCUBE[this.world.getBlock(fx, gy - 1, fz)] && !BLOCKS[this.world.getBlock(fx, gy - 1, fz)].solid; k++) gy--;
+    const h = ip[1] - gy; if (h < 3) r.drawShadow(ip[0], gy, ip[2], e.w * 0.75 * (1 - h / 6), 0.55 * (1 - h / 3));
+  }
+  return true;
+};
 (() => {
   const _dm = Game.prototype.drawMob;
   Game.prototype.drawMob = function (e, ip, a, env, l) {
     if (!e.vm && FARM_SKIN[e.type] && e !== this.player && this.drawFarmMob(e, ip, a, env, l)) return;
+    if (!e.vm && e.baby && BABY_HUMANOID[e.type] && e !== this.player && this.drawBabyHumanoid(e, ip, a, env, l)) return;
     return _dm.call(this, e, ip, a, env, l);
   };
   const _pd = VMob.prototype.preDraw;
@@ -242,7 +281,9 @@ class LeashKnot extends Entity {
   loadData(o) { if (o && o.post) { this.post = o.post; this.pos = [o.post[0] + 0.5, o.post[1] + 0.375, o.post[2] + 0.5]; } }
   drawSelf(g, ip, a, env, l) {
     const r = g.renderer, md = EM.get(r, 'leash_knot#main'), tex = r.etex('entity/lead_knot/lead_knot'); if (!md || !tex) return;
-    EM.reset(md); const m = M4.create(); M4.translate(m, ip[0], ip[1] - 0.375 + 0.0625 * 0, ip[2]);
+    // (vanilla LeashKnotRenderer only turns the model over - the knot, -8..0 px, spans 0..0.5 above the entity at the post's
+    // y + 0.375; drawEM also drops a mob model by 1.501, taken back here: the knot hung over a block above the fence)
+    EM.reset(md); const m = M4.create(); M4.translate(m, ip[0], ip[1] - 1.501, ip[2]);
     r.drawEM(md, tex, m, l, env, {});
   }
 }
@@ -353,17 +394,31 @@ const MOB_BUCKET = { cod_bucket: 'cod', salmon_bucket: 'salmon', pufferfish_buck
 })();
 // powder snow: things sink into it and freeze (leather boots let players walk on it)
 (() => {
+  const FREEZE_IMMUNE = /^leather_(helmet|chestplate|leggings|boots|horse_armor)$/;
+  const isImmune = (s) => !!(s && ITEMS[s.id] && FREEZE_IMMUNE.test(ITEMS[s.id].key));
+  const wearsFreezeImmune = (e) => {
+    const a = e.inv ? e.inv.slots : e.armorItems, o = e.inv ? 36 : 0;
+    if (a) for (let i = o; i < o + 4; i++) if (isImmune(a[i])) return true;
+    return isImmune(e.armorItem);
+  };
   const _bt = Living.prototype.baseTick;
   Living.prototype.baseTick = function () {
     _bt.call(this);
     if (BID.powder_snow === undefined) return;
     const x = Math.floor(this.pos[0]), z = Math.floor(this.pos[2]);
-    const inSnow = this.world.getBlock(x, Math.floor(this.pos[1] + 0.1), z) === BID.powder_snow || this.world.getBlock(x, Math.floor(this.pos[1] + this.h * 0.8), z) === BID.powder_snow;
+    // (a noClip one - spectator, vex - isn't in the snow at all: vanilla isAffectedByBlocks)
+    const inSnow = !this.noClip && (this.world.getBlock(x, Math.floor(this.pos[1] + 0.1), z) === BID.powder_snow || this.world.getBlock(x, Math.floor(this.pos[1] + this.h * 0.8), z) === BID.powder_snow);
+    if (!inSnow && !(this.frozenT > 0)) return;
+    // canFreeze: not a spectator, not these types (freeze_immune_entity_types, and Skeleton.canFreeze), nor anyone with
+    // leather armor in any armor slot (FREEZE_IMMUNE_WEARABLES, horse armor included); whoever can't freeze thaws even
+    // in the snow and takes no freeze damage
+    const immune = this.spectator || /^(stray|polar_bear|snow_golem|wither|skeleton)$/.test(this.type) || wearsFreezeImmune(this);
     if (inSnow) {
       this.vel[0] *= 0.9; this.vel[2] *= 0.9; if (this.vel[1] < -0.05) this.vel[1] = -0.05; this.fallDist = 0;
-      if (!/^(stray|polar_bear|snow_golem|wither|skeleton_horse|wither_skeleton)$/.test(this.type) && !(this.inv && this.inv.slots[36] && ITEMS[this.inv.slots[36].id].key === 'leather_boots')) this.frozenT = Math.min(140, (this.frozenT || 0) + 1);
+      if (!immune) this.frozenT = Math.min(140, (this.frozenT || 0) + 1);
       if (this.jumpHeld) this.vel[1] = 0.1;
-    } else if (this.frozenT > 0) this.frozenT = Math.max(0, this.frozenT - 2);
-    if (this.frozenT >= 140 && this.age % 40 === 0) this.hurt(this.type === 'blaze' || this.type === 'strider' || this.type === 'magma_cube' ? 5 : 1, { type: 'freeze' });
+    }
+    if ((!inSnow || immune) && this.frozenT > 0) this.frozenT = Math.max(0, this.frozenT - 2);
+    if (!immune && this.frozenT >= 140 && this.age % 40 === 0) this.hurt(this.type === 'blaze' || this.type === 'strider' || this.type === 'magma_cube' ? 5 : 1, { type: 'freeze' });
   };
 })();

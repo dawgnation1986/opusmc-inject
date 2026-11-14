@@ -124,6 +124,24 @@ function lootCond(c, ctx) {
   return false;
 }
 const condsOk = (o, ctx) => !o.conditions || o.conditions.every(c => lootCond(c, ctx));
+// a loot table's enchant_with_levels (the enchanting table's choice at that level, its primary items) and
+// enchant_randomly (one enchantment of those that fit, at a random level); a book becomes an enchanted book.
+// options: the #on_random_loot tag (all but the treasure ones, less curses, frost walker and mending) or a list
+const LOOT_TREASURE = new Set(['binding_curse', 'vanishing_curse', 'frost_walker', 'mending']);
+function lootEnchant(st, fn, f) {
+  const o = f.options, keys = o && (typeof o !== 'string' || o[0] !== '#') ? new Set([].concat(o).map(k => String(k).replace('minecraft:', ''))) : null;
+  const ok = (E) => keys ? keys.has(E.key) : !E.treasure || LOOT_TREASURE.has(E.key), book = ITEMS[st.id].key === 'book';
+  let list;
+  if (fn === 'enchant_with_levels') list = selectEnchants(new JRandom((Math.random() * 2 ** 31) | 0), st.id, Math.max(0, lootInt(f.levels)), ok);
+  else {
+    const can = ENCH_LIST.filter(E => ok(E) && (book || E.sup.has(st.id)));
+    if (!can.length) return;
+    const E = can[(Math.random() * can.length) | 0]; list = [[E.key, 1 + ((Math.random() * E.max) | 0)]];
+  }
+  if (!list.length) return;
+  if (book) st.id = ITEM_KEY.enchanted_book;
+  st.e = list;
+}
 function lootEntry(en, ctx, out) {
   const t = en.type.replace('minecraft:', '');
   if (t === 'empty') return;
@@ -143,6 +161,9 @@ function lootEntry(en, ctx, out) {
     else if (fn === 'furnace_smelt') { const r = COOKING.smelting && COOKING.smelting[st.id]; if (r) st.id = r.result; }
     else if (fn === 'set_potion') st.pot = String(f.id).replace('minecraft:', '');
     else if (fn === 'set_ominous_bottle_amplifier') { const a = f.amplifier; st.amp = a && /uniform/.test(a.type || '') ? randInt(lootNum(a.min), lootNum(a.max)) : Math.floor(lootNum(a)); }
+    // worn and enchanted: a fished bow or boots came whole and plain (players' feedback 2026-11)
+    else if (fn === 'set_damage') { const d = ITEMS[st.id].durability; if (d) st.dmg = clamp(Math.floor((1 - lootNum(f.damage)) * d), 0, d - 1); }
+    else if ((fn === 'enchant_with_levels' || fn === 'enchant_randomly') && typeof selectEnchants === 'function') lootEnchant(st, fn, f);
   }
   n = Math.floor(n);
   if (n <= 0) return;
@@ -437,7 +458,7 @@ class VMob extends Mob {
     }
     if (this.inWater && !D.sinks && (this.vel[1] < 0.02 || this.collidedH)) c.jump = true;
     if (this.inLava && this.T.fireproof && D.lavaWalker) c.jump = true;
-    if (c.jump && this.onGround && !this.inWater) { this.vel[1] = D.jump || 0.42; this.jumpFromY = this.pos[1]; }
+    if (c.jump && this.onGround && !this.inWater) { this.vel[1] = (D.jump || 0.42) * jumpFactorOf(this); this.jumpFromY = this.pos[1]; }
     else if (this.onGround) this.jumpFromY = undefined;
     const s = this.T.speed * c.mod * (this.baby && D.babyFast ? 1.2 : 1);
     this.travel(c.fwd, c.strafe, s * s * (D.landSpeedMul || 1), c.jump);
@@ -447,7 +468,8 @@ class VMob extends Mob {
   // swimming or flying straight toward the goal (no gravity), turning to face where it goes
   move3d(c) {
     const D = this.D, v = this.vel, g = c.goal, fly = this.ai === 'fly';
-    const sp = (fly ? (this.T.flySpeed || 0.6) * 0.1 : this.T.speed * 0.12) * c.mod * (D.speed3 || 1);
+    // (swimAcc: the push per tick vanilla's swim move control gives at speed modifier 1; the drag of 0.9 makes ten times that the top speed)
+    const sp = (fly ? (this.T.flySpeed || 0.6) * 0.1 * (D.speed3 || 1) : D.swimAcc || this.T.speed * 0.12 * (D.speed3 || 1)) * c.mod;
     if (g) {
       const dx = g[0] - this.pos[0], dy = g[1] - this.pos[1], dz = g[2] - this.pos[2], d = Math.hypot(dx, dy, dz);
       if (d > 0.2) {
@@ -523,7 +545,7 @@ class VMob extends Mob {
     EM.reset(md); this.setupAnim(md, a);
     const tex = this.texKey(r);
     const att = this.attachments ? this.attachments(g, md, lt, env) : null;
-    r.drawEM(md, tex, m, lt, env, { overlay, attach: att, cull: this.D.cull, bright: this.D.bright });
+    r.drawEM(md, tex, m, lt, env, { overlay, attach: att, cull: typeof this.D.cull === 'function' ? this.D.cull(this) : this.D.cull, bright: this.D.bright });
     if (this.drawLayers) this.drawLayers(g, r, md, m, a, env, lt, overlay);
     if (this.D.glow) { const gt = r.etex(typeof this.D.glow === 'function' ? this.D.glow(this) : this.D.glow); if (gt) r.drawEMGlow(md, gt, m, env, {}); }
   }

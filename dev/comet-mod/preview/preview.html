@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Comet FX — 特效预览台</title>
+<link rel="stylesheet" href="preview.css">
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="world"></canvas>
+</div>
+
+<!-- ------------------------------------------------------------ 控制面板 -->
+<aside id="controls" class="glass">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>COMET FX</h1>
+    <span class="ver">v0.1 · Meteor 基座</span>
+  </div>
+  <p class="sub">以 Meteor Client 为基座的视觉层预览。<br>玻璃 UI / 绘制线框 / 光环图案 / HUD / 开场动画，全部实时绘制。</p>
+
+  <div class="sec">
+    <div class="sec-title">外观预设</div>
+    <div class="preset-bar">
+      <button data-preset="绚丽" class="on">绚丽</button>
+      <button data-preset="平缓">平缓</button>
+      <button data-preset="基本">基本</button>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">光环图案</div>
+    <select id="mode"></select>
+    <div class="row"><label>半径</label><span class="val" id="v-radius">2.6</span></div>
+    <input type="range" id="radius" min="1.2" max="4.5" step="0.1" value="2.6">
+    <div class="row"><label>旋转速度</label><span class="val" id="v-speed">1.0</span></div>
+    <input type="range" id="speed" min="0" max="3" step="0.1" value="1">
+    <div class="row"><label>层数</label><span class="val" id="v-layers">1</span></div>
+    <input type="range" id="layers" min="1" max="3" step="1" value="1">
+    <div class="row"><label>粒子</label><span class="val" id="v-particles">40</span></div>
+    <input type="range" id="particles" min="0" max="240" step="10" value="40">
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">效果开关</div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="rainbow" checked><span class="track"></span>彩虹流动</label></div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="pulse" checked><span class="track"></span>呼吸脉冲</label></div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="glow" checked><span class="track"></span>辉光</label></div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="trail"><span class="track"></span>拖影</label></div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="tips" checked><span class="track"></span>尖角发光</label></div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="esp" checked><span class="track"></span>3D 线框 / 追踪线</label></div>
+    <div class="row"><label class="toggle"><input type="checkbox" id="hud" checked><span class="track"></span>HUD 组件</label></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">玻璃参数</div>
+    <div class="row"><label>模糊</label><span class="val" id="v-blur">22</span></div>
+    <input type="range" id="blur" min="0" max="40" step="1" value="22">
+    <div class="row"><label>饱和度</label><span class="val" id="v-sat">180</span></div>
+    <input type="range" id="sat" min="80" max="220" step="5" value="180">
+    <div class="row"><label>圆角</label><span class="val" id="v-round">14</span></div>
+    <input type="range" id="round" min="0" max="28" step="1" value="14">
+  </div>
+
+  <div class="btns">
+    <button class="primary" id="play-intro">▶ 播放开场动画</button>
+    <button id="cycle">循环切换图案</button>
+    <button id="reset">重置参数</button>
+  </div>
+
+  <p class="hint">图案公式与 Java 侧 <b>CometGeometry</b> 完全一致（已用 javac 25 跑通 34 项断言）。五芒星恰好 5 尖、六边形为直边。点击开场动画画面可跳过。</p>
+</aside>
+
+<!-- ------------------------------------------------------------ HUD -->
+<div id="hud-watermark" class="hud glass"><b>COMET</b><span>FX · Meteor 26.3</span></div>
+<div id="hud-coords" class="hud glass">
+  <span class="axis">X</span> 128.4 &nbsp; <span class="axis">Y</span> 64.0 &nbsp; <span class="axis">Z</span> -302.1 &nbsp; · &nbsp; 4.2 bps &nbsp; · &nbsp; 西北
+</div>
+
+<div id="hud-array" class="hud glass">
+  <div class="item">光环 · 五芒星<i></i></div>
+  <div class="item">ESP<i></i></div>
+  <div class="item">追踪线<i></i></div>
+  <div class="item">毛玻璃 UI<i></i></div>
+  <div class="item">名牌<i></i></div>
+  <div class="item">雷达<i></i></div>
+</div>
+
+<div id="hud-target" class="hud glass">
+  <div class="thead">
+    <div class="face"></div>
+    <div class="tname">僵尸村民<br><span class="tname-sub">Zombie Villager</span></div>
+    <div class="dist">12.4 m</div>
+  </div>
+  <div class="hpbar"><div class="hpfill"></div></div>
+  <div class="equip"><span></span><span></span><span></span><span></span><span></span></div>
+</div>
+
+<div id="hud-notes" class="hud"></div>
+
+<div id="hud-radar" class="hud glass"><canvas id="radar" width="296" height="296"></canvas></div>
+
+<div id="hud-crosshair" class="hud"></div>
+<div id="hud-hint" class="hud">拖动鼠标可旋转视角 · 滚轮缩放</div>
+
+<div id="legend" class="hud glass">
+  <b>绘制层</b>：12 边 3D 框 · 追踪线 · 四角括号 · 落点圈<br>
+  <b>玻璃层</b>：blur <span class="k" id="lg-blur">22</span>px / saturate <span class="k" id="lg-sat">180</span>% / brightness 1.05
+</div>
+
+<!-- ------------------------------------------------------------ 开场动画 -->
+<div id="intro"><canvas id="intro-cv"></canvas><div class="skip">点击跳过</div></div>
+
+<script src="preview.js"></script>
+</body>
+</html>

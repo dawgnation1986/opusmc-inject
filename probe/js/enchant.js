@@ -51,7 +51,8 @@ function enchantCost(rand, slot, shelves, ench) {
 function availableEnchants(level, id, treasure) {
   const book = ITEMS[id].key === 'book', out = [];
   for (const E of ENCH_LIST) {
-    if (!treasure && (!E.table || E.treasure)) continue; // the table: only its own; loot may give any
+    // the table: only its own; loot may give any (treasure true), or those a filter takes (a loot table's options)
+    if (typeof treasure === 'function' ? !treasure(E) : !treasure && (!E.table || E.treasure)) continue;
     if (!book && !E.prim.has(id)) continue;
     for (let l = E.max; l >= 1; l--) if (level >= enchMinCost(E, l) && level <= enchMaxCost(E, l)) { out.push([E.key, l]); break; }
   }
@@ -238,8 +239,17 @@ function fortuneCount(n, lvl) {
   const bonus = Math.max(0, Math.floor(Math.random() * (lvl + 2)) - 1);
   return n * (bonus + 1);
 }
+// a ripe crop's extra drop (vanilla loot tables: apply_bonus binomial_with_bonus_count, extra 3, p 0.5714286): 1 plus a
+// roll of 3 + fortune - fortune did nothing on crops
+function cropBonusCount(r, tool) {
+  let n = 1;
+  for (let i = 0, k = 3 + enchLevel(tool, 'fortune'); i < k; i++) if (r() < 0.5714286) n++;
+  return n;
+}
 // silk touch takes these as they are (others than this list drop themselves when they have an item)
-const NO_SILK = new Set(['spawner', 'budding_amethyst', 'reinforced_deepslate', 'farmland', 'dirt_path', 'frosted_ice', 'trial_spawner', 'vault']);
+const NO_SILK = new Set(['spawner', 'budding_amethyst', 'reinforced_deepslate', 'farmland', 'dirt_path', 'frosted_ice', 'trial_spawner', 'vault', 'small_dripleaf', 'hanging_roots',
+  'seagrass', 'vine', 'glow_lichen', 'nether_sprouts', 'sculk_vein', 'short_grass', 'fern', 'tall_grass', 'large_fern', 'dead_bush',
+  ...WOOLS.map(([c]) => c + '_wool')]); // (the first wool blocks: the vanilla import's wool item, silk touch or not)
 
 // ---- creative: enchanted books of every enchantment and level (vanilla's ingredients tab) ----
 const _ctItems = creativeTabItems;
@@ -280,7 +290,7 @@ Player.prototype.waterEfficiency = function () { return Math.min(1, enchLevel(th
     if (this.soulSpeedOn && this.onGround && boots && (Math.abs(this.pos[0] - this.prev[0]) + Math.abs(this.pos[2] - this.prev[2]) > 0.01)) {
       if (Math.random() < 0.04 && !this.creative && ITEMS[boots.id].durability && !unbreakingSkips(boots, true)) {
         boots.dmg = (boots.dmg || 0) + 1;
-        if (boots.dmg >= ITEMS[boots.id].durability) { this.inv.slots[39] = null; Sound.block('break', 'metal', this.pos); }
+        if (boots.dmg >= ITEMS[boots.id].durability) { this.inv.slots[39] = null; Sound.ev('entity.item.break', this.pos, 0.8, 0.8 + Math.random() * 0.4); }
       }
       if (Math.random() < 0.3) { g.particles.spawn('soul', this.pos[0] + (Math.random() - 0.5) * this.w, this.pos[1] + 0.1, this.pos[2] + (Math.random() - 0.5) * this.w, -this.vel[0] * 0.2, 0.1, -this.vel[2] * 0.2); Sound.ev('particle.soul_escape', this.pos, 0.6 + Math.random() * 0.4, 0.6 + Math.random() * 0.4); }
     }
@@ -340,8 +350,11 @@ Player.prototype.waterEfficiency = function () { return Math.min(1, enchLevel(th
     const crit = str > 0.9 && p.vel[1] < -0.05 && !p.onGround && !p.inWater;
     const sweep = sword && str > 0.9 && !crit && !p.sprinting && p.onGround && moved < 0.1 && !this.net && e instanceof Living;
     const base = Math.max(0, (def && def.attack ? def.attack : 1) + effectAttackBonus(p)) * (0.2 + str * str * 0.8);
-    const r = _attack.call(this, e);
-    if (!sweep) return r;
+    // (the sweep has its own sound instead of the strong hit's; only after a hit that landed, as vanilla)
+    this.sweepHit = sweep;
+    let r;
+    try { r = _attack.call(this, e); } finally { this.sweepHit = false; }
+    if (!sweep || !r) return r;
     const se = enchLevel(held, 'sweeping_edge'), dmg = 1 + (se / (se + 1)) * base, b = e.box();
     for (const o of this.entities) {
       if (o === e || o === p || !(o instanceof Living) || o.dead || o.deathTime > 0 || o.isVehicle) continue;

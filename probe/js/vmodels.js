@@ -12,6 +12,17 @@ const VM = {
   init() {
     const D = window.VMODELS;
     if (!D) return;
+    // the mods' models (their data.js: self.MOD_VMODELS, the same shape) after vanilla's, their indices moved along
+    for (const M of self.MOD_VMODELS || []) {
+      const off = D.models.length, mv = (v) => v.map((x) => Object.assign({}, x, { m: x.m + off }));
+      D.models.push(...M.models);
+      for (const k in M.blocks || {}) {
+        const b = M.blocks[k];
+        D.blocks[k] = b.variants ? { variants: b.variants.map(([p, l]) => [p, mv(l)]) } : { multipart: b.multipart.map(([w, l]) => [w, mv(l)]) };
+      }
+      for (const k in M.items || {}) { const it = Object.assign({}, M.items[k]); if (it.m !== undefined) it.m += off; if (it.gui !== undefined) it.gui += off; D.items[k] = it; }
+    }
+    self.MOD_VMODELS = [];
     this.data = D;
     this.ready = true;
   },
@@ -62,7 +73,9 @@ const VM = {
         if (uvlock && (rx || ry) && dir >= 0) uvs = P.map(p => FACES[dir].uv(p[0], p[1], p[2]));
         let cull = -1;
         if (fd.cull) { const c = FACES[this.DIR[fd.cull]].n; cull = axisDir(rotVariant([0.5 + c[0], 0.5 + c[1], 0.5 + c[2]], rx, ry).map(v => v - 0.5)); }
-        out.push({ p: P, uv: uvs, layer, anim: ANIM_FRAMES[layer], tint: fd.tint, cull, dir, shade: el.shade !== false, n, ao: model.ao });
+        // (ct: a mod's connected texture - its layer for each set of joined sides; Mesher.ctLayer picks one)
+        const ct = fd.ct ? Object.fromEntries(Object.entries(fd.ct).map(([k, v]) => [k, T(v)])) : null;
+        out.push({ p: P, uv: uvs, layer, anim: ANIM_FRAMES[layer], tint: fd.tint, cull, dir, shade: el.shade !== false, n, ao: model.ao, ct });
       }
     }
     this.baked.set(key, out);
@@ -205,7 +218,7 @@ Mesher.vmodel = function (b, meta, x, y, z, ox, oy, oz, single) {
   const h = hash3(ox + x, oy + y, oz + z, 1234);
   const parts = VM.select(st.key, st.p, h);
   const buf = b.render === 'translucent' ? this.transBuf : this.opaqueBuf;
-  const tintC = b.tint ? this.tintOf(b, x, z) : null;
+  const tintC = b.tint === 'stem' ? stemTint(st.p.age) : b.tint ? this.tintOf(b, x, z) : null;
   const own = lights[this.P(x, y, z)];
   const fast = FAST_LEAVES && !single && LEAF_BLOCK[ids[this.P(x, y, z)]], ovl = fast ? SOLID_LEAF : 0;
   for (const quads of parts) for (const q of quads) {
@@ -216,17 +229,19 @@ Mesher.vmodel = function (b, meta, x, y, z, ox, oy, oz, single) {
       // the inner faces of a heap of powder snow, drawn later in the translucent pass, covered its top
       if (b.cullSame && nid === b.id) continue;
     }
+    const L = q.ct && !single ? this.ctLayer(q, x, y, z) : q.layer;
     let r = 255, g = 255, bl = 255;
-    if (q.tint >= 0) { const tc = tintC || this.tintOf({ tint: 'grass' }, x, z); r = tc[0]; g = tc[1]; bl = tc[2]; }
+    // (a tinted face of a block vanilla gives no colour stays as it is: BlockColors' -1)
+    if (q.tint >= 0 && tintC) { r = tintC[0]; g = tintC[1]; bl = tintC[2]; }
     const shadeF = q.shade && q.dir >= 0 ? FACE_SHADE[q.dir] : (q.shade ? 0.8 + 0.2 * Math.max(0, q.n[1]) : 1);
     if (single) {
-      for (let k = 0; k < 4; k++) buf.v(ox + x + q.p[k][0], oy + y + q.p[k][1], oz + z + q.p[k][2], q.uv[k][0], q.uv[k][1], q.layer, 0, r, g, bl, Math.round(shadeF * 255), 255, 255, q.anim);
+      for (let k = 0; k < 4; k++) buf.v(ox + x + q.p[k][0], oy + y + q.p[k][1], oz + z + q.p[k][2], q.uv[k][0], q.uv[k][1], L, 0, r, g, bl, Math.round(shadeF * 255), 255, 255, q.anim);
       continue;
     }
     if (q.dir < 0) {
       // free-standing planes (crosses, rotated torch parts): the block's own light, no AO
       const s = Math.round((own >> 4) * 17), k2 = Math.round((own & 15) * 17), sh = Math.round(shadeF * 255);
-      for (let k = 0; k < 4; k++) buf.v(ox + x + q.p[k][0], oy + y + q.p[k][1], oz + z + q.p[k][2], q.uv[k][0], q.uv[k][1], q.layer, ovl, r, g, bl, sh, s, k2, q.anim);
+      for (let k = 0; k < 4; k++) buf.v(ox + x + q.p[k][0], oy + y + q.p[k][1], oz + z + q.p[k][2], q.uv[k][0], q.uv[k][1], L, ovl, r, g, bl, sh, s, k2, q.anim);
       continue;
     }
     // axis-aligned: smooth light from the layer in front of the face (flush) or the block's own layer
@@ -243,11 +258,25 @@ Mesher.vmodel = function (b, meta, x, y, z, ox, oy, oz, single) {
         const cc = F.c[c], w = (cc[ta[0]] ? u : 1 - u) * (cc[ta[1]] ? v : 1 - v);
         a += C.ao[c] * w; sk += C.sk[c] * w; bk += C.bk[c] * w;
       }
-      buf.v(ox + x + p[0], oy + y + p[1], oz + z + p[2], q.uv[k][0], q.uv[k][1], q.layer, ovl, r, g, bl,
+      buf.v(ox + x + p[0], oy + y + p[1], oz + z + p[2], q.uv[k][0], q.uv[k][1], L, ovl, r, g, bl,
         Math.round(shadeF * a * 255), Math.round(sk * 17), Math.round(bk * 17), q.anim);
     }
   }
   return true;
+};
+// a connected face's layer: which of its four sides (up, down, left, right as its texture lies on the face - the UV
+// layout of Mesher.vmodel's faces) touch a block of the same kind, as a suffix (u d l r) choosing the variant
+// (mantle:connected, cornerless_full - the seared glass of a smeltery reads as one window)
+const CT_SIDES = [ // per face direction (W E D U N S): the world offsets of its up, down, left, right
+  [[0, 1, 0], [0, -1, 0], [0, 0, -1], [0, 0, 1]], [[0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+  [[0, 0, 1], [0, 0, -1], [-1, 0, 0], [1, 0, 0]], [[0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]],
+  [[0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0]], [[0, 1, 0], [0, -1, 0], [-1, 0, 0], [1, 0, 0]]];
+Mesher.ctLayer = function (q, x, y, z) {
+  if (q.dir < 0) return q.layer;
+  const ids = this.ids, me = ids[this.P(x, y, z)], S = CT_SIDES[q.dir];
+  let sfx = '';
+  for (let i = 0; i < 4; i++) { const o = S[i]; if (ids[this.P(x + o[0], y + o[1], z + o[2])] === me) sfx += 'udlr'[i]; }
+  return sfx && q.ct[sfx] !== undefined ? q.ct[sfx] : q.layer;
 };
 // AO / light at the 4 corners (FACES order) of the block face in direction f
 Mesher.faceCorners = function (x, y, z, f, flush, useAO) {

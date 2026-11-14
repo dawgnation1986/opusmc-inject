@@ -101,6 +101,7 @@ const Features = (() => {
       // heightmaps per type over the 3x3 chunks, filled per column on first use and kept exact by set()
       // (like vanilla's chunk heightmaps; scanning down from the top for every ore vein was most of decoration)
       this.hm = {};
+      this.spill = null; // (decorate: the cells written, chunk -> Set of indices)
     }
     col(x, z) { return ((((z >> 4) - this.cz + 1) * 3 + (x >> 4) - this.cx + 1) << 8) | ((z & 15) << 4) | (x & 15); }
     chunk(x, z) {
@@ -126,6 +127,7 @@ const Features = (() => {
       const wl = canWaterlog(id, meta) && ((c.getB(i) === WATER && c.getM(i) === 0) || (c.getB(i) === id && c.wl && c.wl.has(i)));
       if (wl) (c.wl || (c.wl = new Set())).add(i); else if (c.wl) c.wl.delete(i);
       c.setB(i, id); c.setM(i, meta);
+      if (this.spill) { let s = this.spill.get(c); if (!s) this.spill.set(c, s = new Set()); s.add(i); }
       for (const type in this.hm) {
         const H = this.hm[type], k = this.col(x, z), h = H[k];
         if (h === HM_UNSET) continue;
@@ -316,6 +318,95 @@ const Features = (() => {
   const SUPPORT = {};
   const sup = (t) => SUPPORT[t] || (SUPPORT[t] = tagSet(t));
   const DRY = new Set(['dead_bush', 'short_dry_grass', 'tall_dry_grass']);
+  // vanilla isFaceSturdy / canSupportCenter: does the block at (x, y, z) offer its side d (0 west, 1 east, 2 down, 3 up,
+  // 4 north, 5 south) - mode 0 the whole face (FULL), 1 its middle 2 x 2 pixels (CENTER: a standing torch), 2 the whole
+  // face, leaves too (MultifaceBlock.canAttachTo: vines and lichen), 3 any of it (a sea pickle). From its boxes: only
+  // full cubes counted before, or any block at all - a torch went on a torch, a ladder on a fence (feedback 2026-11)
+  const POSTS = { wall: [4, 0, 4, 12, 16, 12], pane: [7, 0, 7, 9, 16, 9] };
+  // vanilla support shapes smaller than the model's box (a potted plant's box is the plant's, a stonecutter's the whole
+  // cube ...); scaffolding's is its stable shape (collision for no entity: the full top plate and four corner posts)
+  const SUPPORT_SHAPE = {
+    flower_pot: [[5, 0, 5, 11, 6, 11]], brewing_stand: [[1, 0, 1, 15, 2, 15], [7, 2, 7, 9, 14, 9]], stonecutter: [[0, 0, 0, 16, 9, 16]],
+    sculk_sensor: [[0, 0, 0, 16, 8, 16]], calibrated_sculk_sensor: [[0, 0, 0, 16, 8, 16]], chorus_flower: [[1, 0, 1, 15, 15, 15]],
+    scaffolding: [[0, 14, 0, 16, 16, 16], [0, 0, 0, 2, 16, 2], [14, 0, 0, 16, 16, 2], [0, 0, 14, 2, 16, 16], [14, 0, 14, 16, 16, 16]],
+  };
+  // an end rod: the 4 wide column along its facing axis (RodBlock), whatever its nonsolid flag says
+  function endRod(id, m) {
+    const a = ['west', 'east', 'down', 'up', 'north', 'south'].indexOf(propOf(id, m, 'facing')) >> 1;
+    if (a < 0) return null;
+    const q = [6, 6, 6, 10, 10, 10];
+    q[a] = 0; q[a + 3] = 16;
+    return [q];
+  }
+  // a piston head: the 4 thick plate on its facing side and the arm back through the base (PistonHeadBlock)
+  function pistonHead(id, m) {
+    const f = ['west', 'east', 'down', 'up', 'north', 'south'].indexOf(propOf(id, m, 'facing')), a = f >> 1, s = f & 1, short = propOf(id, m, 'short') === 'true';
+    if (f < 0) return null;
+    const plate = [0, 0, 0, 16, 16, 16], arm = [6, 6, 6, 10, 10, 10];
+    plate[a] = s ? 12 : 0; plate[a + 3] = s ? 16 : 4;
+    arm[a] = s ? (short ? 0 : -4) : 4; arm[a + 3] = s ? 12 : (short ? 16 : 20);
+    return [plate, arm];
+  }
+  function sturdy(R, x, y, z, d, mode = 0) {
+    const id = R.id(x, y, z), b = BLOCKS[id];
+    if (!id || !b || IS_FLUID[id]) return false;
+    if (!LEAVES) initTags();
+    if (LEAVES.has(id)) return mode >= 2; // (leaves: no support shape, a full collision box)
+    if (SOLIDCUBE[id]) return true;
+    const m = R.meta ? R.meta(x, y, z) : 0, k = b.key;
+    if (k === 'snow') return d === 2 || (m & 7) === 7;
+    // (a whole model box, but vanilla's shape has a hole or is smaller: a hopper's, cauldron's, composter's open top, a
+    // lectern's sloped one, the honey block 14 wide and 15 high)
+    if (k === 'hopper') return mode === 3 ? d === 3 : mode === 1 && d === 2 && propOf(id, m, 'facing') === 'down';
+    if (/(^|_)cauldron$/.test(k)) return mode === 3 && d === 3;
+    if (k === 'composter' && d === 3) return mode === 3;
+    if (k === 'lectern' && d !== 2) return false;
+    if (k === 'honey_block') return mode === 1 && d === 2;
+    let boxes = SUPPORT_SHAPE[k] || (k.startsWith('potted_') ? SUPPORT_SHAPE.flower_pot : k === 'piston_head' ? pistonHead(id, m) : k === 'end_rod' ? endRod(id, m) : null);
+    if (!boxes) {
+      if (!b.solid) return false;
+      if (b.shape === SH_CUBE) return true;
+      if ((b.shape !== SH_BOXES && b.shape !== SH_MODEL) || !b.boxes) return false;
+      if (b.gate && propOf(id, m, 'open') === 'true') return false;
+      boxes = b.fence ? [POSTS[b.fence] || [6, 0, 6, 10, 16, 10]] : b.collide ? b.collide(m) : b.boxes(m);
+    }
+    const a = d >> 1, u = a === 0 ? 1 : 0, v = a === 2 ? 1 : 2, on = [];
+    for (const q of boxes) if ((d & 1 ? q[a + 3] >= 16 : q[a] <= 0) && q[u + 3] > q[u] && q[v + 3] > q[v]) on.push(q);
+    if (mode === 3) return on.length > 0;
+    const lo = mode === 1 ? 7 : 0, hi = mode === 1 ? 9 : 16;
+    for (let i = lo; i < hi; i++) for (let j = lo; j < hi; j++) {
+      if (!on.some(q => q[u] <= i && q[u + 3] >= i + 1 && q[v] <= j && q[v + 3] >= j + 1)) return false;
+    }
+    return true;
+  }
+  const SIDE = [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]], SIDE_OPP = [1, 0, 3, 2, 5, 4];
+  const SIDE_NAME = ['west', 'east', 'down', 'up', 'north', 'south'];
+  // the neighbour on side d of (x, y, z) holds on to what is there, by its face turned toward it
+  const holds = (R, x, y, z, d, mode) => sturdy(R, x + SIDE[d][0], y + SIDE[d][1], z + SIDE[d][2], SIDE_OPP[d], mode);
+  // vines and glow lichen: the faces that still hold on (VineBlock.getUpdatedState, MultifaceBlock.updateShape) - the
+  // new meta, -1 when none is left; undefined for other blocks. One with no face at all (placed so before) takes every
+  // face it can hold on to
+  function faceUpdate(R, id, meta, x, y, z) {
+    const b = BLOCKS[id], k = b && b.key;
+    if (k !== 'vine' && k !== 'glow_lichen') return undefined;
+    const s = b.states && b.states[meta];
+    if (!s) return undefined;
+    const sides = k === 'vine' ? [3, 0, 1, 4, 5] : [0, 1, 2, 3, 4, 5], bare = sides.every(d => s[SIDE_NAME[d]] !== 'true');
+    const um = k === 'vine' && R.id(x, y + 1, z) === id ? (R.meta ? R.meta(x, y + 1, z) : 0) : -1;
+    const ok = (d) => holds(R, x, y, z, d, 2) || (um >= 0 && d !== 3 && propOf(id, um, SIDE_NAME[d]) === 'true');
+    let m = meta, any = false;
+    for (const d of sides) {
+      const f = SIDE_NAME[d], has = s[f] === 'true', keep = (has || bare) && ok(d);
+      if (keep !== has) m = withProp(id, m, f, keep ? 'true' : 'false');
+      if (keep) any = true;
+    }
+    return any ? m : -1;
+  }
+  // a dripstone grows from a sturdy face, or from a dripstone pointing the same way (SpeleothemBlock)
+  function speleothemHolds(R, x, y, z, down) {
+    const by = down ? y + 1 : y - 1, n = R.id(x, by, z);
+    return sturdy(R, x, by, z, down ? 2 : 3) || (n === BID.pointed_dripstone && propOf(n, R.meta ? R.meta(x, by, z) : 0, 'vertical_direction') === (down ? 'down' : 'up'));
+  }
   function canSurvive(R, id, meta, x, y, z) {
     if (!LEAVES) initTags();
     const b = BLOCKS[id];
@@ -328,12 +419,17 @@ const Features = (() => {
         return below === id || sup('supports_cactus').has(below);
       }
       case 'cactus_flower': return sup('support_override_cactus_flower').has(below) || !!SOLIDCUBE[below];
+      case 'soul_fire': return sup('soul_fire_base_blocks').has(below); // (vanilla SoulFireBlock.canSurvive)
       case 'sugar_cane': {
         if (below === id) return true;
         if (!sup('supports_sugar_cane').has(below)) return false;
-        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const n = R.id(x + dx, y - 1, z + dz); if (n === WATER || WATERLOGGED.has(n) || sup('supports_sugar_cane_adjacently').has(n)) return true; }
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const n = R.id(x + dx, y - 1, z + dz); if (n === WATER || WATERLOGGED.has(n) || (R.water && R.water(x + dx, y - 1, z + dz)) || sup('supports_sugar_cane_adjacently').has(n)) return true; }
         return false;
       }
+      // crops and stems: farmland only (they went to supports_vegetation below: grass and dirt too)
+      case 'carrots': case 'potatoes': case 'beetroots': case 'torchflower_crop': case 'pitcher_crop': return sup('supports_crops').has(below);
+      case 'melon_stem': case 'attached_melon_stem': return sup('supports_melon_stem').has(below);
+      case 'pumpkin_stem': case 'attached_pumpkin_stem': return sup('supports_pumpkin_stem').has(below);
       case 'lily_pad': return below === WATER || sup('supports_lily_pad').has(below);
       case 'mangrove_propagule': return sup('supports_mangrove_propagule').has(below);
       case 'azalea': case 'flowering_azalea': return sup('supports_azalea').has(below);
@@ -346,20 +442,29 @@ const Features = (() => {
       case 'crimson_fungus': case 'warped_fungus': return sup(k === 'crimson_fungus' ? 'supports_crimson_fungus' : 'supports_warped_fungus').has(below);
       case 'crimson_roots': case 'warped_roots': return sup(k === 'crimson_roots' ? 'supports_crimson_roots' : 'supports_warped_roots').has(below);
       case 'nether_sprouts': return sup('supports_nether_sprouts').has(below);
-      case 'weeping_vines': case 'weeping_vines_plant': case 'twisting_vines': case 'twisting_vines_plant': return true;
-      case 'vine': case 'glow_lichen': case 'cave_vines': case 'cave_vines_plant': case 'hanging_roots': case 'spore_blossom': case 'pale_hanging_moss': case 'sculk_vein': return true;
+      // vines hanging down and growing up (GrowingPlantBlock): the same plant above / below, or a sturdy face; vines and
+      // glow lichen: a face still holding on - they all stayed in the air once what held them was gone (feedback 2026-11)
+      case 'weeping_vines': case 'weeping_vines_plant': case 'cave_vines': case 'cave_vines_plant': {
+        const a = BLOCKS[R.id(x, y + 1, z)], h = k.replace(/_plant$/, '');
+        return (!!a && (a.key === h || a.key === h + '_plant')) || holds(R, x, y, z, 3, 0);
+      }
+      case 'twisting_vines': case 'twisting_vines_plant': return (!!bb && (bb.key === 'twisting_vines' || bb.key === 'twisting_vines_plant')) || holds(R, x, y, z, 2, 0);
+      case 'vine': case 'glow_lichen': return faceUpdate(R, id, meta, x, y, z) !== -1;
+      case 'pointed_dripstone': return speleothemHolds(R, x, y, z, propOf(id, meta, 'vertical_direction') !== 'up');
+      case 'leaf_litter': return holds(R, x, y, z, 2, 0);
+      case 'sea_pickle': return holds(R, x, y, z, 2, 3);
+      case 'hanging_roots': case 'spore_blossom': case 'pale_hanging_moss': case 'sculk_vein': case 'cobweb': return true;
     }
-    // torches, levers, buttons, coral fans: a full face to hang on (vanilla canSupportCenter / isFaceSturdy) - by default
-    // anything went, a torch on a torch, a lever on a lever: "火把可以插在火把上", feedback 2026-11-01/02
-    const full = (n) => { const nb = BLOCKS[n]; return !!SOLIDCUBE[n] || (!!nb && nb.shape === SH_CUBE && !!nb.solid); };
-    const center = (n) => { const nb = BLOCKS[n]; return full(n) || (!!nb && /(_fence|_wall)$/.test(nb.key) && !/(^|_)(wall_|fence_gate)/.test(nb.key)); };
-    const behind = () => { const D = { north: [0, 1], south: [0, -1], east: [-1, 0], west: [1, 0] }[propOf(id, meta, 'facing')]; return D ? R.id(x + D[0], y, z + D[1]) : 0; };
-    if (/(^|_)wall_torch$/.test(k) || /coral_wall_fan$/.test(k)) return full(behind());
-    if (/(^|_)torch$/.test(k)) return center(below);
-    if (/coral_fan$/.test(k)) return full(below);
+    // torches, levers, buttons, coral fans: a full face to hang on, the middle of the top for a standing torch (vanilla
+    // isFaceSturdy / canSupportCenter) - by default anything went, a torch on a torch, a lever on a lever: "火把可以插在
+    // 火把上", feedback 2026-11-01/02
+    const back = () => { const f = SIDE_NAME.indexOf(propOf(id, meta, 'facing')); return f < 0 ? -1 : SIDE_OPP[f]; };
+    if (/(^|_)wall_torch$/.test(k) || /coral_wall_fan$/.test(k)) { const d = back(); return d >= 0 && holds(R, x, y, z, d, 0); }
+    if (/(^|_)torch$/.test(k)) return holds(R, x, y, z, 2, 1);
+    if (/coral_fan$/.test(k)) return holds(R, x, y, z, 2, 0);
     if (k === 'lever' || /_button$/.test(k)) {
-      const face = propOf(id, meta, 'face');
-      return face === 'floor' ? full(below) : face === 'ceiling' ? full(R.id(x, y + 1, z)) : full(behind());
+      const face = propOf(id, meta, 'face'), d = face === 'floor' ? 2 : face === 'ceiling' ? 3 : back();
+      return d >= 0 && holds(R, x, y, z, d, 0);
     }
     if (WATERLOGGED.has(id)) return (!!SOLIDCUBE[below] && below !== BID.magma_block) || below === id || ((k === 'kelp' || k === 'kelp_plant') && below === BID.kelp_plant);
     if (DRY.has(k)) return sup('supports_dry_vegetation').has(below);
@@ -605,6 +710,24 @@ const Features = (() => {
     return true;
   };
 
+  // BlockPileFeature: villages' hay / melon / pumpkin / snow / ice piles (it was missing, so none appeared)
+  FEATURE.block_pile = (ctx, cfg, r, x, y, z) => {
+    const R = ctx.R, prov = once(cfg, 'p', () => provider(cfg.raw.state_provider)), PATH = BID.dirt_path;
+    if (y < R.minY + 5) return false;
+    const xr = 2 + r.nextInt(2), zr = 2 + r.nextInt(2);
+    const tryPlace = (px, py, pz) => {
+      if (R.id(px, py, pz) !== 0) return;
+      const below = R.id(px, py - 1, pz);
+      if (below === PATH ? !r.nextBoolean() : !SOLIDCUBE[below]) return;
+      R.setState(px, py, pz, prov(r, px, py, pz, R));
+    };
+    for (let pz = z - zr; pz <= z + zr; pz++) for (let py = y; py <= y + 1; py++) for (let px = x - xr; px <= x + xr; px++) {
+      const xd = x - px, zd = z - pz;
+      if (xd * xd + zd * zd <= r.nextFloat() * 10 - r.nextFloat() * 6) tryPlace(px, py, pz);
+      else if (r.nextFloat() < 0.031) tryPlace(px, py, pz);
+    }
+    return true;
+  };
   FEATURE.disk = (ctx, cfg, r, x, y, z) => {
     const R = ctx.R, c = cfg.raw, prov = once(cfg, 'p', () => provider(c.state_provider)), target = once(cfg, 't', () => predicate(c.target));
     const rad = intProvider(c.radius)(r), top = y + c.half_height, bot = y - c.half_height - 1;
@@ -669,6 +792,13 @@ const Features = (() => {
       const px = x + m, py = y + p, pz = z + o;
       if (!canRepl(R, px, py, pz)) continue;
       R.set(px, py, pz, p >= 4 ? 0 : fluid[0], 0);
+      // what stood on it and can't now (grass, leaf litter a neighbour chunk put there) goes, as at vanilla's post
+      // processing (markAboveForPostProcessing: 2 up) - it was left in the air over the lake (feedback 2026-11)
+      if (p >= 4) for (let q = 1; q <= 2; q++) {
+        const a = R.id(px, py + q, pz);
+        if (!a || IS_FLUID[a] || BLOCKS[a].solid || canSurvive(R, a, R.meta(px, py + q, pz), px, py + q, pz)) break;
+        R.set(px, py + q, pz, 0, 0);
+      }
     }
     if (barrierP) for (let m = 0; m < 16; m++) for (let o = 0; o < 16; o++) for (let p = 0; p < 8; p++) {
       if (!edge(m, o, p) || (p >= 4 && r.nextInt(2) === 0)) continue;
@@ -967,40 +1097,91 @@ const Features = (() => {
     return k > 0;
   };
   FEATURE.underwater_magma = (ctx, cfg, r, x, y, z) => {
+    // UnderwaterMagmaFeature: the floor of the water the origin is in (the origin has to be water), and around it only
+    // blocks that stay covered - not water or air, a full block below and on all four sides. (It took any origin and wanted
+    // water above the magma: from inside the ground under a river or sea bed it put magma on the bed, open to the water)
     const R = ctx.R, c = cfg.raw;
-    let fy = y;
-    for (let i = 0; i < c.floor_search_range && R.id(x, fy, z) === WATER; i++) fy--;
-    if (!SOLIDCUBE[R.id(x, fy, z)]) return false;
-    const rad = c.placement_radius_around_floor;
+    const col = scanColumn(R, x, y, z, c.floor_search_range, (id) => id === WATER, (id) => id !== WATER);
+    if (!col || col.floor === null) return false;
+    const fy = col.floor, rad = c.placement_radius_around_floor;
     let k = 0;
-    for (let dx = -rad; dx <= rad; dx++) for (let dy = -rad; dy <= rad; dy++) for (let dz = -rad; dz <= rad; dz++) {
+    for (let dz = -rad; dz <= rad; dz++) for (let dy = -rad; dy <= rad; dy++) for (let dx = -rad; dx <= rad; dx++) {
       if (r.nextFloat() >= c.placement_probability_per_valid_position) continue;
-      const px = x + dx, py = fy + dy, pz = z + dz;
-      if (!SOLIDCUBE[R.id(px, py, pz)] || R.id(px, py + 1, pz) !== WATER) continue;
-      if (DIR6.slice(2).some(d => !SOLIDCUBE[R.id(px + d[0], py, pz + d[2])])) continue;
+      const px = x + dx, py = fy + dy, pz = z + dz, id = R.id(px, py, pz);
+      if (id === WATER || id === 0 || !SOLIDCUBE[R.id(px, py - 1, pz)]) continue;
+      if (HORIZ4.some(([hx, hz]) => !SOLIDCUBE[R.id(px + hx, py, pz + hz)])) continue;
       R.set(px, py, pz, BID.magma_block); k++;
     }
     return k > 0;
   };
-  FEATURE.coral_tree = FEATURE.coral_claw = FEATURE.coral_mushroom = (ctx, cfg, r, x, y, z) => {
-    const R = ctx.R, kinds = ['tube', 'brain', 'bubble', 'fire', 'horn'], kind = kinds[r.nextInt(5)], blk = BID[kind + '_coral_block'];
-    if (blk === undefined) return false;
-    const h = r.nextInt(3) + 2;
-    let placed = false;
-    for (let i = 0; i < h; i++) {
-      const py = y + i;
-      if (R.id(x, py, z) !== WATER && i > 0) break;
-      R.set(x, py, z, blk); placed = true;
-      if (r.nextFloat() < 0.25 && R.id(x, py + 1, z) === WATER) { const deco = [kind + '_coral', kind + '_coral_fan'][r.nextInt(2)]; if (BID[deco] !== undefined) R.set(x, py + 1, z, BID[deco]); }
-      for (const [dx, dz, f] of [[1, 0, 'east'], [-1, 0, 'west'], [0, 1, 'south'], [0, -1, 'north']]) {
-        if (r.nextFloat() < 0.2 && R.id(x + dx, py, z + dz) === WATER && BID[kind + '_coral_wall_fan'] !== undefined) {
-          const w = BID[kind + '_coral_wall_fan'];
-          R.set(x + dx, py, z + dz, w, Math.max(0, BLOCKS[w].states.findIndex(s => s.facing === f)));
-        }
+  // CoralFeature (tree / claw / mushroom). A coral block only goes where there is water (or a coral) and water above it -
+  // it was a simplified column whose first block went anywhere, onto beaches and dry land and one block out of the water
+  const CORAL_KINDS = ['tube', 'brain', 'bubble', 'fire', 'horn']; // (the tags' order)
+  const CORALS = [...CORAL_KINDS.map(k => k + '_coral'), ...CORAL_KINDS.map(k => k + '_coral_fan')];
+  const CORAL_DIRS = [[0, -1, 'north'], [1, 0, 'east'], [0, 1, 'south'], [-1, 0, 'west']]; // (Direction.Plane.HORIZONTAL)
+  function placeCoralBlock(R, r, x, y, z, blk) {
+    const at = R.id(x, y, z);
+    if (!((at === WATER || CORALS.some(n => BID[n] === at)) && R.id(x, y + 1, z) === WATER)) return false;
+    R.set(x, y, z, blk);
+    if (r.nextFloat() < 0.25) { const d = BID[CORALS[r.nextInt(CORALS.length)]]; if (d !== undefined) R.set(x, y + 1, z, d); }
+    else if (r.nextFloat() < 0.05 && BID.sea_pickle !== undefined) { const SP = BID.sea_pickle; R.set(x, y + 1, z, SP, withProp(SP, withProp(SP, 0, 'pickles', r.nextInt(4) + 1), 'waterlogged', true)); }
+    for (const [dx, dz, f] of CORAL_DIRS) {
+      if (r.nextFloat() < 0.2 && R.id(x + dx, y, z + dz) === WATER) {
+        const w = BID[CORAL_KINDS[r.nextInt(5)] + '_coral_wall_fan'];
+        if (w !== undefined) R.set(x + dx, y, z + dz, w, withProp(w, 0, 'facing', f));
       }
     }
-    return placed;
+    return true;
+  }
+  const coralFeature = (place) => (ctx, cfg, r, x, y, z) => {
+    const blk = BID[CORAL_KINDS[r.nextInt(5)] + '_coral_block'];
+    return blk === undefined ? false : place(ctx.R, r, x, y, z, blk);
   };
+  FEATURE.coral_tree = coralFeature((R, r, x, y, z, blk) => {
+    let py = y;
+    const trunk = r.nextInt(3) + 1;
+    for (let i = 0; i < trunk; i++, py++) if (!placeCoralBlock(R, r, x, py, z, blk)) return true;
+    const n = r.nextInt(3) + 2, dirs = shuffled(CORAL_DIRS, r);
+    for (const [bx, bz] of dirs.slice(0, n)) {
+      let px = x + bx, qy = py, pz = z + bz, seg = 0;
+      const h = r.nextInt(5) + 2;
+      for (let j = 0; j < h && placeCoralBlock(R, r, px, qy, pz, blk); j++) {
+        seg++; qy++;
+        if (j === 0 || (seg >= 2 && r.nextFloat() < 0.25)) { px += bx; pz += bz; seg = 0; }
+      }
+    }
+    return true;
+  });
+  FEATURE.coral_claw = coralFeature((R, r, x, y, z, blk) => {
+    if (!placeCoralBlock(R, r, x, y, z, blk)) return false;
+    const ci = r.nextInt(4), claw = CORAL_DIRS[ci], n = r.nextInt(2) + 2;
+    const branches = shuffled([claw, CORAL_DIRS[(ci + 1) & 3], CORAL_DIRS[(ci + 3) & 3]], r);
+    for (const br of branches.slice(0, n)) {
+      let px = x + br[0], py = y, pz = z + br[1];
+      const side = r.nextInt(2) + 1;
+      let seg, inway;
+      if (br === claw) { seg = [claw[0], 0, claw[1]]; inway = r.nextInt(3) + 2; }
+      else { py++; seg = r.nextInt(2) === 0 ? [br[0], 0, br[1]] : [0, 1, 0]; inway = r.nextInt(3) + 3; }
+      for (let i = 0; i < side && placeCoralBlock(R, r, px, py, pz, blk); i++) { px += seg[0]; py += seg[1]; pz += seg[2]; }
+      px -= seg[0]; py -= seg[1]; pz -= seg[2]; py++;
+      for (let i = 0; i < inway; i++) {
+        px += claw[0]; pz += claw[1];
+        if (!placeCoralBlock(R, r, px, py, pz, blk)) break;
+        if (r.nextFloat() < 0.25) py++;
+      }
+    }
+    return true;
+  });
+  FEATURE.coral_mushroom = coralFeature((R, r, x, y, z, blk) => {
+    const h = r.nextInt(3) + 3, w = r.nextInt(3) + 3, l = r.nextInt(3) + 3, sink = r.nextInt(3) + 1;
+    for (let a = 0; a <= w; a++) for (let b = 0; b <= h; b++) for (let c = 0; c <= l; c++) {
+      const ea = a === 0 || a === w, eb = b === 0 || b === h, ec = c === 0 || c === l;
+      if ((ea && eb) || (ec && eb) || (ea && ec) || !(ea || eb || ec)) continue;
+      if (r.nextFloat() < 0.1) continue;
+      placeCoralBlock(R, r, x + a, y + b - sink, z + c, blk);
+    }
+    return true;
+  });
   FEATURE.blue_ice = (ctx, cfg, r, x, y, z) => {
     const R = ctx.R;
     if (y > 61 || y < R.minY) return false;
@@ -1096,48 +1277,246 @@ const Features = (() => {
     }
     return true;
   };
-  // pointed dripstone clusters / large dripstones (simplified)
-  FEATURE.pointed_dripstone = FEATURE.speleothem = (ctx, cfg, r, x, y, z) => {
-    const R = ctx.R, PD = BID.pointed_dripstone;
-    if (PD === undefined) return false;
-    const up = SOLIDCUBE[R.id(x, y + 1, z)], down = SOLIDCUBE[R.id(x, y - 1, z)];
-    if (!up && !down) return false;
-    const dir = up ? -1 : 1, len = 1 + r.nextInt(4);
-    for (let i = 0; i < len; i++) {
-      const py = y + i * dir;
-      if (!R.isAir(py === y ? x : x, py, z)) break;
-      const th = i === len - 1 ? 'tip' : i === len - 2 ? 'frustum' : i === 0 ? 'base' : 'middle';
-      R.set(x, py, z, PD, Math.max(0, BLOCKS[PD].states.findIndex(s => s.thickness === th && s.vertical_direction === (dir < 0 ? 'down' : 'up'))));
+  // ---- speleothems (pointed dripstone): SpeleothemFeature, SpeleothemClusterFeature, LargeDripstoneFeature, SpeleothemUtils.
+  // (They were simplified: every cluster put a dripstone block and a 1-4 long dripstone on floor and ceiling of 60 % of
+  // the columns in its radius, on any solid block - caves full of dripstone, and dripstone grown into structures)
+  function floatProvider(p) {
+    if (typeof p === 'number') return () => p;
+    const t = strip(p.type), fr = Math.fround;
+    switch (t) {
+      case 'constant': return () => p.value;
+      case 'uniform': return (r) => fr(fr(r.nextFloat() * fr(p.max_exclusive - p.min_inclusive)) + p.min_inclusive);
+      case 'clamped_normal': return (r) => clamp(fr(p.mean + fr(fr(r.nextGaussian()) * p.deviation)), p.min, p.max);
     }
+    throw new Error('float provider ' + t);
+  }
+  const emptyOrWater = (id) => id === 0 || id === WATER;
+  // water or a waterlogged block (its fluid state is water)
+  const fluidWater = (R, x, y, z) => {
+    const id = R.id(x, y, z);
+    if (id === WATER) return true;
+    const c = WATERLOGGED.has(id) && R.chunk(x, z);
+    return !!(c && c.wl && c.wl.has(((y - R.minY) << 8) | ((z & 15) << 4) | (x & 15)));
+  };
+  const emptyOrWaterOrLava = (id) => id === 0 || id === WATER || id === LAVA;
+  // Column.scan: the floor and ceiling (null: none within range) of the run of `inside` cells through y
+  function scanColumn(R, x, y, z, range, inside, edge) {
+    if (!inside(R.id(x, y, z))) return null;
+    const dir = (d) => { let py = y; for (let i = 1; i < range && inside(R.id(x, py, z)); i++) py += d; return edge(R.id(x, py, z)) ? py : null; };
+    const ceiling = dir(1), floor = dir(-1);
+    return { floor, ceiling };
+  }
+  // the speleothem configs' blocks: [base id, pointed id, replaceable set] (null: a block this game doesn't have)
+  const speleoBlocks = (cfg) => once(cfg, 'blocks', () => {
+    const b = stateOf(cfg.raw.base_block), p = stateOf(cfg.raw.pointed_block);
+    return b && p && BLOCKS[p[0]].states ? [b[0], p[0], blockSet(cfg.raw.replaceable_blocks)] : null;
+  });
+  const pointedMeta = (id, dir, th) => Math.max(0, BLOCKS[id].states.findIndex(s => s.thickness === th && s.vertical_direction === (dir > 0 ? 'up' : 'down')));
+  const isBase = (id, B) => id === B[0] || B[2].has(id);
+  function placeBaseBlock(R, x, y, z, B) { if (!B[2].has(R.id(x, y, z))) return false; R.set(x, y, z, B[0]); return true; }
+  // SpeleothemUtils.growSpeleothem: base, middles, frustum, tip from (x, y, z) towards dir (1 up, -1 down)
+  function growSpeleothem(R, x, y, z, dir, height, merged, B) {
+    if (!isBase(R.id(x, y - dir, z), B)) return;
+    const L = [];
+    if (height >= 3) { L.push('base'); for (let i = 0; i < height - 3; i++) L.push('middle'); }
+    if (height >= 2) L.push('frustum');
+    if (height >= 1) L.push(merged ? 'tip_merge' : 'tip');
+    L.forEach((th, i) => R.set(x, y + i * dir, z, B[1], pointedMeta(B[1], dir, th)));
+  }
+  const HORIZ4 = [[0, -1], [1, 0], [0, 1], [-1, 0]], DIR6V = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]]; // (Direction order)
+  FEATURE.pointed_dripstone = FEATURE.speleothem = (ctx, cfg, r, x, y, z) => {
+    const R = ctx.R, B = speleoBlocks(cfg), c = cfg.raw;
+    if (!B) return false;
+    const above = isBase(R.id(x, y + 1, z), B), below = isBase(R.id(x, y - 1, z), B);
+    if (!above && !below) return false;
+    const dir = above && below ? (r.nextBoolean() ? -1 : 1) : above ? -1 : 1;
+    // the patch of base blocks around the root
+    const spread = c.chance_of_directional_spread ?? 0.7, s2 = c.chance_of_spread_radius2 ?? 0.5, s3 = c.chance_of_spread_radius3 ?? 0.5;
+    const rx = x, ry = y - dir, rz = z;
+    placeBaseBlock(R, rx, ry, rz, B);
+    for (const [hx, hz] of HORIZ4) {
+      if (r.nextFloat() > spread) continue;
+      const x1 = rx + hx, z1 = rz + hz;
+      placeBaseBlock(R, x1, ry, z1, B);
+      if (r.nextFloat() > s2) continue;
+      const d2 = DIR6V[r.nextInt(6)], x2 = x1 + d2[0], y2 = ry + d2[1], z2 = z1 + d2[2];
+      placeBaseBlock(R, x2, y2, z2, B);
+      if (r.nextFloat() > s3) continue;
+      const d3 = DIR6V[r.nextInt(6)];
+      placeBaseBlock(R, x2 + d3[0], y2 + d3[1], z2 + d3[2], B);
+    }
+    const h = r.nextFloat() < (c.chance_of_taller_generation ?? 0.2) && emptyOrWater(R.id(x, y + dir, z)) ? 2 : 1;
+    growSpeleothem(R, x, y, z, dir, h, false, B);
     return true;
   };
   FEATURE.dripstone_cluster = FEATURE.speleothem_cluster = (ctx, cfg, r, x, y, z) => {
-    const R = ctx.R, DB = BID.dripstone_block;
-    const rad = intProvider(cfg.raw.radius || 5)(r);
-    let any = false;
-    for (let dx = -rad; dx <= rad; dx++) for (let dz = -rad; dz <= rad; dz++) {
-      if (dx * dx + dz * dz > rad * rad || r.nextFloat() > 0.6) continue;
-      for (const dy of [-1, 1]) {
-        let py = y;
-        for (let k = 0; k < 12 && R.isAir(x + dx, py, z + dz); k++) py += dy;
-        if (SOLIDCUBE[R.id(x + dx, py, z + dz)] && DB !== undefined) { R.set(x + dx, py, z + dz, DB); any = true; FEATURE.pointed_dripstone(ctx, cfg, r, x + dx, py - dy, z + dz); }
+    const R = ctx.R, B = speleoBlocks(cfg), c = cfg.raw;
+    if (!B || !emptyOrWater(R.id(x, y, z))) return false;
+    const P = once(cfg, 'prov', () => ({ height: intProvider(c.height), wet: floatProvider(c.wetness), dens: floatProvider(c.density), rad: intProvider(c.radius), layer: intProvider(c.speleothem_block_layer_thickness) }));
+    const height = P.height(r), wetness = P.wet(r), density = P.dens(r), xr = P.rad(r), zr = P.rad(r);
+    const range = c.floor_to_ceiling_search_range, diff = c.max_stalagmite_stalactite_height_diff;
+    const isLava = (px, py, pz) => R.id(px, py, pz) === LAVA, stone = tagSet('base_stone_overworld');
+    const stoneOrWater = (px, py, pz) => stone.has(R.id(px, py, pz)) || fluidWater(R, px, py, pz);
+    const canPool = (px, py, pz) => {
+      const id = R.id(px, py, pz);
+      if (id === WATER || id === B[0] || id === B[1] || fluidWater(R, px, py + 1, pz)) return false;
+      for (const [hx, hz] of HORIZ4) if (!stoneOrWater(px + hx, py, pz + hz)) return false;
+      return stoneOrWater(px, py - 1, pz);
+    };
+    const spHeight = (dx, dz, maxH) => {
+      if (r.nextFloat() > density) return 0;
+      const dist = Math.abs(dx) + Math.abs(dz), mean = WG.clampedMap(dist, 0, c.max_distance_from_center_affecting_height_bias, maxH / 2, 0);
+      return Math.trunc(clamp(Math.fround(mean + Math.fround(Math.fround(r.nextGaussian()) * c.height_deviation)), 0, maxH));
+    };
+    for (let dx = -xr; dx <= xr; dx++) for (let dz = -zr; dz <= zr; dz++) {
+      const edge = Math.min(xr - Math.abs(dx), zr - Math.abs(dz));
+      const chance = WG.clampedMap(edge, 0, c.max_distance_from_edge_affecting_chance_of_speleothem, c.chance_of_speleothem_at_max_distance_from_center, 1);
+      const px = x + dx, pz = z + dz;
+      const col = scanColumn(R, px, y, pz, range, emptyOrWater, (id) => !emptyOrWater(id));
+      if (!col) continue;
+      const ceiling = col.ceiling;
+      let floor = col.floor;
+      if (ceiling === null && floor === null) continue;
+      if (r.nextFloat() < wetness && floor !== null && canPool(px, floor, pz)) { R.set(px, floor, pz, WATER); floor--; }
+      let stalactite = 0, stalagmite = 0;
+      if (r.nextDouble() < chance && ceiling !== null && !isLava(px, ceiling, pz)) {
+        const t = P.layer(r);
+        for (let i = 0; i < t && placeBaseBlock(R, px, ceiling + i, pz, B); i++);
+        stalactite = spHeight(dx, dz, floor !== null ? Math.min(height, ceiling - floor) : height);
       }
+      if (r.nextDouble() < chance && floor !== null && !isLava(px, floor, pz)) {
+        const t = P.layer(r);
+        for (let i = 0; i < t && placeBaseBlock(R, px, floor - i, pz, B); i++);
+        stalagmite = ceiling !== null ? Math.max(0, stalactite + r.nextInt(2 * diff + 1) - diff) : spHeight(dx, dz, height);
+      }
+      let actTite = stalactite, actMite = stalagmite;
+      if (ceiling !== null && floor !== null && ceiling - stalactite <= floor + stalagmite) {
+        const lo = Math.max(ceiling - stalactite, floor + 1), hi = Math.min(floor + stalagmite, ceiling - 1);
+        const bottom = r.nextInt(hi + 1 - lo + 1) + lo;
+        actTite = ceiling - bottom; actMite = bottom - 1 - floor;
+      }
+      const merge = r.nextBoolean() && actTite > 0 && actMite > 0 && ceiling !== null && floor !== null && actTite + actMite === ceiling - floor - 1;
+      if (ceiling !== null) growSpeleothem(R, px, ceiling - 1, pz, -1, actTite, merge, B);
+      if (floor !== null) growSpeleothem(R, px, floor + 1, pz, 1, actMite, merge, B);
     }
-    return any;
+    return true;
   };
-  FEATURE.large_dripstone = (ctx, cfg, r, x, y, z) => FEATURE.dripstone_cluster(ctx, { raw: { radius: 3 } }, r, x, y, z);
+  FEATURE.large_dripstone = (ctx, cfg, r, x, y, z) => {
+    const R = ctx.R, c = cfg.raw, DB = BID.dripstone_block;
+    if (DB === undefined || !emptyOrWater(R.id(x, y, z))) return false;
+    const repl = once(cfg, 'repl', () => blockSet(c.replaceable_blocks)), stone = tagSet('base_stone_overworld');
+    const col = scanColumn(R, x, y, z, c.floor_to_ceiling_search_range ?? 30, emptyOrWater, (id) => id === DB || repl.has(id) || id === LAVA);
+    if (!col || col.floor === null || col.ceiling === null) return false;
+    const colH = col.ceiling - col.floor - 1;
+    if (colH < 4) return false;
+    const P = once(cfg, 'prov', () => ({ tite: floatProvider(c.stalactite_bluntness), mite: floatProvider(c.stalagmite_bluntness), scale: floatProvider(c.height_scale), wind: floatProvider(c.wind_speed) }));
+    const cr = c.column_radius, rMin = cr.min_inclusive, rMax = cr.max_inclusive;
+    const maxR = clamp(Math.trunc(colH * Math.fround(c.max_column_radius_to_cave_height_ratio)), rMin, rMax);
+    const radius = r.nextInt(maxR - rMin + 1) + rMin;
+    const make = (ry, up, blunt) => ({ x, y: ry, z, up, radius, blunt: blunt(r), scale: P.scale(r) });
+    const tite = make(col.ceiling - 1, false, P.tite), mite = make(col.floor + 1, true, P.mite);
+    const heightAt = (d, cr2) => {
+      let dd = cr2 < d.blunt ? d.blunt : cr2;
+      const rr = dd / d.radius * 0.384, h = d.scale * (0.75 * Math.pow(rr, 4 / 3) - Math.pow(rr, 2 / 3) - Math.log(rr) / 3);
+      return Math.trunc(Math.max(h, 0) / 0.384 * d.radius);
+    };
+    const windy = (d) => d.radius >= c.min_radius_for_wind && d.blunt >= c.min_bluntness_for_wind;
+    let wind = null;
+    if (windy(tite) && windy(mite)) {
+      const speed = P.wind(r), dirA = Math.fround(r.nextFloat() * Math.fround(Math.PI));
+      wind = { oy: y, wx: mcos(dirA) * speed, wz: msin(dirA) * speed, max: 16 - radius };
+    }
+    const off = (px, py, pz) => {
+      if (!wind) return [px, py, pz];
+      const dy = wind.oy - py;
+      return [px + clamp(Math.floor(wind.wx * dy), -wind.max, wind.max), py, pz + clamp(Math.floor(wind.wz * dy), -wind.max, wind.max)];
+    };
+    const embedded = (px, py, pz, rad) => {
+      if (emptyOrWaterOrLava(R.id(px, py, pz))) return false;
+      const inc = Math.fround(6 / rad);
+      for (let a = 0; a < Math.fround(Math.PI * 2); a = Math.fround(a + inc)) {
+        if (emptyOrWaterOrLava(R.id(px + Math.trunc(mcos(a) * rad), py, pz + Math.trunc(msin(a) * rad)))) return false;
+      }
+      return true;
+    };
+    const settle = (d) => {
+      while (d.radius > 1) {
+        let ry = d.y;
+        const tries = Math.min(10, heightAt(d, 0));
+        for (let i = 0; i < tries; i++) {
+          if (R.id(d.x, ry, d.z) === LAVA) return false;
+          const [ox, oy, oz] = off(d.x, ry, d.z);
+          if (embedded(ox, oy, oz, d.radius)) { d.y = ry; return true; }
+          ry += d.up ? -1 : 1;
+        }
+        d.radius = d.radius >> 1;
+      }
+      return false;
+    };
+    const place = (d) => {
+      for (let dx = -d.radius; dx <= d.radius; dx++) for (let dz = -d.radius; dz <= d.radius; dz++) {
+        const cur = Math.fround(Math.sqrt(dx * dx + dz * dz));
+        if (cur > d.radius) continue;
+        let h = heightAt(d, cur);
+        if (h <= 0) continue;
+        if (r.nextFloat() < 0.2) h = Math.trunc(h * Math.fround(Math.fround(r.nextFloat() * 0.2) + 0.8));
+        let py = d.y, out = false;
+        const maxY = d.up ? R.height('WORLD_SURFACE_WG', d.x + dx, d.z + dz) : Infinity;
+        for (let i = 0; i < h && py < maxY; i++) {
+          const [ox, oy, oz] = off(d.x + dx, py, d.z + dz), id = R.id(ox, oy, oz);
+          if (emptyOrWaterOrLava(id)) { out = true; R.set(ox, oy, oz, DB); }
+          else if (out && stone.has(id)) break;
+          py += d.up ? 1 : -1;
+        }
+      }
+    };
+    const a = settle(tite), b = settle(mite);
+    if (a) place(tite);
+    if (b) place(mite);
+    return true;
+  };
+  // SculkPatchFeature. The sculk itself still spreads in a simplified way (no SculkSpreader cursors / veins), but what grows
+  // on it follows vanilla: the catalyst only at the patch's origin (catalyst_chance), a sensor or 1 in 11 a shrieker where
+  // a charge (amount_per_charge of 50 per growth) is used up, never within 1 of the origin nor where the 9 x 3 x 9 around
+  // already has more than 2, and extra_rare_growths shriekers (ancient cities only). It used to put a sensor, shrieker or
+  // catalyst (a third each) on 4.5 % of the sculk it placed, with no spacing - the deep dark was full of them
   FEATURE.sculk_patch = (ctx, cfg, r, x, y, z) => {
-    const R = ctx.R, S = BID.sculk, V = BID.sculk_vein;
+    const R = ctx.R, S = BID.sculk, c = cfg.raw;
     if (S === undefined) return false;
-    const n = cfg.raw.spread_attempts || 32;
-    let any = false;
+    // canSpreadFrom: sculk, or air / a water source next to a full block
+    const o = R.id(x, y, z);
+    if (!(o === S || o === BID.sculk_vein || o === BID.sculk_catalyst || o === 0 || (o === WATER && R.meta(x, y, z) === 0))) return false;
+    if (o !== S && o !== BID.sculk_vein && o !== BID.sculk_catalyst && !DIR6V.some(([dx, dy, dz]) => SOLIDCUBE[R.id(x + dx, y + dy, z + dz)])) return false;
+    const repl = tagSet('sculk_replaceable_world_gen'), spots = [];
+    const n = (c.spread_attempts || 32) * Math.max(1, (c.spread_rounds || 0) + (c.growth_rounds || 0));
     for (let i = 0; i < n; i++) {
       const px = x + r.nextInt(9) - 4, pz = z + r.nextInt(9) - 4;
       let py = y; for (let k = 0; k < 6 && R.isAir(px, py, pz); k++) py--;
       const id = R.id(px, py, pz);
-      if (SOLIDCUBE[id] && id !== BID.bedrock) { R.set(px, py, pz, S); any = true; if (r.nextFloat() < 0.15 && R.isAir(px, py + 1, pz)) { const k = ['sculk_sensor', 'sculk_shrieker', 'sculk_catalyst'][r.nextInt(3)]; if (BID[k] !== undefined && r.nextFloat() < 0.3) R.set(px, py + 1, pz, BID[k]); } }
+      if (id === S || (repl.has(id) && SOLIDCUBE[id])) { if (id !== S) R.set(px, py, pz, S); spots.push([px, py, pz]); }
     }
-    return any;
+    const SENSOR = BID.sculk_sensor, SHRIEKER = BID.sculk_shrieker;
+    const growthsNear = (px, py, pz) => {
+      let k = 0;
+      for (let ax = -4; ax <= 4; ax++) for (let ay = 0; ay <= 2; ay++) for (let az = -4; az <= 4; az++) { const id = R.id(px + ax, py + ay, pz + az); if (id === SENSOR || id === SHRIEKER) k++; }
+      return k;
+    };
+    const per = c.amount_per_charge || 32;
+    if (spots.length && SENSOR !== undefined && SHRIEKER !== undefined) for (let i = 0; i < (c.charge_count || 1); i++) {
+      const [px, py, pz] = spots[r.nextInt(spots.length)];
+      if ((px - x) ** 2 + (py - y) ** 2 + (pz - z) ** 2 < 1) continue; // (noGrowthRadius 1)
+      const up = R.id(px, py + 1, pz);
+      if (!(up === 0 || up === WATER) || growthsNear(px, py, pz) > 2 || r.nextInt(50) >= per) continue;
+      if (r.nextInt(11) === 0) R.set(px, py + 1, pz, SHRIEKER, withProp(SHRIEKER, 0, 'can_summon', true));
+      else R.set(px, py + 1, pz, SENSOR, withProp(SENSOR, 0, 'sculk_sensor_phase', 'inactive'));
+    }
+    if (r.nextFloat() <= (c.catalyst_chance ?? 0.5) && SOLIDCUBE[R.id(x, y - 1, z)] && BID.sculk_catalyst !== undefined) R.set(x, y, z, BID.sculk_catalyst);
+    const extra = c.extra_rare_growths ? intProvider(c.extra_rare_growths)(r) : 0;
+    for (let i = 0; i < extra && SHRIEKER !== undefined; i++) {
+      const px = x + r.nextInt(5) - 2, pz = z + r.nextInt(5) - 2;
+      if (R.isAir(px, y, pz) && SOLIDCUBE[R.id(px, y - 1, pz)]) R.set(px, y, pz, SHRIEKER, withProp(SHRIEKER, 0, 'can_summon', true));
+    }
+    return true;
   };
   // vanilla dungeons are generated by the old generator's monster room (kept for gen-2 too)
   FEATURE.monster_room = (ctx, cfg, r, x, y, z) => {
@@ -1167,7 +1546,7 @@ const Features = (() => {
       R.set(px, y, pz, BID.chest, 4 | 8);
       break;
     }
-    R.set(x, y, z, BID.spawner, r.nextInt(3));
+    R.set(x, y, z, BID.spawner, [1, 0, 0, 2][r.nextInt(4)]); // (vanilla's MOBS: skeleton, zombie, zombie, spider - dims.js SPAWNER_MOBS)
     return true;
   };
 
@@ -1450,7 +1829,11 @@ const Features = (() => {
   function decorate(game, world, ch) {
     buildOrder(world.dim === 'nether' ? 'nether' : 'overworld');
     DIM.minY = world.minY || 0; DIM.height = world.dim === 'nether' ? 128 : HEIGHT;
+    // (a chunk decorated before and generated again: what that decoration wrote, instead of running it once more)
+    const rec = world.spills && world.spills.get(ckey(ch.cx, ch.cz));
+    if (rec && rec.has(ckey(ch.cx, ch.cz))) { restoreSpill(world, ch, rec); return; }
     const R = new Region(world, ch.cx, ch.cz);
+    if (world.spills) R.spill = new Map();
     const seedStr = world.seedStr || '0';
     if (!game._zoom || game._zoomSeed !== seedStr) { game._zoom = new WG.BiomeZoom(BigInt(seedStr)); game._zoomSeed = seedStr; }
     const zoom = game._zoom;
@@ -1486,8 +1869,85 @@ const Features = (() => {
         try { placePF(ctx, f, rand, [x0, MIN_Y, z0], f); } catch (e) { if (!decorate.warned) { decorate.warned = true; console.warn('feature', f, e); } }
       }
     }
+    if (R.spill) keepSpill(world, ch, R);
   }
-  const api = { decorate, WRand, Region, stateOf, provider, predicate, intProvider, placePF, placeCF: (ctx, cf, r, p) => { if (!LEAVES) initTags(); return placeCF(ctx, cf, r, p); }, FEATURE, canSurvive, tagSet, withProp, msin, mcos, propOf };
+  // What a chunk's decoration wrote, into itself and into its neighbours (world.spills: source key -> target key ->
+  // {seq, after, d}), kept while the source or a neighbour of it is held. Vanilla never generates a chunk twice; here a
+  // chunk that was unloaded (or a proto that was dropped) is generated again next to neighbours that are already
+  // decorated and won't run their features again, so what they had put into it - the halves of trees and ore blobs on
+  // its border - was lost; and decorated again against neighbours in another state its own trees came out elsewhere,
+  // cut at the finished neighbours, their old halves left there as floating leaves that then decayed. Now it gets its
+  // own decoration and its neighbours' back from these records. (`after`: written after the target's own decoration;
+  // ch.got: the sources whose writes a chunk already has)
+  function keepSpill(world, ch, R) {
+    const sk = ckey(ch.cx, ch.cz);
+    let rec = world.spills.get(sk);
+    if (!rec) world.spills.set(sk, rec = new Map());
+    // (the chunks this decoration could write into get the new record; a finished one keeps the old record)
+    for (let j = 0; j < 9; j++) { const c = R.ch[j]; if (c && !c.final) rec.delete(ckey(c.cx, c.cz)); }
+    if (!R.spill.has(ch)) R.spill.set(ch, new Set());
+    for (const [c, set] of R.spill) {
+      // runs of cells in a row (x) with the same block: [first cell | (length - 1) << 18, id | (meta | waterlogged 256) << 16]
+      // (ore blobs are most of it: about a fifth of one entry per cell)
+      const idx = Int32Array.from(set).sort(), d = new Int32Array(idx.length * 2), st = (i) => c.getM(i) | (c.wl && c.wl.has(i) ? 256 : 0);
+      let n = 0;
+      for (let j = 0; j < idx.length;) {
+        const i = idx[j], id = c.getB(i), m = st(i);
+        let len = 1;
+        while (len < 4096 && j + len < idx.length && idx[j + len] === i + len && c.getB(i + len) === id && st(i + len) === m) len++;
+        d[n++] = i | ((len - 1) << 18); d[n++] = id | (m << 16);
+        j += len;
+      }
+      world.spillSeq = (world.spillSeq || 0) + 1;
+      rec.set(ckey(c.cx, c.cz), { seq: world.spillSeq, after: c.stage === 2, d: d.slice(0, n) });
+      if (c !== ch) (c.got || (c.got = new Set())).add(sk);
+    }
+  }
+  function putSpill(ch, e) {
+    const d = e.d;
+    for (let n = 0; n < d.length; n += 2) {
+      const i0 = d[n] & 0x3ffff, end = i0 + (d[n] >>> 18) + 1, id = d[n + 1] & 0xffff, m = d[n + 1] >>> 16;
+      for (let i = i0; i < end; i++) {
+        ch.setB(i, id); ch.setM(i, m & 255);
+        if (m & 256) (ch.wl || (ch.wl = new Set())).add(i); else if (ch.wl) ch.wl.delete(i);
+      }
+    }
+  }
+  // a chunk decorated before: its own record, and its records for the neighbours that don't have them (made again since)
+  function restoreSpill(world, ch, rec) {
+    const k = ckey(ch.cx, ch.cz);
+    putSpill(ch, rec.get(k));
+    for (const [tk, e] of rec) {
+      const c = tk !== k && world.proto.get(tk);
+      if (!c || c.final || (c.got && c.got.has(k))) continue;
+      putSpill(c, e);
+      (c.got || (c.got = new Set())).add(k);
+    }
+  }
+  // the records of decorated neighbours (decorated(key)) for a chunk generated again: after = false when it arrives,
+  // true right after its own decoration
+  function applySpill(world, ch, after, decorated) {
+    if (!world.spills) return;
+    const k = ckey(ch.cx, ch.cz), list = [];
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+      if (!a && !b) continue;
+      const nk = ckey(ch.cx + a, ch.cz + b), rec = world.spills.get(nk), e = rec && rec.get(k);
+      if (e && e.after === after && !(ch.got && ch.got.has(nk)) && decorated(nk)) list.push([e, nk]);
+    }
+    list.sort((x, y) => x[0].seq - y[0].seq);
+    for (const [e, nk] of list) { putSpill(ch, e); (ch.got || (ch.got = new Set())).add(nk); }
+  }
+  // records no longer needed: neither the source nor a neighbour of it is held (held(key))
+  function pruneSpill(world, held) {
+    if (!world.spills) return;
+    for (const sk of world.spills.keys()) {
+      const cx = Math.floor(sk / 65536) - 32768, cz = (sk % 65536) - 32768;
+      let keep = false;
+      for (let a = -1; a <= 1 && !keep; a++) for (let b = -1; b <= 1; b++) if (held(ckey(cx + a, cz + b))) { keep = true; break; }
+      if (!keep) world.spills.delete(sk);
+    }
+  }
+  const api = { decorate, applySpill, pruneSpill, WRand, Region, stateOf, provider, predicate, intProvider, placePF, placeCF: (ctx, cf, r, p) => { if (!LEAVES) initTags(); return placeCF(ctx, cf, r, p); }, FEATURE, canSurvive, tagSet, withProp, msin, mcos, propOf, sturdy, faceUpdate };
   api.helpers = () => ({ LEAVES, LOGS, DIRT, REPLACE_TREES, DIR6, once });
   return api;
 })();

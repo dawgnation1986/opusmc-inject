@@ -88,9 +88,9 @@ const Checkin = (() => {
       const get = async (path, body) => {
         let f;
         try { f = await fetch(base + path, body ? { method: 'POST', body: JSON.stringify(body) } : undefined); }
-        catch (e) { this.wait = 600000; throw new Error('连不上游戏服务器'); }
+        catch (e) { this.wait = 600000; throw new Error('游戏正在更新中…请稍后'); }
         if (f.status === 401) return null;
-        let j; try { j = await f.json(); } catch (e) { j = { error: '服务器没有回应（HTTP ' + f.status + '）' }; }
+        let j; try { j = await f.json(); } catch (e) { j = { error: '游戏正在更新中…请稍后' }; }
         if (!f.ok || j.error) throw new Error(j.error || 'HTTP ' + f.status);
         return j;
       };
@@ -558,7 +558,7 @@ class CheckinScreen extends MenuScreen {
     tl.call(this);
     const g = this.game;
     Checkin.load(g); // (each time the title opens, at most once a minute)
-    if (!Checkin.shown()) return;
+    if (!Checkin.shown() || !(typeof Live === 'undefined' || Live.on('title.checkin'))) return; // (the admin panel can hide it: js/live.js)
     const r = Checkin.titleRect(g.ui);
     this.widgets.push({ ...r, label: '签到', checkin: true, tip: ['开服签到：累计签 ' + Checkin.count() + ' 天，领原创装饰'], onClick: () => g.ui.open(new CheckinScreen(g, this)) });
   };
@@ -567,7 +567,7 @@ class CheckinScreen extends MenuScreen {
     pl.call(this);
     const g = this.game;
     Checkin.load(g);
-    if (!Checkin.shown()) return;
+    if (!Checkin.shown() || !(typeof Live === 'undefined' || Live.on('title.checkin'))) return;
     // (the top left: the menu's own rows change with rooms, the AI companion and local rooms; the top right is where the
     // touch HUD's pause button is - a second tap there to get back to the game opened this)
     this.widgets.push({ x: 4, y: 4, w: 54, h: 16, label: '签到', checkin: true, onClick: () => g.ui.open(new CheckinScreen(g, this)) });

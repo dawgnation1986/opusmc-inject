@@ -447,7 +447,9 @@
           for (const s of startsAt(gen, p[0], p[1])) {
             if (!s.name.startsWith(name)) continue;
             const x = (s.box[0] + s.box[3]) >> 1, z = (s.box[2] + s.box[5]) >> 1, d = Math.hypot(x - cx * 16, z - cz * 16);
-            if (!best || d < best.d) best = { name: s.name, x, y: s.pieces[0].box[1], z, d };
+            // (a fortress start has no pieces here: its builder runs on the main thread)
+            const y = s.pieces.length ? s.pieces[0].box[1] : s.fortress ? s.fortress[1] : s.box[1];
+            if (!best || d < best.d) best = { name: s.name, x, y, z, d };
           }
         }
       }
@@ -583,10 +585,13 @@
       if (terrain) y = height(x, z) - 1 + b[1];
       out.loot.push([x, y, z, b[3], b[4]]);
     }
+    // entities: vanilla StructureTemplate.transform(Vec3) - a position inside a block turns with that block (the +1s),
+    // not as the block corner (the iron golem stood outside its cage in turned outposts); the chunk is the block's
     if (tpl.ent) for (const e of tpl.ent) {
-      const rp = rotPos(e[0], e[1], e[2], rot), x = rp[0] + p.pos[0], z = rp[2] + p.pos[2];
-      if (x < x0 || x >= x0 + 16 || z < z0 || z >= z0 + 16) continue;
-      out.ent.push([x, rp[1] + p.pos[1], z, e[3], e[4]]);
+      const bp = rotPos(Math.floor(e[0]), Math.floor(e[1]), Math.floor(e[2]), rot), bx = bp[0] + p.pos[0], bz = bp[2] + p.pos[2];
+      if (bx < x0 || bx >= x0 + 16 || bz < z0 || bz >= z0 + 16) continue;
+      const [ex, ey, ez] = e, rp = rot === 1 ? [1 - ez, ey, ex] : rot === 2 ? [1 - ex, ey, 1 - ez] : rot === 3 ? [ez, ey, 1 - ex] : [ex, ey, ez];
+      out.ent.push([rp[0] + p.pos[0], rp[1] + p.pos[1], rp[2] + p.pos[2], e[3], e[4]]);
     }
   }
 

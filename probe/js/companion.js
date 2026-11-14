@@ -6,7 +6,8 @@
 // our storage; the service also makes the prompt and keeps the talk and the limits. Talking: V (or 游戏菜单 → 伙伴); what is going on in
 // the game goes along with each line, so the answers fit; now and then (an advancement, a death, a new dimension) it
 // says something by itself. What it remembers of the player is a short note the service keeps with the account.
-// Unlocked by 三连 on the companion's video (the service's ai.videos; until it is out, following the UP).
+// Unlocked by following the UP and 三连 on the game's video (the service's /api/gate since 11-13; the service itself only
+// asks for following); the first time, it comes to the player in the world by itself and says hello (greet).
 // ---------------------------------------------------------------------------
 // the kaomoji it may use (ai.js gives the model the same list): every character of these is in the game's font
 // (tools/build_font.py takes the characters of the game's own text)
@@ -18,14 +19,14 @@ const Companion = {
   status: null, history: [], busy: false, sinceRemember: 0, lastEvent: 0, events: 0, watch: null,
   get name() { return (this.status && this.status.name) || '伙伴'; },
   // (the service's shared key - status.shared, with status.freeLeft lines left today; status.key: one's own, off now)
-  get ready() { return !COMPANION_OFF && !!(this.status && this.status.on && this.status.unlocked && (this.status.key || this.status.shared)); },
+  get ready() { return !COMPANION_OFF && !!(this.status && this.status.on && this.unlocked && (this.status.key || this.status.shared)); },
+  // the service's unlock (following) and the 三连 the game asks for too (Account.has('jing'))
+  get unlocked() { return !!(this.status && this.status.unlocked) && Account.has('jing'); },
   // (whether it shows at all: the service says - not released to everyone yet)
   get shown() { return !COMPANION_OFF && !!(this.status && this.status.on); },
   async load() {
-    if (COMPANION_OFF || !Account.loggedIn) { this.status = null; if (!COMPANION_OFF && typeof alert === 'function' && !window.__aiDiagShown) { window.__aiDiagShown = 1; alert('[AI 诊断] 未登录（Account.loggedIn=false），跳过 status 拉取——先去标题屏登录'); } return null; }
-    try { this.status = await Account.api('/api/ai/status', {}); }
-    catch (e) { this.status = null; alert('[AI 诊断] status 拉取失败: ' + (e && e.message) + ' (HTTP ' + (e && e.status) + ')'); }
-    if (this.status && !this.status.on) alert('[AI 诊断] 服务端 on=false: ' + JSON.stringify(this.status).slice(0, 200));
+    if (COMPANION_OFF || !Account.loggedIn) { this.status = null; return null; }
+    try { this.status = await Account.api('/api/ai/status', {}); } catch (e) { }
     return this.status;
   },
   // ---- what is going on (plain words for the model) ----
@@ -70,7 +71,7 @@ const Companion = {
   },
   // ---- talking ----
   show(g, who, text, color) {
-    // (the chat box doesn't wrap: one line each up to its width)
+    // (one message a line, each up to the chat box's width, indented under the name)
     const lines = [], max = 312;
     let cur = who;
     for (const ch of String(text)) { if (Font.width(cur + ch) > max) { lines.push(cur); cur = '  '; } cur += ch; }
@@ -79,8 +80,13 @@ const Companion = {
   },
   // quick mode (the user, 2026-11-01): what the player writes in the chat is said to it too - every line alone in a
   // world, in a room only a line with its name in it (the friends' talk would use up the player's lines of the day)
+  // on at all (the user, 11-13: off for everyone by default - not shown, no hello, no lines of its own, the chat not
+  // answered - until the player turns it on in its screen; settings.jingOn, a new setting so everyone starts off. V
+  // and 和鲸鲸聊天 still talk to it: that is asking it on purpose)
+  // (never switched by the player: what the admin panel says - js/live.js jing.default, off unless set)
+  on(g) { if (!g || !g.settings) return false; const v = g.settings.jingOn; return v === true || (v === undefined && typeof Live !== 'undefined' && Live.get('jing.default', false) === true); },
   quick(g, text) {
-    if (!this.ready || g.settings.aiQuick === false) return false;
+    if (!this.ready || g.settings.aiQuick === false || !this.on(g)) return false;
     return text === undefined || !(g.net && g.net.room) || String(text).includes(this.name);
   },
   // quiet: a reaction of its own (to a command) - a refusal (too fast, no money) isn't shown
@@ -137,7 +143,7 @@ const Companion = {
   // something just happened: a line of its own, now and then (the player's lines: at most every 2 minutes, 10 a visit)
   async event(g, what) {
     const s = g.settings;
-    if (!this.ready || this.busy || s.aiTalk === false || g.state !== 'play') return;
+    if (!this.ready || this.busy || s.aiTalk === false || !this.on(g) || g.state !== 'play' || !(typeof Live === 'undefined' || Live.on('jing.chatty'))) return;
     const now = Date.now();
     if (now - this.lastEvent < 120e3 || this.events >= 10) return;
     this.lastEvent = now; this.events++; this.busy = true;
@@ -152,11 +158,32 @@ const Companion = {
     this.sinceRemember = 0;
     try { this.status = await Account.api('/api/ai/remember', { history: this.history.slice(-20) }); } catch (e) { }
   },
+  // ---- the first time it is unlocked (each account, on this device): called in front of the player in the world, with
+  // a hello of its own - not the model's, no line of the day used (the user, 2026-11-07: "通过后首次进入界面就会召唤鲸鲸")
+  hiDone: null, hiWait: 0,
+  greeted() {
+    const id = Account.data && Account.data.id; if (!id) return true;
+    if (!this.hiDone) { try { this.hiDone = new Set(JSON.parse(localStorage.getItem('mcjs-jing-hi') || '[]')); } catch (e) { this.hiDone = new Set(); } }
+    return this.hiDone.has(id);
+  },
+  greet(g) {
+    const id = Account.data && Account.data.id; if (!id) return;
+    this.greeted(); this.hiDone.add(id);
+    try { localStorage.setItem('mcjs-jing-hi', JSON.stringify([...this.hiDone].slice(-20))); } catch (e) { }
+    const how = typeof touchOn === 'function' && touchOn(g) ? (g.net && g.net.room ? `在聊天里叫一声「${this.name}」我就会回你` : '点开聊天直接跟我说话就行') : '按 V 就能和我聊天';
+    this.show(g, '<' + this.name + '> ', `你好呀～我是${this.name}！以后我就陪着你啦 (≧▽≦) ${how}，游戏里有什么不会的都可以问我哦～`, '#7FE3FF');
+    Jing.pulse = performance.now(); Jing.call(10000);
+    Sound.ev && Sound.ev('entity.experience_orb.pickup', null, 0.35, 1.3);
+    Telemetry.count && Telemetry.count('jing_hi');
+  },
   // the game watched once a second: advancements, death, another dimension
   start(g) {
     if (this.watch) return;
     let adv = null, dim = null, dead = false, world = null;
     this.watch = setInterval(() => {
+      // (the hello: two seconds into the world with nothing open, once it is unlocked)
+      if (g.state === 'play' && g.player && !g.player.dead && !g.ui.screen && this.ready && this.on(g) && (typeof Live === 'undefined' || Live.on('jing.greet')) && !this.greeted()) { if (++this.hiWait >= 2) { this.hiWait = 0; this.greet(g); } }
+      else this.hiWait = 0;
       if (g.state !== 'play' || !g.player) { adv = null; dim = null; world = null; return; }
       if (world !== g.world) { world = g.world; adv = new Set(Object.keys(g.adv || {})); dim = g.dim; dead = false; return; }
       const now = new Set(Object.keys(g.adv || {}));
@@ -176,7 +203,7 @@ function wrapText(text, w) { const out = []; let line = ''; for (const ch of Str
 // ---- talking to it: a line at the bottom like the chat's (the chat box shows the talk) ----
 class CompanionChatScreen extends MenuScreen {
   constructor(game) { super(game, null); this.blurBg = false; this.bgDim = 0; this.isChat = true; game.ui.chatOff = 0; }
-  wheel(ui, dy) { ui.chatOff = clamp((ui.chatOff || 0) - Math.sign(dy) * 7, 0, Math.max(0, ui.chat.length - 20)); }
+  wheel(ui, dy) { ui.chatOff = clamp((ui.chatOff || 0) - Math.sign(dy) * 7, 0, Math.max(0, ui.chatRowCount() - 20)); }
   layout() {
     const u = this.game.ui, lw = Font.width('对' + Companion.name + '说：') + 6;
     u.showInput(2 + lw, u.h - 14, u.w - 4 - lw, 12, '', (v) => { u.close(); v = v.trim(); if (v) Companion.say(this.game, v); }, { onEsc: () => u.close(), max: 200 });
@@ -201,9 +228,14 @@ class CompanionScreen extends FormScreen {
     const back = { x: cx - 100, y: u.h - 30, w: 200, h: 20, label: '完成', onClick: () => this.back() };
     if (!Account.loggedIn) { this.widgets.push({ x: cx - 100, y: 70, w: 200, h: 24, gold: true, label: '登录', onClick: () => g.ui.open(new LoginScreen(g, () => g.ui.open(new CompanionScreen(g, this.parent)))) }, back); return; }
     if (!st) { this.widgets.push(back); return; }
-    const vids = st.videos || [];
-    if (!st.unlocked) {
-      this.widgets.push({ x: cx - 100, y: 70, w: 200, h: 24, gold: true, label: vids.length ? '去三连解锁' : '去关注解锁', onClick: () => this.unlock() }, back);
+    if (!Companion.unlocked) {
+      // (both asked for: following the UP and 三连 on the game's video; each opens the app's own page)
+      const f = !!Account.unlocks.follow, t = Account.tripleOk();
+      this.widgets.push(
+        { x: cx - 100, y: 76, w: 98, h: 22, gold: !f, label: f ? '✓ 已关注' : '去关注', enabled: !f, tip: ['打开 UP 主的空间，关注后回来'], onClick: () => this.unlock('follow') },
+        { x: cx + 2, y: 76, w: 98, h: 22, gold: !t, label: t ? '✓ 已三连' : '去三连', enabled: !t, tip: ['打开新视频，点赞、投币、收藏后回来'], onClick: () => this.unlock('triple') },
+        { x: cx - 100, y: 102, w: 200, h: 20, label: () => (Account.checking ? '正在检查…' : '我完成了，检查'), enabled: !Account.checking, onClick: () => this.recheck() },
+        back);
       return;
     }
     const s = g.settings;
@@ -212,26 +244,39 @@ class CompanionScreen extends FormScreen {
       { x: cx - 49, y: 94, w: 98, h: 20, label: () => '快速模式：' + (s.aiQuick === false ? '关' : '开'), tip: ['开着时，在聊天框里说的话' + Companion.name + '都会回', '（联机房间里要提到「' + Companion.name + '」）；关掉就只有按 V 才回'], onClick: () => { s.aiQuick = s.aiQuick === false; g.saveSettings(); } },
       { x: cx + 52, y: 94, w: 98, h: 20, label: '忘掉记忆', enabled: !!st.memory, tip: st.memory ? [Companion.name + '记得：', ...wrapText(st.memory, 220), '', '点一下清空这些记忆'] : ['还没有记住什么'], onClick: () => this.forget() },
       // (no 改名字 any more - the user, 2026-11-05: 鲸鲸 is always 鲸鲸)
-      { x: st.admin ? cx - 150 : cx - 74, y: 118, w: 148, h: 20, label: () => '显示' + Companion.name + '：' + (s.aiShow === false ? '关' : '开'), tip: ['在你身边飘着的小球（只有你自己看得到）'], onClick: () => { s.aiShow = s.aiShow === false; g.saveSettings(); } },
+      { x: st.admin ? cx - 150 : cx - 74, y: 118, w: 148, h: 20, label: () => Companion.name + '：' + (Companion.on(g) ? '开' : '关'), gold: !Companion.on(g),
+        tip: Companion.on(g) ? ['在你身边飘着、会打招呼、会主动说话', '点一下关掉（按 V 照样能找它聊）'] : ['现在是关着的：不显示、不打招呼、不主动说话', '点一下打开'], onClick: () => { s.jingOn = !Companion.on(g); g.saveSettings(); this.layout(); } },
       ...(st.admin ? [{ x: cx + 2, y: 118, w: 148, h: 20, gold: true, label: '共用密钥…', tip: ['管理员：全服玩家聊天用的密钥', '今天已花 ' + st.admin.yuan + ' 元 / 上限 ' + st.admin.budget + ' 元（' + st.admin.lines + ' 句）'], onClick: () => { g.ui.hideInput(); g.ui.open(new CompanionSharedScreen(g, this)); } }] : []),
       { x: cx - 150, y: u.h - 30, w: 148, h: 20, gold: Companion.ready, label: fitText('和' + Companion.name + '聊天', 140), enabled: Companion.ready && g.state === 'play', tip: g.state === 'play' ? ['也可以在游戏里按 V'] : ['进入世界后按 V 和' + Companion.name + '聊天'], onClick: () => { g.ui.hideInput(); g.ui.open(new CompanionChatScreen(g)); } },
       { x: cx + 2, y: u.h - 30, w: 148, h: 20, label: '完成', onClick: () => this.back() },
     );
   }
-  async unlock() {
-    const vids = (Companion.status && Companion.status.videos) || [];
+  async unlock(kind) {
     try {
       if (!(await Toy.ready())) { this.say('请在 B站 App 或电脑网页的游戏页面里操作', true); return; }
-      if (vids.length) await Toy.openVideo(vids[0]); else await Toy.openAuthor();
-      this.say(vids.length ? '完成三连后回到这里，会自动检查' : '关注后回到这里，会自动检查');
+      if (kind === 'triple') { const v = (Account.gate && Account.gate.videos) || []; if (v[0]) await Toy.openVideo(v[0]); } else await Toy.openAuthor();
+      this.say(Toy.backHint(kind));
       this.waiting = true;
     } catch (e) { this.say(e instanceof ToyError ? Toy.explain(e) : e.message, true); }
   }
-  // back from the video page: checked again
+  // back from the video / the UP's page (or 我完成了，检查): checked again
   async recheck() {
     this.waiting = false;
-    await Account.checkUnlocks(true); await Companion.load();
-    if (Companion.status && Companion.status.unlocked) this.say('已解锁' + Companion.name + '！进入世界后按 V 就能和它聊天'); else this.say('还没有检测到，完成后再回来看看', true);
+    if (!(await Toy.ready())) { this.say('请在 B站 App 或电脑网页的游戏页面里检查', true); return; }
+    this.layout();
+    let r = null; try { r = await Account.checkUnlocks(); } catch (e) { this.say(e.message, true); }
+    await Companion.load();
+    if (Companion.unlocked) this.say('已解锁' + Companion.name + '！' + (this.game.state === 'play' ? '回到游戏，它马上就来' : '进入世界后它就会来找你'));
+    else if (r && !r.inToy) this.say('请在 B站 App 或电脑网页的游戏页面里检查', true);
+    else if (r && r.inToy && r.error && r.follow === null && r.triple === null) this.say('没查到（' + Toy.explain(r.error) + '），过一会儿再点检查', true);
+    else if (r && r.inToy && !r.own) this.say('这里没登录你自己的 B站：用你的 B站 关注、三连后，在那台设备打开一次游戏就会同步', true);
+    else if (r && r.triple === null && !Account.tripleOk()) this.say('没查到三连状态（' + (r.error ? Toy.explain(r.error) : 'B站没有返回能看懂的数据') + '），过一会儿再点检查', true);
+    else {
+      const t = Account.tripleParts, miss = [];
+      if (!Account.unlocks.follow) miss.push('关注');
+      if (!Account.tripleOk()) { if (t && !t.all) { if (!t.like) miss.push('点赞'); if (!t.coin) miss.push('投币'); if (!t.fav) miss.push('收藏'); } else miss.push('三连'); }
+      this.say(miss.length ? '还差：' + miss.join('、') + '（刚操作完可能要等几秒）' : '还没有检测到，完成后再回来看看', true);
+    }
     if (this.game.ui.screen === this) this.layout();
   }
   // (opened in the game with V: back to the game)
@@ -243,9 +288,10 @@ class CompanionScreen extends FormScreen {
     if (this.waiting && document.visibilityState !== 'visible') this.leftAt = Date.now();
     if (!Account.loggedIn) { Font.center(c, '登录后才能使用 AI 伙伴', cx, 50, '#A0A0A0'); return; }
     if (!st) { Font.center(c, '正在读取…', cx, 50, '#A0A0A0'); return; }
-    if (!st.unlocked) {
-      Font.center(c, fitText((st.videos || []).length ? `给 ${Companion.name} 的介绍视频三连（点赞 + 投币 + 收藏）就能解锁` : '关注 UP 主就能解锁 AI 伙伴', ui.w - 8), cx, 50, '#FFD24A');
-      if (this.note) Font.center(c, fitText(this.note, ui.w - 8), cx, 104, this.noteColor);
+    if (!Companion.unlocked) {
+      Font.center(c, fitText(`关注 UP 主 + 给新视频三连，就能解锁${Companion.name}`, ui.w - 8), cx, 46, '#FFD24A');
+      Font.center(c, fitText('三连 = 点赞 + 投币 + 收藏；之前给老视频三连过的也要再三连', ui.w - 8), cx, 60, '#A0A0A0');
+      if (this.note) Font.center(c, fitText(this.note, ui.w - 8), cx, 130, this.noteColor);
       return;
     }
     Font.center(c, fitText(`${Companion.name}：会聊天、懂你在游戏里做什么的 AI 小伙伴`, ui.w - 8), cx, 34, '#7FE3FF');
@@ -263,6 +309,9 @@ class CompanionScreen extends FormScreen {
   Game.prototype.startTitle = function (...a) { const r = st.apply(this, a); Companion.start(this); if (!Companion.status) Companion.load(); return r; };
   const took = Account.took;
   Account.took = function (j) { const r = took.call(this, j); if (j && j.token) Companion.load(); return r; };
+  // (unlocked on the 解锁 screen: the service's half - following - read again, so it comes at once)
+  const cu = Account.checkUnlocks;
+  Account.checkUnlocks = async function (...a) { const r = await cu.apply(this, a); if (r && r.got && r.got.length) await Companion.load(); return r; };
 })();
 
 // ---- 共用密钥… (super administrators): the service's own DeepSeek key everyone talks on, what it spent today ----
@@ -275,6 +324,8 @@ class CompanionSharedScreen extends FormScreen {
     this.widgets = [
       { x: cx - 150, y: 118, w: 148, h: 20, gold: true, label: () => (this.busy ? '正在检查…' : '设为共用密钥'), enabled: !this.busy, onClick: () => this.submit() },
       { x: cx + 2, y: 118, w: 148, h: 20, label: '停用共用密钥', enabled: !!a.sharedTail && !this.busy, tip: ['删掉共用密钥：所有玩家就都不能聊了'], onClick: () => this.remove() },
+      // (the limits, changed at once - no restart: the service's ai-limits.json, the user 2026-11-07)
+      { x: cx - 150, y: 142, w: 300, h: 20, gold: true, label: '调整上限…（每天 / 每小时花多少钱、每人几句，立刻生效）', onClick: () => { this.game.ui.hideInput(); this.game.ui.open(new CompanionLimitsScreen(this.game, this)); } },
       { x: cx - 100, y: u.h - 30, w: 200, h: 20, label: '完成', onClick: () => this.back() },
     ];
   }
@@ -293,7 +344,49 @@ class CompanionSharedScreen extends FormScreen {
     Font.center(c, fitText('全服玩家都用这个密钥和' + Companion.name + '聊天（费用从这个账户扣，只存在服务器上）', ui.w - 8), cx, 36, '#A0A0A0');
     Font.center(c, fitText(`今天已花 ${a.yuan ?? 0} 元 / 每天上限 ${a.budget ?? '?'} 元，共 ${a.lines ?? 0} 句；这个小时 ${a.hourYuan ?? 0} / ${a.hourBudget ?? '?'} 元`, ui.w - 8), cx, 50, '#FFD24A');
     Font.center(c, fitText(`每天：每人 ${a.perDay ?? 30} 句（每分钟 ${a.perMinute ?? 4} 句）、每个地址 ${a.perIp ?? 60} 句、每个网段 ${a.perNet ?? 300} 句`, ui.w - 8), cx, 64, '#A0A0A0');
-    if (a.stopped) Font.center(c, fitText('今天有 ' + a.stopped + ' 个账号一直让' + Companion.name + '做别的事（写代码、翻译等），免费聊天已暂停', ui.w - 8), cx, 146, '#FF8080');
+    if (a.stopped) Font.center(c, fitText('今天有 ' + a.stopped + ' 个账号一直让' + Companion.name + '做别的事（写代码、翻译等），免费聊天已暂停', ui.w - 8), cx, 168, '#FF8080');
+  }
+}
+
+// ---- 调整上限… (super administrators): the shared key's limits - the day's and the hour's yuan, one player's lines a
+// day, and a day's budget for today only (back to the usual at 00:00) - saved by the service in ai-limits.json and
+// used at once, no restart (the user, 2026-11-07). An empty field: the service's own setting (config.js) ----
+class CompanionLimitsScreen extends FormScreen {
+  constructor(game, parent) {
+    super(game, Companion.name + '的上限', parent); this.busy = false;
+    const a = (Companion.status && Companion.status.admin) || {}, str = (v) => (v === undefined || v === null ? '' : String(v));
+    this.day = str(a.budgetBase ?? a.budget); this.hour = str(a.hourBudget); this.per = str(a.perDay); this.today = a.boost ? str(a.boost.yuan) : '';
+  }
+  layout() {
+    const u = this.game.ui, cx = u.w / 2, num = (v) => v.replace(/[^0-9.]/g, '').slice(0, 6), int = (v) => v.replace(/[^0-9]/g, '').slice(0, 5);
+    this.fields = {};
+    this.addField('day', cx - 150, 72, 96, '每天上限（元）', 6, num);
+    this.addField('hour', cx - 48, 72, 96, '每小时上限（元）', 6, num);
+    this.addField('per', cx + 54, 72, 96, '每人每天（句）', 5, int);
+    this.addField('today', cx - 150, 114, 96, '只今天的每天上限（元）', 6, num);
+    this.widgets = [
+      { x: cx - 150, y: u.h - 30, w: 148, h: 20, gold: true, label: () => (this.busy ? '正在保存…' : '保存（立刻生效）'), enabled: !this.busy, onClick: () => this.save() },
+      { x: cx + 2, y: u.h - 30, w: 148, h: 20, label: '完成', onClick: () => this.back() },
+    ];
+  }
+  submit() { this.save(); }
+  async save() {
+    if (this.busy) return;
+    const b = { freeBudgetYuan: this.day, freeBudgetHourYuan: this.hour, freePerDay: this.per, todayYuan: this.today };
+    for (const k in b) b[k] = String(b[k] || '').trim();
+    this.busy = true; this.layout();
+    try { Companion.status = await Account.api('/api/ai/limits', b); this.say('已保存，马上生效（不用重启）'); }
+    catch (e) { this.say(e.message, true); }
+    this.busy = false; this.layout();
+  }
+  drawExtra(ui) {
+    const c = ui.ctx, cx = ui.w / 2, a = (Companion.status && Companion.status.admin) || {};
+    const b = a.boost;
+    Font.center(c, fitText(`现在：每天 ${a.budget ?? '?'} 元${b ? `（今天临时，0 点后回到 ${a.budgetBase ?? '?'} 元）` : ''} · 每小时 ${a.hourBudget ?? '?'} 元 · 每人每天 ${a.perDay ?? '?'} 句`, ui.w - 8), cx, 34, '#FFD24A');
+    Font.center(c, fitText(`今天已花 ${a.yuan ?? 0} 元，共 ${a.lines ?? 0} 句；这个小时 ${a.hourYuan ?? 0} 元`, ui.w - 8), cx, 46, '#A0A0A0');
+    Font.draw(c, fitText('填了就只用到今晚 0 点；空着 = 不用', ui.w / 2 + 150 - 104), cx - 48, 120, '#A0A0A0');
+    Font.center(c, fitText('空着的格子 = 用服务器原来的设置', ui.w - 8), cx, 144, '#808080');
+    this.drawFields(ui);
   }
 }
 
@@ -305,7 +398,7 @@ class CompanionSharedScreen extends FormScreen {
 const Jing = {
   R: 0.2, mesh: null, tail: null, pos: null, yaw: 0, last: 0, pulse: -1e9,
   TAIL_AT: [0, -0.55, -0.78], // where the tail's stem meets the ball (it swings about this)
-  visible(g) { return Companion.ready && g.settings.aiShow !== false && g.state === 'play' && !!g.player && !g.player.dead && g.mode !== 'spectator'; },
+  visible(g) { return Companion.ready && Companion.on(g) && g.state === 'play' && !!g.player && !g.player.dead && g.mode !== 'spectator'; },
   // a mesh in the entity layout (position, uv, normal; quads)
   upload(r, d) {
     const gl = r.gl, vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -386,9 +479,13 @@ const Jing = {
     return performance.now() < this.until || Companion.busy || s instanceof CompanionChatScreen || (s instanceof ChatScreen && Companion.quick(g));
   },
   call(ms) { this.until = Math.max(this.until || 0, performance.now() + ms); },
-  place(g, now) {
+  place(g, now, a) {
     const p = g.player, w = g.world, cp = Math.cos(p.pitch);
-    const e = [p.pos[0], p.pos[1] + (p.eyeH || 1.62) * (p.sneaking ? 0.92 : 1), p.pos[2]];
+    // the eyes where the camera has them (game.js): between ticks, and lower crawling, swimming, sneaking or in bed. From
+    // the tick's position it jittered against the camera (flickering in first person); at standing height in a
+    // one-block gap or a bed under a roof the eyes were inside the block above, and it stuck there in the wall
+    const ip = p.ipos(a == null ? 1 : a), eh = g.smoothEye != null ? g.smoothEye : g.sleeping ? 0.2 : p.eye();
+    const e = [ip[0], ip[1] + eh, ip[2]];
     const fh = [-Math.sin(p.yaw), 0, -Math.cos(p.yaw)], rt = [Math.cos(p.yaw), 0, -Math.sin(p.yaw)];
     let d = [-Math.sin(p.yaw) * cp, Math.sin(p.pitch), -Math.cos(p.yaw) * cp];
     if (g.perspective === 2) d = d.map((v) => -v);
@@ -416,8 +513,9 @@ const Jing = {
     for (let i = 0; i < 3; i++) this.pos[i] += (t[i] - this.pos[i]) * k;
     // (on its way it doesn't cut through a wall either)
     this.pos = reach(e, this.pos);
-    // too close to the eyes to be anything but in the way (a one-block tunnel): not drawn
-    this.tooClose = g.perspective === 0 && Math.hypot(this.pos[0] - e[0], this.pos[1] - e[1], this.pos[2] - e[2]) < 0.55;
+    // too close to the eyes to be anything but in the way (a one-block tunnel): not drawn (back only once a little
+    // further: right at the limit, walking along a wall, it went on and off every frame)
+    this.tooClose = g.perspective === 0 && Math.hypot(this.pos[0] - e[0], this.pos[1] - e[1], this.pos[2] - e[2]) < (this.tooClose ? 0.7 : 0.55);
     const cam = g.renderer.camPos, want = Math.atan2(cam[0] - this.pos[0], cam[2] - this.pos[2]);
     let dy = want - this.yaw; dy = Math.atan2(Math.sin(dy), Math.cos(dy));
     this.yaw += dy * (1 - Math.exp(-dt * 6));
@@ -441,7 +539,7 @@ const Jing = {
       return;
     }
     if (!this.mesh) this.build(r, this.img);
-    this.place(g, now);
+    this.place(g, now, a);
     if (this.tooClose) return;
     const s = now / 1000, since = (now - this.pulse) / 1000;
     // a little hop when it speaks

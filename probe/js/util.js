@@ -2,7 +2,8 @@
 // ---------------------------------------------------------------------------
 // Math, random and noise utilities
 // ---------------------------------------------------------------------------
-const CHUNK = 16, MAX_BLOCKS = 4096;
+// (8192: room for the mods' blocks - mods.js; the sections keep ids in 16 bits)
+const CHUNK = 16, MAX_BLOCKS = 8192;
 // World format: gen 1 = the original 0..255 worlds; gen 2 = vanilla 1.18+ terrain, 384 blocks tall.
 // Internally y always starts at 0; MIN_Y is the vanilla y of internal 0 in the overworld.
 let HEIGHT = 256, SECTIONS = 16, SEA = 62, MIN_Y = 0, ALL_SECTIONS = 0xFFFF;

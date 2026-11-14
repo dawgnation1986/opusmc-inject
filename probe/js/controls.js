@@ -47,7 +47,11 @@ function bindDown(g, name) {
 function pressAction(g, act, e) {
   const p = g.player, ui = g.ui, s = g.settings, now = performance.now();
   switch (act) {
-    case 'inventory': if (g.mode !== 'spectator') ui.open(g.mode === 'creative' ? new CreativeScreen(g) : g.net ? g.net.inventoryScreen() : new CraftingScreen(g, 2)); return true;
+    case 'inventory':
+      // riding a tame horse, donkey, mule or llama, or a camel: its inventory, as vanilla (HasCustomInventoryScreen) -
+      // only sneak + use opened it, and on a phone sneaking gets off ("手机骑乘时打不开马的背包")
+      if (!g.net && !g.p2pGuest && g.mode !== 'spectator' && p.vehicle && typeof Horse !== 'undefined' && p.vehicle instanceof Horse && (p.vehicle.tame || p.vehicle instanceof Camel)) { ui.open(new HorseScreen(g, p.vehicle)); return true; }
+      if (g.mode !== 'spectator') ui.open(g.mode === 'creative' ? new CreativeScreen(g) : g.net ? g.net.inventoryScreen() : new CraftingScreen(g, 2)); return true;
     case 'chat': ui.open(new ChatScreen(g)); return true;
     case 'command': ui.open(new ChatScreen(g, '/')); return true;
     case 'help': ui.open(new HelpScreen(g, null)); ui.screen.parent = null; return true;
@@ -86,6 +90,7 @@ function pressAction(g, act, e) {
       return false;
     case 'use':
       if (s.toggleUse) g.mouseBtn[2] = !g.mouseBtn[2]; else g.mouseBtn[2] = true;
+      if (g.mouseBtn[2]) g.useClicked = true; // (kept for the next tick even if let go before it, like mouseClicked0)
       g.useCd = 0;
       return false;
   }

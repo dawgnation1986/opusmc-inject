@@ -156,30 +156,44 @@
 
   // ---- ruined portals (simplified RuinedPortalPiece: placement, mossiness, netherrack spread) -----------
   T.ruined_portal = (gen, name, def, cx, cz, r) => {
+    // RuinedPortalStructure.findGenerationPoint (its order of random calls)
     const setups = def.setups;
-    let tot = 0; for (const s of setups) tot += s.weight;
-    let f = r.nextFloat() * tot, setup = setups[0];
-    for (const s of setups) { f -= s.weight; if (f < 0) { setup = s; break; } }
+    let setup = setups[0];
+    if (setups.length > 1) {
+      let tot = 0; for (const s of setups) tot += s.weight;
+      let f = r.nextFloat();
+      for (const s of setups) { f -= s.weight / tot; if (f < 0) { setup = s; break; } }
+    }
+    const ap = setup.air_pocket_probability, airPocket = ap === 0 ? false : ap === 1 ? true : r.nextFloat() < ap;
     const giant = r.nextFloat() < 0.05;
     const tn = giant ? 'ruined_portal/giant_portal_' + (1 + r.nextInt(3)) : 'ruined_portal/portal_' + (1 + r.nextInt(10));
     const tpl = H.TPL[tn];
     if (!tpl) return null;
-    const rot = r.nextInt(4), mirror = r.nextFloat() < 0.5 ? 2 : 0;
-    const airPocket = r.nextFloat() < setup.air_pocket_probability;
+    const rot = r.nextInt(4), mirror = r.nextFloat() < 0.5 ? 0 : 2;
     const sx = tpl.size[0], sz = tpl.size[2], piv = [sx >> 1, sz >> 1];
     const x0 = cx * 16, z0 = cz * 16;
     const a = H.rotPosM(0, 0, 0, rot, mirror, piv[0], piv[1]), b = H.rotPosM(sx - 1, 0, sz - 1, rot, mirror, piv[0], piv[1]);
-    const mx = x0 + ((a[0] + b[0]) >> 1), mz = z0 + ((a[2] + b[2]) >> 1);
-    const surf = gen.baseHeight(mx, mz, setup.placement === 'on_ocean_floor');
+    const bx0 = x0 + Math.min(a[0], b[0]), bx1 = x0 + Math.max(a[0], b[0]), bz0 = z0 + Math.min(a[2], b[2]), bz1 = z0 + Math.max(a[2], b[2]);
+    const floor = setup.placement === 'on_ocean_floor', ySpan = tpl.size[1];
+    const surf = gen.baseHeight(bx0 + ((bx1 - bx0 + 1) >> 1), bz0 + ((bz1 - bz0 + 1) >> 1), floor) - 1;
+    const between = (lo, hi) => r.nextInt(hi - lo + 1) + lo, within = (lo, hi) => (lo < hi ? between(lo, hi) : hi);
+    const minY = gen.minY + 15;
     let y;
     switch (setup.placement) {
-      case 'underground': y = gen.minY + 15 + r.nextInt(Math.max(1, surf - 15 - (gen.minY + 15))); break;
-      case 'partly_buried': y = surf - 1 - tpl.size[1] + 2 + r.nextInt(3); break;
-      case 'in_mountain': y = Math.max(70, surf - tpl.size[1] - r.nextInt(Math.max(1, surf - 70 - tpl.size[1] + 1))); break;
-      case 'in_nether': y = airPocket ? 32 + r.nextInt(64) : 32 + r.nextInt(8); break;
-      default: y = surf - 1;
+      case 'in_nether': y = airPocket ? between(32, 100) : r.nextFloat() < 0.5 ? between(27, 29) : between(29, 100); break;
+      case 'in_mountain': y = within(70, surf - ySpan); break;
+      case 'underground': y = within(minY, surf - ySpan); break;
+      case 'partly_buried': y = surf - ySpan + between(2, 8); break;
+      default: y = surf;
     }
-    if (!biomeOk(gen, def, mx, y, mz)) return null;
+    // findSuitableY: down to where 3 of the 4 bottom corners are in the ground (it was the centre's surface, so on a
+    // slope or a cliff edge the portal hung in the air)
+    const corners = [[bx0, bz0], [bx1, bz0], [bx0, bz1], [bx1, bz1]];
+    // (WORLD_SURFACE_WG: not air, so the aquifer's water / lava count but cave air does; OCEAN_FLOOR_WG: solid only)
+    const opaque = gen.substanceAt ? (x, yy, z) => { const s = gen.substanceAt(x, yy, z); return floor ? s === WG.SUB.NONE : s !== WG.SUB.AIR; }
+      : (x, yy, z) => gen.densityAt(x, yy, z) > 0 || (!floor && yy < gen.sea);
+    for (; y > minY; y--) { let n = 0; for (const [x, z] of corners) if (opaque(x, y, z) && ++n === 3) break; if (n === 3) break; }
+    if (!biomeOk(gen, def, x0, y, z0)) return null;
     const moss = setup.mossiness, black = setup.replace_with_blackstone;
     const MOSSY = { stone_bricks: 'mossy_stone_bricks', stone_brick_stairs: 'mossy_stone_brick_stairs', stone_brick_slab: 'mossy_stone_brick_slab', stone_brick_wall: 'mossy_stone_brick_wall' };
     const BLACK = { stone_bricks: 'polished_blackstone_bricks', cracked_stone_bricks: 'cracked_polished_blackstone_bricks', stone_brick_stairs: 'polished_blackstone_brick_stairs', stone_brick_slab: 'polished_blackstone_brick_slab', stone_brick_wall: 'polished_blackstone_brick_wall', chiseled_stone_bricks: 'chiseled_polished_blackstone', stone: 'blackstone', cobblestone: 'blackstone', mossy_stone_bricks: 'polished_blackstone_bricks' };
@@ -189,6 +203,9 @@
       mapState: (g, x, yy, z) => {
         const n = H.NAMES[g];
         if (n === 'gold_block' && H.JR(H.posSeed(x, yy, z)).nextFloat() < 0.3) return AIR();
+        // the lava (RuinedPortalPiece.getLavaProcessorRule): all magma on the ocean floor, else a fifth of it. (It
+        // stayed lava on the sea floor, in the water: "海里废弃传送门的岩浆碰水不变黑曜石")
+        if (n === 'lava' && (setup.placement === 'on_ocean_floor' || H.JR(H.posSeed(x, yy, z)).nextFloat() < 0.2)) return H.stateOf('magma_block') ?? g;
         if (black) return swap(g, BLACK);
         if (moss > 0 && MOSSY[n] && H.JR(H.posSeed(x, yy, z)).nextFloat() < moss) return swap(g, MOSSY);
         return g;
@@ -338,33 +355,68 @@
     const P = scattered(cx * 16, 64, cz * 16, r.nextInt(4), 12, 10, 15);
     const dy = avgGround(gen, P.box) - P.box[1];
     P.box[1] += dy; P.box[4] += dy;
+    // JungleTemplePiece.postProcess: its boxes are filled solid (cobblestone 40% / mossy cobblestone), then carved;
+    // the lower floor has the two tripwire arrow traps and the three-lever puzzle with sticky pistons hiding a chest
     const CO = 'cobblestone', MO = 'mossy_cobblestone', CH = 'chiseled_stone_bricks';
-    const stone = (B, x, y, z) => B.set(x, y, z, B.rnd(x, y, z) < 0.4 ? CO : MO);
-    const cs = (f, half = 'bottom') => `cobblestone_stairs[facing=${f},half=${half},shape=straight,waterlogged=false]`;
+    const cs = (f) => `cobblestone_stairs[facing=${f},half=bottom,shape=straight,waterlogged=false]`;
+    const WIRE_NS = 'redstone_wire[east=none,north=side,power=0,south=side,west=none]', WIRE_EW = 'redstone_wire[east=side,north=none,power=0,south=none,west=side]';
+    const TRIP_EW = 'tripwire[attached=true,disarmed=false,east=true,north=false,powered=false,south=false,west=true]';
+    const TRIP_NS = 'tripwire[attached=true,disarmed=false,east=false,north=true,powered=false,south=true,west=false]';
+    const LEVER = 'lever[face=wall,facing=north,powered=false]';
     return start(name, def, [codePiece(P, (B) => {
-      const shell = (ax, ay, az, bx, by, bz, hollow) => { for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) for (let z = az; z <= bz; z++) { const e = y === ay || y === by || x === ax || x === bx || z === az || z === bz; if (e) stone(B, x, y, z); else if (hollow) B.set(x, y, z, 'air'); } };
-      shell(0, -4, 0, 11, 0, 14, false);
-      shell(2, 1, 2, 9, 2, 2, false); shell(2, 1, 12, 9, 2, 12, false); shell(2, 1, 3, 2, 2, 11, false); shell(9, 1, 3, 9, 2, 11, false);
-      shell(1, 3, 1, 10, 6, 1, false); shell(1, 3, 13, 10, 6, 13, false); shell(1, 3, 2, 1, 6, 12, false); shell(10, 3, 2, 10, 6, 12, false);
-      shell(2, 3, 2, 9, 3, 12, false); shell(2, 6, 2, 9, 6, 12, false); shell(3, 7, 3, 8, 7, 11, false); shell(4, 8, 4, 7, 8, 10, false);
-      B.box(3, 1, 3, 8, 2, 11, 'air'); B.box(4, 4, 4, 7, 5, 10, 'air'); B.box(5, 7, 5, 6, 7, 9, 'air');
-      for (let x = 0; x <= 11; x++) for (let z = 0; z <= 14; z++) B.down(x, -5, z, MO);
-      // entrance stairs and doorways
-      for (let i = 0; i <= 3; i++) { B.set(5, i - 1 > 0 ? i - 1 : 0, i, cs('south')); B.set(6, i - 1 > 0 ? i - 1 : 0, i, cs('south')); }
-      B.box(5, 1, 0, 6, 3, 1, 'air'); B.box(5, 4, 1, 6, 5, 2, 'air');
-      for (const z of [4, 7, 10]) { B.set(1, 4, z, 'air'); B.set(10, 4, z, 'air'); B.set(1, 4, z, CH); }
-      // lower floor: lever puzzle, chests, dispenser traps with tripwire
-      B.box(1, -3, 1, 10, -1, 13, 'air'); shell(0, -4, 0, 11, 0, 14, false); B.box(1, -3, 1, 10, -1, 13, 'air');
-      B.box(5, -3, 2, 6, 0, 2, 'air');
-      B.set(8, -3, 1, 'lever[face=wall,facing=south,powered=false]'); B.set(9, -3, 1, 'lever[face=wall,facing=south,powered=false]'); B.set(10, -3, 1, 'lever[face=wall,facing=south,powered=false]');
-      B.chest(8, -3, 3, 'chest[facing=west,type=single,waterlogged=false]', 'chests/jungle_temple');
-      B.chest(9, -2, 11, 'chest[facing=north,type=single,waterlogged=false]', 'chests/jungle_temple');
-      B.set(3, -3, 2, 'dispenser[facing=north,triggered=false]'); B.chest(3, -3, 2, 'dispenser[facing=north,triggered=false]', 'chests/jungle_temple_dispenser');
-      B.set(3, -3, 6, 'tripwire_hook[attached=false,facing=south,powered=false]'); B.set(3, -3, 8, 'tripwire_hook[attached=false,facing=north,powered=false]');
-      for (let z = 7; z <= 7; z++) B.set(3, -3, z, 'tripwire[attached=false,disarmed=false,east=false,north=true,powered=false,south=true,west=false]');
-      B.set(9, -3, 13, 'redstone_wire[east=none,north=side,power=0,south=none,west=none]');
-      for (const [x, z] of [[2, 3], [9, 3], [2, 11], [9, 11]]) B.set(x, -1, z, CH);
-      B.set(5, 7, 7, 'stone_bricks'); B.set(6, 7, 7, 'stone_bricks');
+      const fill = (ax, ay, az, bx, by, bz) => { for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) for (let z = az; z <= bz; z++) B.set(x, y, z, B.rnd(x, y, z) < 0.4 ? CO : MO); };
+      const air = (ax, ay, az, bx, by, bz) => B.box(ax, ay, az, bx, by, bz, 'air');
+      fill(0, -4, 0, 11, 0, 14);
+      fill(2, 1, 2, 9, 2, 2); fill(2, 1, 12, 9, 2, 12); fill(2, 1, 3, 2, 2, 11); fill(9, 1, 3, 9, 2, 11);
+      fill(1, 3, 1, 10, 6, 1); fill(1, 3, 13, 10, 6, 13); fill(1, 3, 2, 1, 6, 12); fill(10, 3, 2, 10, 6, 12);
+      fill(2, 3, 2, 9, 3, 12); fill(2, 6, 2, 9, 6, 12); fill(3, 7, 3, 8, 7, 11); fill(4, 8, 4, 7, 8, 10);
+      air(3, 1, 3, 8, 2, 11); air(4, 3, 6, 7, 3, 9); air(2, 4, 2, 9, 5, 12); air(4, 6, 5, 7, 6, 9); air(5, 7, 6, 6, 7, 8);
+      air(5, 1, 2, 6, 2, 2); air(5, 2, 12, 6, 2, 12); air(5, 5, 1, 6, 5, 1); air(5, 5, 13, 6, 5, 13);
+      for (const [x, z] of [[1, 5], [10, 5], [1, 9], [10, 9]]) B.set(x, 5, z, 'air');
+      for (const z of [0, 14]) for (const x of [2, 4, 7, 9]) fill(x, 4, z, x, 5, z);
+      fill(5, 6, 0, 6, 6, 0);
+      for (const x of [0, 11]) { for (let z = 2; z <= 12; z += 2) fill(x, 4, z, x, 5, z); fill(x, 6, 5, x, 6, 5); fill(x, 6, 9, x, 6, 9); }
+      fill(2, 7, 2, 2, 9, 2); fill(9, 7, 2, 9, 9, 2); fill(2, 7, 12, 2, 9, 12); fill(9, 7, 12, 9, 9, 12);
+      fill(4, 9, 4, 4, 9, 4); fill(7, 9, 4, 7, 9, 4); fill(4, 9, 10, 4, 9, 10); fill(7, 9, 10, 7, 9, 10); fill(5, 9, 7, 6, 9, 7);
+      for (const [x, y, z, f] of [[5, 9, 6, 'north'], [6, 9, 6, 'north'], [5, 9, 8, 'south'], [6, 9, 8, 'south'], [4, 0, 0, 'north'], [5, 0, 0, 'north'], [6, 0, 0, 'north'], [7, 0, 0, 'north'],
+        [4, 1, 8, 'north'], [4, 2, 9, 'north'], [4, 3, 10, 'north'], [7, 1, 8, 'north'], [7, 2, 9, 'north'], [7, 3, 10, 'north']]) B.set(x, y, z, cs(f));
+      fill(4, 1, 9, 4, 1, 9); fill(7, 1, 9, 7, 1, 9); fill(4, 1, 10, 7, 2, 10); fill(5, 4, 5, 6, 4, 5);
+      B.set(4, 4, 5, cs('east')); B.set(7, 4, 5, cs('west'));
+      for (let i = 0; i < 4; i++) { B.set(5, -i, 6 + i, cs('south')); B.set(6, -i, 6 + i, cs('south')); air(5, -i, 7 + i, 6, -i, 9 + i); }
+      // lower floor
+      air(1, -3, 12, 10, -1, 13); air(1, -3, 1, 3, -1, 13); air(1, -3, 1, 9, -1, 5);
+      for (let z = 1; z <= 13; z += 2) fill(1, -3, z, 1, -2, z);
+      for (let z = 2; z <= 12; z += 2) fill(1, -1, z, 3, -1, z);
+      fill(2, -2, 1, 5, -2, 1); fill(7, -2, 1, 9, -2, 1); fill(6, -3, 1, 6, -3, 1); fill(6, -1, 1, 6, -1, 1);
+      // trap 1: tripwire across the west corridor, wire to the dispenser above the north wall
+      B.set(1, -3, 8, 'tripwire_hook[attached=true,facing=east,powered=false]'); B.set(4, -3, 8, 'tripwire_hook[attached=true,facing=west,powered=false]');
+      B.set(2, -3, 8, TRIP_EW); B.set(3, -3, 8, TRIP_EW);
+      for (let z = 2; z <= 7; z++) B.set(5, -3, z, WIRE_NS);
+      B.set(5, -3, 1, 'redstone_wire[east=none,north=side,power=0,south=none,west=side]'); B.set(4, -3, 1, WIRE_EW);
+      B.set(3, -3, 1, MO);
+      B.chest(3, -2, 1, 'dispenser[facing=north,triggered=false]', 'chests/jungle_temple_dispenser');
+      B.set(3, -2, 2, 'vine[east=false,north=false,south=true,up=false,west=false]');
+      // trap 2: tripwire in front of the main chest, wire to the dispenser on the east
+      B.set(7, -3, 1, 'tripwire_hook[attached=true,facing=north,powered=false]'); B.set(7, -3, 5, 'tripwire_hook[attached=true,facing=south,powered=false]');
+      for (let z = 2; z <= 4; z++) B.set(7, -3, z, TRIP_NS);
+      B.set(8, -3, 6, WIRE_EW); B.set(9, -3, 6, 'redstone_wire[east=none,north=none,power=0,south=side,west=side]');
+      B.set(9, -3, 5, 'redstone_wire[east=none,north=side,power=0,south=up,west=none]');
+      B.set(9, -3, 4, MO); B.set(9, -2, 4, WIRE_NS);
+      B.chest(9, -2, 3, 'dispenser[facing=west,triggered=false]', 'chests/jungle_temple_dispenser');
+      B.set(8, -1, 3, 'vine[east=true,north=false,south=false,up=false,west=false]'); B.set(8, -2, 3, 'vine[east=true,north=false,south=false,up=false,west=false]');
+      B.chest(8, -3, 3, 'chest[facing=north,type=single,waterlogged=false]', 'chests/jungle_temple');
+      for (const [x, y, z] of [[9, -3, 2], [8, -3, 1], [4, -3, 5], [5, -2, 5], [5, -1, 5], [6, -3, 5], [7, -2, 5], [7, -1, 5], [8, -3, 5]]) B.set(x, y, z, MO);
+      fill(9, -1, 1, 9, -1, 5);
+      // the lever puzzle: three levers on the chiseled wall, sticky pistons opening the hidden chest's room
+      air(8, -3, 8, 10, -1, 10);
+      for (const x of [8, 9, 10]) { B.set(x, -2, 11, CH); B.set(x, -2, 12, LEVER); }
+      fill(8, -3, 8, 8, -3, 10); fill(10, -3, 8, 10, -3, 10);
+      B.set(10, -2, 9, MO);
+      B.set(8, -2, 9, WIRE_NS); B.set(8, -2, 10, WIRE_NS);
+      B.set(10, -1, 9, 'redstone_wire[east=side,north=side,power=0,south=side,west=side]');
+      B.set(9, -2, 8, 'sticky_piston[extended=false,facing=up]'); B.set(10, -2, 8, 'sticky_piston[extended=false,facing=west]'); B.set(10, -1, 8, 'sticky_piston[extended=false,facing=west]');
+      B.set(10, -2, 10, 'repeater[delay=1,facing=north,locked=false,powered=false]');
+      B.chest(9, -3, 10, 'chest[facing=south,type=single,waterlogged=false]', 'chests/jungle_temple');
     })]);
   };
 
@@ -375,7 +427,7 @@
     if (!biomeOk(gen, def, cx * 16 + 8, 50, cz * 16 + 8)) return null;
     const PL = mesa ? 'dark_oak_planks' : 'oak_planks';
     const FE = (mesa ? 'dark_oak_fence' : 'oak_fence') + '[east=false,north=false,south=false,waterlogged=false,west=false]';
-    const ops = [], boxes = [];
+    const ops = [], boxes = [], carts = [];
     const free = (b) => !boxes.some(o => b[0] <= o[3] && b[3] >= o[0] && b[1] <= o[4] && b[4] >= o[1] && b[2] <= o[5] && b[5] >= o[2]);
     const D4 = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // north east south west
     const fill = (b, key, mode) => ops.push([b[0], b[1], b[2], b[3], b[4], b[5], key, mode || 0]);
@@ -432,6 +484,8 @@
           fill(bx(f, f, 0, 0, sy, sy + 1), FE); fill(bx(f, f, 2, 2, sy, sy + 1), FE); fill(bx(f, f, 0, 2, sy + 2, sy + 2), PL);
         }
         fill(b, 'cobweb', spider ? 5 : 4);
+        // MineShaftCorridor.createChest: beside each support, 1 in 100 a chest minecart (decided per block in build)
+        for (let i = 0; i < n; i++) { const f = 2 + i * 5; carts.push([...at(f - 1, 2), sy], [...at(f + 1, 0), sy]); }
         if (rails) fill(bx(0, L - 1, 1, 1, sy, sy), dir % 2 === 0 ? 'rail[shape=north_south,waterlogged=false]' : 'rail[shape=east_west,waterlogged=false]', 6);
         if (spider) fill(bx(L >> 1, L >> 1, 1, 1, sy, sy), 'spawner');
         const nx = at(L, 0), turn = r.nextInt(4);
@@ -448,9 +502,10 @@
     const dy = j - top;
     for (const o of ops) { o[1] += dy; o[4] += dy; }
     for (const b of boxes) { b[1] += dy; b[4] += dy; }
+    for (const c of carts) c[2] += dy;
     const all = boxes.reduce((a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.min(a[2], b[2]), Math.max(a[3], b[3]), Math.max(a[4], b[4]), Math.max(a[5], b[5])], boxes[0].slice());
     const piece = { kind: 'code', box: all, rigid: false, gld: 0, junctions: [],
-      build: (cx0, cz0, minY, Hh, blocks, meta, getId, idx) => {
+      build: (cx0, cz0, minY, Hh, blocks, meta, getId, idx, out) => {
         const liquid = (id) => { const n = SG.ID_NAME[id]; return n === 'water' || n === 'lava'; };
         for (const o of ops) {
           const g = S(o[6]), id = SG.SMAP_ID(g), m = SG.SMAP_META(g);
@@ -467,7 +522,18 @@
             if ((mode === 4 || mode === 5) && cur) continue;
             if (mode === 6 && (H.JR(H.posSeed(x, y, z)).nextFloat() > 0.7 || !blocks[idx(x, y - 1, z)])) continue;
             blocks[k] = id; meta[k] = m;
+            if (o[6] === 'spawner' && out) out.loot.push([x, y, z, 'spawner', 'cave_spider']); // (structures.js structureExtras)
           }
+        }
+        // chest minecarts: on air with something below, on a rail of a random shape (abandoned_mineshaft loot)
+        if (out) for (const [x, z, y] of carts) {
+          if (x < cx0 || x > cx0 + 15 || z < cz0 || z > cz0 + 15 || y <= minY || y >= minY + Hh - 1) continue;
+          const rr = H.JR(H.posSeed(x, y, z)); rr.nextFloat();
+          if (rr.nextInt(100) !== 0 || blocks[idx(x, y, z)] || !blocks[idx(x, y - 1, z)]) continue;
+          const g = S(rr.nextBoolean() ? 'rail[shape=north_south,waterlogged=false]' : 'rail[shape=east_west,waterlogged=false]');
+          if (SG.SMAP_ID(g) < 0) continue;
+          blocks[idx(x, y, z)] = SG.SMAP_ID(g); meta[idx(x, y, z)] = SG.SMAP_META(g);
+          out.ent.push([x + 0.5, y + 0.0625, z + 0.5, 'minecart:chest', { loot: 'chests/abandoned_mineshaft' }]);
         }
       } };
     return start(name, def, [piece]);

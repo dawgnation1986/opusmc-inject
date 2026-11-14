@@ -94,6 +94,7 @@ class TouchControls {
     const ui = this.ui;
     if (e.target === ui.input) return; // the text field takes the tap itself (opens the on-screen keyboard)
     ui.lastTouch = performance.now();
+    this.prune(e);
     const play = this.playing();
     if (play && !this.on()) return; // touch controls off: leave the browser's mouse emulation alone
     e.preventDefault();
@@ -101,11 +102,25 @@ class TouchControls {
     for (const ct of e.changedTouches) {
       const [x, y] = this.gui(ct.clientX, ct.clientY);
       const s = { sx: ct.clientX, sy: ct.clientY, cx: ct.clientX, cy: ct.clientY, x0: x, y0: y, x, y, t0: performance.now() };
+      // (an id given again while the old touch is still here, its end lost: that one is ended first)
+      const old = this.t.get(ct.identifier);
+      if (old) { this.t.delete(ct.identifier); this.endTouch(old, true); }
       this.t.set(ct.identifier, s);
       if (play) this.startPlay(s); else this.startMenu(s);
     }
   }
+  endTouch(s, cancel) { if (s.kind === 'menu') this.endMenu(s, cancel); else this.endPlay(s, cancel); }
+  // touches whose end never came (a system gesture - a screenshot, the notification shade - took the touchend): ended as
+  // cancelled once an event lists the fingers down without them. Kept, the joystick (or the attack / use button) stayed
+  // held - the player walked or mined on alone and a new thumb on the stick did nothing (feedback 11-01 to 11-11)
+  prune(e) {
+    if (!e.touches || !this.t.size) return;
+    const live = new Set();
+    for (const ct of e.touches) live.add(ct.identifier);
+    for (const [id, s] of [...this.t]) if (!live.has(id)) { this.t.delete(id); this.endTouch(s, true); }
+  }
   onMove(e) {
+    this.prune(e);
     let mine = false;
     for (const ct of e.changedTouches) {
       const s = this.t.get(ct.identifier);
@@ -127,8 +142,9 @@ class TouchControls {
       if (!s) continue;
       mine = true;
       this.t.delete(ct.identifier);
-      if (s.kind === 'menu') this.endMenu(s, cancel); else this.endPlay(s, cancel);
+      this.endTouch(s, cancel);
     }
+    this.prune(e);
     if (!mine) return;
     e.preventDefault();
     Sound.init();
@@ -168,6 +184,8 @@ class TouchControls {
     if (document.activeElement === ui.input && !(ui.inputBox && ui.hit(ui.inputBox, s.x, s.y))) ui.input.blur();
     ui.mouse.x = s.x; ui.mouse.y = s.y;
     if (!sc) return;
+    // (a list that scrolls smoothly - mods_ui.js: a finger down stops it flying on)
+    if (sc.touchHold) sc.touchHold();
     const slider = !(sc instanceof ContainerScreen) && sc.widgets && sc.widgets.some(w => w.slider && w.enabled !== false && ui.hit(w, s.x, s.y));
     const scrollbar = sc instanceof CreativeScreen && s.x >= sc.x + 172 && s.x < sc.x + 190 && s.y >= sc.y + 16 && s.y < sc.y + 132;
     // (sc.touchDrag: a screen that is all dragging - the button layout editor - gets the finger as a held mouse)
@@ -179,11 +197,16 @@ class TouchControls {
     if (s.mode === 'scroll') { this.scrollBy(s); return; }
     if (s.mode !== 'pending' || !s.moved) return;
     const cont = sc instanceof ContainerScreen, dx = s.cx - s.sx, dy = s.cy - s.sy;
-    if (sc && sc.wheel && (!cont || (!ui.cursor && Math.abs(dy) > Math.abs(dx)))) { s.mode = 'scroll'; s.acc = 0; s.ly = s.y0; this.scrollBy(s); }
+    const from = cont && sc.slotAt ? sc.slotAt(s.x0, s.y0) : null;
+    // a stack under the finger goes with it whichever way it is dragged (#B1, 11-11: a screen with a list to scroll took
+    // every upright drag for its list - in the crafting table, the inventory, trading ... a stack could not be dragged up
+    // or down). Not the creative list's own items, nor where the screen's list lies over the slots (a recipe book on a
+    // narrow screen: sc.scrollsAt)
+    const grab = !ui.cursor && !!from && !!from.get() && !from.creative && !(sc.scrollsAt && sc.scrollsAt(s.x0, s.y0));
+    if (sc && sc.wheel && (!cont || (!ui.cursor && !grab && Math.abs(dy) > Math.abs(dx)))) { s.mode = 'scroll'; s.acc = 0; s.ly = s.y0; this.scrollBy(s); }
     else if (cont) {
       // a stack dragged from its slot with nothing in hand: carried, and put down where the finger lets go (11-03:
       // before, it stayed on the finger and needed another tap - "背包里放东西不舒服")
-      const from = sc.slotAt && sc.slotAt(s.x0, s.y0);
       if (!ui.cursor && from && from.get()) s.carry = from;
       this.synth('down', s, 0, true); s.mode = 'down'; this.synth('move', s);
     }
@@ -191,6 +214,8 @@ class TouchControls {
   }
   scrollBy(s) {
     const sc = this.ui.screen;
+    // (one that scrolls by the pixel - mods_ui.js, 11-12: follows the finger exactly, not in steps of a row)
+    if (sc && sc.scrollPx) { sc.scrollPx(s.y - s.ly); s.ly = s.y; return; }
     const step = sc instanceof WorldListScreen ? 36 : sc instanceof OptionsListScreen ? 25 : sc instanceof ContainerScreen ? 18 : 20;
     s.acc += s.y - s.ly; s.ly = s.y;
     while (Math.abs(s.acc) >= step) { const d = Math.sign(s.acc); s.acc -= d * step; this.ui.wheel(-d); }
@@ -205,6 +230,8 @@ class TouchControls {
         if (s.carry && !cancel) this.dropCarried(s);
         break;
       case 'long': this.synth('up', s, 2); break;
+      // (let go: it flies on at the finger's speed)
+      case 'scroll': if (ui.screen && ui.screen.scrollRelease) ui.screen.scrollRelease(); break;
     }
     // no hover highlight left behind on buttons (inventories keep the position for the carried stack)
     if (!(ui.screen instanceof ContainerScreen)) { ui.mouse.x = -1000; ui.mouse.y = -1000; }
@@ -216,7 +243,9 @@ class TouchControls {
     const ui = this.ui, sc = ui.screen;
     if (!(sc instanceof ContainerScreen) || !ui.cursor) return;
     const to = sc.slotAt(s.x, s.y), home = s.carry;
-    const clickAt = (atStart) => { this.synth('down', s, 0, atStart); this.synth('up', s, 0, atStart); };
+    // (no double click made of these: a quick flick put back on its own slot within 300 ms of the pick-up was one, and
+    // gathered the stack up again instead of putting it down - #B1)
+    const clickAt = (atStart) => { sc.lastClick = null; this.synth('down', s, 0, atStart); this.synth('up', s, 0, atStart); };
     if (to && to !== home && !to.output) {
       clickAt(false);
       if (ui.cursor && !home.output && !home.get()) clickAt(true); // (the swapped stack: into the emptied slot)
@@ -244,7 +273,8 @@ class TouchControls {
   closeRect() {
     const g = this.g, sc = this.ui.screen;
     if (!sc || g.state !== 'play' || !this.on()) return null;
-    if (!(sc instanceof ContainerScreen || sc.isChat || (typeof CreditsScreen !== 'undefined' && sc instanceof CreditsScreen))) return null;
+    // (sc.touchClose: a screen of a mod's own with nothing to close it on a phone - 匠魂's books, 11-13)
+    if (!(sc instanceof ContainerScreen || sc.isChat || sc.touchClose || (typeof CreditsScreen !== 'undefined' && sc instanceof CreditsScreen))) return null;
     const { B } = this.metrics(), ts = Math.round(B * 0.9); // (larger than the top buttons: players could not find how to close the inventory)
     return { x: this.ui.w - 4 - ts, y: 4, w: ts, h: ts };
   }
@@ -270,11 +300,13 @@ class TouchControls {
     if (!p.flying) L.cells.sneak = cell(1, 1);
     const jx = W - m - B, jy = H - m - 2 * B - gp;
     L.jump = { x: jx, y: jy, w: B, h: B };
-    if (p.flying) L.descend = { x: jx, y: H - m - B, w: B, h: B };
+    // (editAll: the layout editor, mobile.js - the buttons that only come now and then are there to be moved and sized
+    // too; the fly-down button could not be, and an enlarged jump covered it)
+    if (p.flying || this.editAll) L.descend = { x: jx, y: H - m - B, w: B, h: B };
     if (st.touchSprintBtn !== false && g.mode !== 'spectator') L.sprint = { x: jx - B - gp, y: H - m - B, w: B, h: B };
     const te = g.targetEntity;
-    if (te && g.mode !== 'spectator' && !(te.T && te.T.hostile)) {
-      L.interactText = typeof Villager !== 'undefined' && te instanceof Villager ? '交易' : '互动';
+    if (g.mode !== 'spectator' && ((te && !(te.T && te.T.hostile)) || this.editAll)) {
+      L.interactText = te && typeof Villager !== 'undefined' && te instanceof Villager ? '交易' : '互动';
       const iw = Math.max(B, Font.width(L.interactText) + 12), ih = Math.round(B * 0.6);
       L.interact = { x: W - m - iw, y: jy - ih - 2 * gp, w: iw, h: ih };
     }
@@ -292,9 +324,9 @@ class TouchControls {
   }
   hitL(r, x, y, pad = this.L.gp) { return !!r && x >= r.x - pad && y >= r.y - pad && x < r.x + r.w + pad && y < r.y + r.h + pad; }
   dpadCell(x, y, start) {
-    const L = this.L, pad = start ? 0 : L.B * 0.75;
-    if (x < L.x0 - pad || y < L.y0 - pad || x >= L.x0 + 3 * L.B + pad || y >= L.y0 + 3 * L.B + pad) return null;
-    const c = clamp(Math.floor((x - L.x0) / L.B), 0, 2), r = clamp(Math.floor((y - L.y0) / L.B), 0, 2);
+    const L = this.L, B = L.dB || L.B, pad = start ? 0 : B * 0.75; // (dB: the D-pad's own cell size, resized - mobile.js)
+    if (x < L.x0 - pad || y < L.y0 - pad || x >= L.x0 + 3 * B + pad || y >= L.y0 + 3 * B + pad) return null;
+    const c = clamp(Math.floor((x - L.x0) / B), 0, 2), r = clamp(Math.floor((y - L.y0) / B), 0, 2);
     const id = [['ul', 'up', 'ur'], ['left', 'sneak', 'right'], [null, 'down', null]][r][c];
     if (id === 'sneak') return start && L.cells.sneak ? 'sneak' : null;
     if ((id === 'ul' || id === 'ur') && start) return null; // the diagonals only appear while moving forward
@@ -378,7 +410,12 @@ class TouchControls {
       if (s.kind === 'look' && !s.moved && !s.holding && now - s.t0 >= 300 && this.playing() && g.mode !== 'spectator') {
         // hold: mine (attack) — or keep using a held-use item like food or a bow
         s.holding = true;
-        s.holdBtn = touchHoldUse(p.inv.held) && !g.targetEntity ? 2 : 0;
+        // (the other hand's - a shield - when the main hand has no use of its own and is no digging tool; a shield goes
+        // up at a mob too: "手机长按不能举盾"). Not at a block: there a long press digs, as with nothing in the other hand
+        const hd = p.inv.held && ITEMS[p.inv.held.id], off = p.inv.slots[40];
+        const offUse = (!g.target || !!g.targetEntity) && !touchHoldUse(p.inv.held) && touchHoldUse(off) && !(hd && (g.mainHandBusy(p.inv.held, hd) || (hd.tool && hd.tool.type !== 'sword')));
+        const st = offUse ? off : p.inv.held;
+        s.holdBtn = touchHoldUse(st) && (!g.targetEntity || ITEMS[st.id].key === 'shield') ? 2 : 0;
         if (s.holdBtn === 2) { g.mouseBtn[2] = true; g.useCd = 0; }
         else { g.mouseBtn[0] = true; g.mouseClicked0 = true; g.attackCd = Math.min(g.attackCd, 0); if (!g.target && !g.targetEntity) p.swing(); }
         if (navigator.vibrate) try { navigator.vibrate(10); } catch (e) { }

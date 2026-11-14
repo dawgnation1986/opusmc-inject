@@ -24,3 +24,38 @@ mods/
 .tmp-online/
 .workbuddy/
 nul
+
+# 整理后的归档目录（organize_root.py）：只留原本就在仓库里的旧脚本/旧包，
+# 让 git 识别成 rename 而不是删除；其余历史快照不入库
+# 注意：不能整体忽略父目录再写 ! 例外（git 不会遍历已忽略的目录）。
+# 改成逐个子目录排除，让 legacy/ 和旧包继续被跟踪。
+_archive/back/
+_archive/tmp-online/
+_archive/源码备份/
+_archive/ring-patterns-preview.png
+
+# 大体积素材 / 备份 / 运行时产物，不入库
+备份/
+材质包/
+opusmc-vanilla-assets.zip
+opusmc-dark-gui-lite.zip
+*.zip.bak
+tools/__pycache__/
+after-close.png
+
+# 构建缓存 / 编译产物 / 运行时（几百 MB，绝不入库）
+dev/comet-mod/_cache/
+dev/comet-mod/_tmp/
+dev/comet-mod/meteor-client/build/
+dev/comet-mod/meteor-client/.gradle/
+dev/comet-mod/preview/shots/
+**/__pycache__/
+*.class
+
+# 可再生的资源副本（由 tools/extract_vanilla_assets.py / build_source_tree.py 生成）
+opusmc-source/
+vanilla-assets/
+opusmc-v47685-src/
+dev/comet-mod/meteor-client/
+dev/comet-mod/fabric-template/
+dev/comet-mod/preview/shots/

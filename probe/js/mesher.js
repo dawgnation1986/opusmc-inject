@@ -136,11 +136,35 @@ function compactVerts(mb, ox, oy, oz) {
 const VIS_ALL = 0x7fff, VIS_PAIR = new Int8Array(36);
 { let k = 0; for (let a = 0; a < 6; a++) for (let b = a + 1; b < 6; b++) { VIS_PAIR[a * 6 + b] = VIS_PAIR[b * 6 + a] = k++; } }
 
+// a slime plant's colour (匠魂, block tint 'slime:<type>[:o]' - its data.js puts the colour maps in self.TC_SLIME, 64 x 64
+// each): SlimeColorizer.getColor - the position folded every 256 blocks into a triangle of the map, leaves and vines 128
+// blocks off; with no position (an item, a block drawn alone) the type's own colour
+const SLIME_RGB = {};
+function slimeTint(t, x, z) {
+  const S = self.TC_SLIME, parts = t.split(':'), type = parts[1];
+  if (!S || !S.maps[type]) return [255, 255, 255];
+  let c = SLIME_RGB[type];
+  if (!c) {
+    const h = S.maps[type], d = S.def[type] || 'ffffff';
+    c = SLIME_RGB[type] = { px: new Uint8Array(h.length / 2), def: [0, 2, 4].map((i) => parseInt(d.substr(i, 2), 16)), cache: new Map() };
+    for (let i = 0; i < c.px.length; i++) c.px[i] = parseInt(h.substr(i * 2, 2), 16);
+  }
+  if (x == null) return c.def;
+  if (parts[2]) { x += 128; z += 128; }
+  let fx = Math.abs((256 - (Math.abs(x) % 512)) / 256), fz = Math.abs((256 - (Math.abs(z) % 512)) / 256);
+  if (fx < fz) { const s = fx; fx = fz; fz = s; }
+  const k = Math.min(63, Math.round(fx * 63)) * 64 + Math.min(63, Math.round(fz * 63));
+  let v = c.cache.get(k);
+  if (!v) { v = [c.px[k * 3], c.px[k * 3 + 1], c.px[k * 3 + 2]]; c.cache.set(k, v); }
+  return v;
+}
+
 const Mesher = {
   ids: new Uint16Array(18 * 18 * 18),
   metas: new Uint8Array(18 * 18 * 18),
   lights: new Uint8Array(18 * 18 * 18),
   tints: new Uint8Array(18 * 18 * 6), // grass rgb + foliage rgb per padded column
+  tints2: new Uint8Array(18 * 18 * 6), // water rgb + dry foliage rgb per padded column
   opaqueBuf: new MeshBuffer(65536),
   transBuf: new MeshBuffer(16384),
   P(x, y, z) { return ((y + 1) * 18 + (z + 1)) * 18 + (x + 1); },
@@ -169,6 +193,12 @@ const Mesher = {
           tints[ti] = ch.grass[ci]; tints[ti + 1] = ch.grass[ci + 1]; tints[ti + 2] = ch.grass[ci + 2];
           tints[ti + 3] = ch.foliage[ci]; tints[ti + 4] = ch.foliage[ci + 1]; tints[ti + 5] = ch.foliage[ci + 2];
           (this.biomes || (this.biomes = new Uint8Array(18 * 18)))[(pz + 1) * 18 + (px + 1)] = ch.biome[lz * 16 + lx];
+          // water and dry foliage: blended per column like the grass (terrain2.js chunkTints), else the biome's own. The water
+          // was the biome's in the page and the default blue in the chunk worker, which has no vanilla biome table: a sea in two
+          // colours, the meshes of blocks changed nearby in the other one
+          const t2 = this.tints2, wa = ch.water, dr = ch.dry, wb = wa ? null : BIOME_WATER[ch.biome[lz * 16 + lx]] || BIOME_WATER_DEFAULT;
+          t2[ti] = wa ? wa[ci] : wb[0]; t2[ti + 1] = wa ? wa[ci + 1] : wb[1]; t2[ti + 2] = wa ? wa[ci + 2] : wb[2];
+          t2[ti + 3] = dr ? dr[ci] : DRY_FOLIAGE_DEFAULT[0]; t2[ti + 4] = dr ? dr[ci + 1] : DRY_FOLIAGE_DEFAULT[1]; t2[ti + 5] = dr ? dr[ci + 2] : DRY_FOLIAGE_DEFAULT[2];
         }
       }
       // cells, a layer at a time with the layer's section arrays looked up once
@@ -199,8 +229,11 @@ const Mesher = {
       case 'foliage': return [t[ti + 3], t[ti + 4], t[ti + 5]];
       case 'birch': return [128, 167, 85];
       case 'spruce': return [97, 153, 97];
-      case 'water': return BIOME_WATER[this.biomes ? this.biomes[(z + 1) * 18 + (x + 1)] : 0] || BIOME_WATER_DEFAULT;
+      case 'water': { const u = this.tints2; return [u[ti], u[ti + 1], u[ti + 2]]; }
+      case 'dry_foliage': { const u = this.tints2; return [u[ti + 3], u[ti + 4], u[ti + 5]]; }
     }
+    // (a mod's plant coloured by where it stands - 匠魂's slime plants, slimeTint; a block alone, an item: its own colour)
+    if (typeof b.tint === 'string' && b.tint.startsWith('slime:')) return slimeTint(b.tint, this.tx0 == null ? null : this.tx0 + x, this.tz0 + z);
     return [255, 255, 255];
   },
 
@@ -210,12 +243,12 @@ const Mesher = {
   },
   // the gathered arrays of a section, to mesh it in the chunk worker (load() puts them back there)
   snapshot(dim) {
-    return { dim, ids: this.ids.slice(), metas: this.metas.slice(), lights: this.lights.slice(), tints: this.tints.slice(),
+    return { dim, ids: this.ids.slice(), metas: this.metas.slice(), lights: this.lights.slice(), tints: this.tints.slice(), tints2: this.tints2.slice(),
       biomes: this.biomes ? this.biomes.slice() : new Uint8Array(18 * 18), wls: this.wls ? this.wls.slice() : null };
   },
   load(s) {
     setFaceShade(s.dim);
-    this.ids.set(s.ids); this.metas.set(s.metas); this.lights.set(s.lights); this.tints.set(s.tints);
+    this.ids.set(s.ids); this.metas.set(s.metas); this.lights.set(s.lights); this.tints.set(s.tints); if (s.tints2) this.tints2.set(s.tints2);
     this.wls = s.wls || null;
     (this.biomes || (this.biomes = new Uint8Array(18 * 18))).set(s.biomes);
   },
@@ -224,6 +257,7 @@ const Mesher = {
     ob.reset(); tb.reset(); lb.reset(); sb.reset();
     const ids = this.ids, wls = this.wls;
     const ox = cx * 16, oy = sy * 16, oz = cz * 16;
+    this.tx0 = ox; this.tz0 = oz; // (where the section is: tintOf's colours by position)
     this.surf = sb; // (liquid() puts the water surfaces there)
     try {
       for (let y = 0; y < 16; y++) {
@@ -277,8 +311,9 @@ const Mesher = {
   // Mesh a single block at local (0,0,0) with full light (icons, dropped items, held blocks)
   single(id, meta, fullBright = true) {
     setFaceShade('overworld');
+    this.tx0 = null;
     this.ids.fill(0); this.metas.fill(0); this.lights.fill(fullBright ? 0xF0 : 0xF0);
-    for (let i = 0; i < this.tints.length; i += 6) { this.tints.set([124, 189, 107, 89, 174, 48], i); }
+    for (let i = 0; i < this.tints.length; i += 6) { this.tints.set([124, 189, 107, 89, 174, 48], i); this.tints2.set([...BIOME_WATER_DEFAULT, ...DRY_FOLIAGE_DEFAULT], i); }
     const p = this.P(0, 0, 0);
     this.ids[p] = id; this.metas[p] = meta;
     if (BLOCKS[id].door) { this.ids[this.P(0, 1, 0)] = 0; }
@@ -294,7 +329,8 @@ const Mesher = {
 
   block(id, x, y, z, ox, oy, oz, single) {
     const b = BLOCKS[id];
-    if (b.beRender && !single) return;
+    // (a block this page doesn't know - a mod's, the world opened without that mod - 11-13: it threw here and the whole 16-block section stayed empty)
+    if (!b || (b.beRender && !single)) return;
     // barriers (and light blocks): nothing to see in the world, only their boxes to bump into - the barrier showed as a
     // white block (players' feedback 2026-10-31)
     if (b.be === 'invisible' && !single) return;
@@ -598,6 +634,7 @@ const Mesher = {
 
   // several blocks at given local offsets (icons for multi-block items)
   multi(list) {
+    this.tx0 = null;
     this.ids.fill(0); this.metas.fill(0); this.lights.fill(0xF0);
     for (const [id, meta, x, y, z] of list) { const p = this.P(x, y, z); this.ids[p] = id; this.metas[p] = meta; }
     const ob = this.opaqueBuf; ob.reset(); this.transBuf.reset();

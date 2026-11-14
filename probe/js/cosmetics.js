@@ -19,11 +19,22 @@ const Cosmetics = (() => {
     { id: 'cape:penguin', kind: 'cape', name: '企鹅披风' },
     { id: 'cape:penguinwalk', kind: 'cape', name: '企鹅披风（动态）' },
     { id: 'cape:goldapple', kind: 'cape', name: '金苹果披风' },
+    // the mods update (11-13, the user): the announcement's gift, the mods' screen's gift (the first time it is really
+    // opened - mods_ui.js), and the smeltery cape (how it is given: not decided yet)
+    { id: 'pet:lantern', kind: 'pet', name: '灯笼小精灵', how: ['更新公告的礼物'] },
+    { id: 'hat:chef', kind: 'hat', name: '厨师帽', how: ['第一次打开「模组」下载界面就送', '点一下去模组界面'], go: 'mods' },
+    { id: 'cape:smeltery', kind: 'cape', name: '冶炼炉披风', how: ['即将推出'] },
   ];
   const KIND = { hat: '帽子', pet: '宠物', pre: '名字前缀', cape: '披风' };
   const info = (id) => LIST.find((d) => d.id === id) || null;
   const name = (id) => { const d = info(id); return d ? d.name : ''; }; // ('' for one this game doesn't know yet)
-  const owned = () => (typeof Account !== 'undefined' && Account.loggedIn && Account.data && Array.isArray(Account.data.owned) ? Account.data.owned : []);
+  // (a super administrator - the user's account - owns every decoration this game knows, also ones the room service
+  // doesn't list yet: a preview's new ones, 11-13)
+  const owned = () => {
+    if (typeof Account === 'undefined' || !Account.loggedIn || !Account.data) return [];
+    if (Account.data.super) return [...new Set([...LIST.map((d) => d.id), ...(Account.data.owned || [])])];
+    return Array.isArray(Account.data.owned) ? Account.data.owned : [];
+  };
   const has = (id) => owned().includes(id);
 
   // ---- the display setting: 'all' (the default), 'mine' (others' hidden), 'none' (this player's too) ----
@@ -131,6 +142,21 @@ const Cosmetics = (() => {
       for (const [x, z] of [[-0.5, -5], [-0.5, 4], [4, -0.5], [-5, -0.5]]) B.push([x, 9.5, z, 1, 2, 1, 0, pt]);
       return B;
     })() }],
+    // the chef's hat (农夫乐事, 11-13): a white pleated band round the head with a little cabbage leaf pinned on the
+    // front, the puffed top wider than the band and shaded underneath, a smaller puff on top
+    chef: [{ name: 'head', pivot: [0, 24, 0], boxes: [
+      [-4, 6, -4, 8, 3, 8, 0.7, (f, i, j, fw, fh) => {
+        if (f === 'top') return '#FFFFFF';
+        if (f === 'bottom') return '#D4D4DE';
+        if (f === 'front' && j === 1 && i === 2) return '#5DAA3C';
+        if (f === 'front' && ((j === 0 && i === 3) || (j === 1 && i === 3) || (j === 2 && i === 2))) return j === 0 ? '#7CC456' : '#3E8A2A';
+        return j === fh - 1 ? '#E2E2EA' : i % 2 ? '#EEEEF4' : '#FFFFFF';
+      }],
+      // (the puff: much wider than the band - the mushroom shape that says chef - with soft folds down its sides)
+      [-6, 9.2, -6, 12, 4, 12, 0, (f, i, j, fw, fh) => (f === 'bottom' ? (i === 0 || j === 0 || i === fw - 1 || j === fw - 1 ? '#C8C8D4' : '#D8D8E2')
+        : f === 'top' ? (hash(i, j, 3) > 0.8 ? '#F1F1F6' : '#FFFFFF') : j === fh - 1 ? '#DEDEE8' : i % 3 === 1 ? '#ECECF3' : '#FFFFFF')],
+      [-4.5, 13.2, -4.5, 9, 2, 9, 0, (f, i, j, fw, fh) => (f === 'bottom' ? '#E0E0E8' : f === 'top' ? (hash(i, j, 5) > 0.85 ? '#F2F2F7' : '#FFFFFF') : i % 3 === 1 ? '#EEEEF4' : '#FFFFFF')],
+    ] }],
   };
 
   // ---- pets ----
@@ -152,6 +178,32 @@ const Cosmetics = (() => {
       { name: 'larm', parent: 'body', pivot: [-3.5, 4.5, 0], boxes: [[-3, -0.5, -0.5, 3, 1, 1, 0, twig]] },
     ],
   };
+  // the lantern spirit (移动光源, 11-13): a little iron lantern with two eyes in its warm glass and a handle on top,
+  // always afloat by its owner's shoulder, swaying and leaning back as it follows; it glows (drawn lit by itself, a
+  // flicker in it) and, in a world with 移动光源 on, lights the blocks round it (Cosmetics.lights, the mod reads it)
+  const IRON = '#3E3E48', IRON_L = '#585864';
+  const glass = (f, i, j, fw, fh) => {
+    if (f === 'top' || f === 'bottom') return IRON;
+    if (i === 0 || i === fw - 1) return IRON_L;
+    if (f === 'front' && j === 2 && (i === 1 || i === 3)) return '#4A2A08';
+    if (f === 'front' && j === 3 && i === 2) return '#B8601A';
+    if (f === 'front' && j === 3 && (i === 1 || i === 3)) return '#FFB08A';
+    const mid = Math.abs(i - (fw - 1) / 2) < 1 && j >= 2;
+    return mid ? '#FFF4C8' : j === 0 || j === fh - 1 ? '#FFC24A' : '#FFDF86';
+  };
+  PETS.lantern = [
+    { name: 'body', pivot: [0, 0, 0], boxes: [
+      [-3, 0, -3, 6, 1, 6, 0, (f, i, j, fw) => (f === 'top' ? '#2C2C34' : i === 0 || i === fw - 1 ? IRON_L : IRON)],
+      [-2.5, 1, -2.5, 5, 5, 5, 0, glass],
+      [-3, 6, -3, 6, 1, 6, 0, (f, i, j, fw) => (f === 'bottom' ? '#2C2C34' : i === 0 || i === fw - 1 ? IRON_L : IRON)],
+      [-2, 7, -2, 4, 1, 4, 0, (f) => (f === 'top' ? IRON_L : IRON)],
+    ] },
+    { name: 'handle', parent: 'body', pivot: [0, 8, 0], boxes: [
+      [-1.5, 0, -0.5, 1, 2, 1, 0, () => IRON_L], [0.5, 0, -0.5, 1, 2, 1, 0, () => IRON_L], [-1.5, 2, -0.5, 3, 1, 1, 0, () => IRON],
+    ] },
+  ];
+  // pets that float by the shoulder all the time; pets that light themselves (block light 0-1, flickering)
+  const PET_FLOAT = { lantern: true }, PET_GLOW = { lantern: true };
   const PET_SCALE = 0.85, PET_MAX = 20, PET_FAR = 32;
   const model = (r, kind, id) => buildModel(r, 'cos_' + kind + '_' + id, (kind === 'hat' ? HATS : PETS)[id]);
 
@@ -228,8 +280,10 @@ const Cosmetics = (() => {
       const pet = opts && opts.inv && e === g.player && typeof Skins !== 'undefined' && Skins.preview() && worn(g, e, 'pet');
       if (pet) {
         const k = model(r, 'pet', pet), mm = M4.copy(m), now = performance.now();
-        M4.translate(mm, 0.45, Math.abs(Math.sin(now / 300)) * 0.05, -0.1); M4.scale(mm, PET_SCALE, PET_SCALE, PET_SCALE);
-        r.drawModel(k, k, mm, petPose(null, now), lt, env, opts);
+        if (PET_FLOAT[pet]) M4.translate(mm, 0.5, 1.15 + Math.sin(now / 500) * 0.05, -0.1);
+        else M4.translate(mm, 0.45, Math.abs(Math.sin(now / 300)) * 0.05, -0.1);
+        M4.scale(mm, PET_SCALE, PET_SCALE, PET_SCALE);
+        r.drawModel(k, k, mm, petPose(null, now, pet), PET_GLOW[pet] ? glowLight(lt, now) : lt, env, opts);
       }
     } catch (err) { if (g.reportError) g.reportError('decoration', err, true); }
     finally { if (cull) gl.enable(gl.CULL_FACE); }
@@ -246,8 +300,15 @@ const Cosmetics = (() => {
     for (let yy = Math.floor(y + 1); yy >= Math.floor(y) - 3; yy--) if (!solidAt(w, x, yy, z) && solidAt(w, x, yy - 1, z)) return yy;
     return null;
   }
-  function petPose(S, now) {
+  // (lit by itself: block light near full, a slow flicker in it; the sky's light as it is)
+  const glowLight = (lt, now) => [lt ? lt[0] : 1, 0.88 + 0.08 * Math.sin(now / 130) * Math.sin(now / 370) + 0.04 * Math.sin(now / 53)];
+  function petPose(S, now, id) {
     const t = now / 1000, wave = S && S.wave > 0 ? Math.sin(S.wave * 12) * 0.5 + 0.9 : 0;
+    // the lantern: swaying a little, leaning back as it hurries after its owner; the handle swinging the other way
+    if (id === 'lantern') {
+      const sway = Math.sin(t * 1.7) * 0.07, lean = S ? Math.min(0.4, (S.speed || 0) * 0.09) : 0;
+      return { body: { rx: lean, rz: sway }, handle: { rz: -sway * 0.8 } };
+    }
     return {
       head: { ry: Math.sin(t * 0.7) * 0.25, rz: Math.sin(t * 1.3) * 0.06 },
       rarm: { rz: 0.35 + wave + Math.sin(t * 2) * 0.05 }, larm: { rz: -0.35 - Math.sin(t * 2 + 1) * 0.05 },
@@ -260,7 +321,7 @@ const Cosmetics = (() => {
     const by = me && g.playerBodyYaw ? g.playerBodyYaw(a) : (e.bodyYaw ?? e.yaw ?? 0);
     const fw = [-Math.sin(by), -Math.cos(by)], rt = [Math.cos(by), -Math.sin(by)];
     const below = floorAt(w, ip[0], ip[1], ip[2]);
-    const air = !!(e.flying || e.gliding || e.swimming || e.netSwim || (me && e.inWater)) || below === null;
+    const air = !!PET_FLOAT[id] || !!(e.flying || e.gliding || e.swimming || e.netSwim || (me && e.inWater)) || below === null;
     let tx, ty, tz;
     if (air) {
       // (by the left shoulder - the right is where the AI companion floats, companion.js place(); in first person
@@ -283,6 +344,7 @@ const Cosmetics = (() => {
     if (S.going) { const k = 1 - Math.exp(-dt * (air ? 4 : 5)); P[0] += (tx - P[0]) * k; P[2] += (tz - P[2]) * k; }
     P[1] += (ty - P[1]) * (1 - Math.exp(-dt * (air ? 4 : 12)));
     const sp = dt > 0 ? Math.hypot(P[0] - ox, P[2] - oz) / dt : 0, moving = sp > 0.3;
+    S.speed = (S.speed || 0) + (sp - (S.speed || 0)) * (1 - Math.exp(-dt * 6));
     // facing where it goes, else its owner
     const want = moving ? Math.atan2(-(P[0] - ox), -(P[2] - oz)) : Math.atan2(-(ip[0] - P[0]), -(ip[2] - P[2]));
     let dy = want - S.yaw; dy = Math.atan2(Math.sin(dy), Math.cos(dy)); S.yaw += dy * (1 - Math.exp(-dt * 8));
@@ -299,9 +361,12 @@ const Cosmetics = (() => {
     const m = M4.create(); M4.translate(m, P[0], y, P[2]); M4.rotY(m, S.yaw);
     M4.scale(m, PET_SCALE / Math.sqrt(sq), PET_SCALE * sq, PET_SCALE / Math.sqrt(sq));
     const L = w.getLight(Math.floor(P[0]), Math.floor(y + 0.3), Math.floor(P[2]));
-    const lt = L ? [(L >> 4) / 15, (L & 15) / 15] : e.lightAt();
+    let lt = L ? [(L >> 4) / 15, (L & 15) / 15] : e.lightAt();
+    if (PET_GLOW[id]) lt = glowLight(lt, now);
+    // (where it is, for its light - Cosmetics.lights)
+    S.glow = PET_GLOW[id] ? [P[0], y + 0.3, P[2]] : null; S.glowT = now;
     const k = model(r, 'pet', id);
-    r.drawModel(k, k, m, petPose(S, now), lt, env, {});
+    r.drawModel(k, k, m, petPose(S, now, id), lt, env, {});
     if (!air && hopY < 0.5) r.drawShadow(P[0], P[1], P[2], 0.28, 0.45 * (1 - hopY * 2));
   }
   // (an invisible owner's pet would give them away - the potion, or a server's flag, as game.js drawMob reads it)
@@ -359,6 +424,17 @@ const Cosmetics = (() => {
       '.....WWWWooo....', '.....WkWkWW.....', '......WkWW......', '....RRRRRRRR....',
       '..t.WWWWWRWW.t..', '...tWWWkWRWWt...', '....WWWWWRWW....', '....WWWkWWWW....',
       '....WWWWWWWW....', '.....SSSSSS.....', '................', '................'] },
+    // (11-13) the chef's hat, the lantern spirit
+    chef: { pal: { W: '#FFFFFF', s: '#D8D8E2', p: '#E6E6EE', d: '#B8B8C4', g: '#5DAA3C', G: '#3E8A2A' }, rows: [
+      '................', '.....WW..WW.....', '...WWWWWWWWWW...', '..WWWWWWWWWWWW..',
+      '..WWWWWWWWWWWW..', '..WsWWWWWWWWsW..', '...ssWWWWWWss...', '....ssssssss....',
+      '....WgWWWWWW....', '....WGgWpWpW....', '....WWpWpWpW....', '....pWpWpWpW....',
+      '....dddddddd....', '................', '................', '................'] },
+    lantern: { pal: { k: '#55555F', K: '#33333B', y: '#FFC24A', Y: '#FFE08A', W: '#FFF6D0', e: '#5A3A10', m: '#B0601A', b: '#FFB08A' }, rows: [
+      '................', '......kkkk......', '......k..k......', '....KKKKKKKK....',
+      '.....KKKKKK.....', '....kyyyyyyk....', '....kYYYYYYk....', '....kYeYYeYk....',
+      '....kbYWWYbk....', '....kYYmmYYk....', '....kyYWWYyk....', '....kyyyyyyk....',
+      '....KKKKKKKK....', '.....KKKKKK.....', '................', '................'] },
   };
   const grey = (c) => { const n = parseInt(c.slice(1), 16), l = Math.round((((n >> 16) & 255) * 0.3 + ((n >> 8) & 255) * 0.59 + (n & 255) * 0.11) * 0.5 + 20); return 'rgb(' + l + ',' + l + ',' + l + ')'; };
   function drawPix(c, art, x, y, size, locked) {
@@ -388,8 +464,16 @@ const Cosmetics = (() => {
     return s;
   }
 
+  // the lights pets give (the lantern spirit): this player's, drawn within the last second - for the 移动光源 mod
+  // (game/mods/dynlights: a light of its own while 移动光源 is on in the world)
+  function lights(g) {
+    const p = g && g.player, S = p && p.cosPet;
+    if (!S || !S.glow || performance.now() - (S.glowT || 0) > 1000) return [];
+    return [{ key: S, x: S.glow[0], y: S.glow[1], z: S.glow[2], L: 12 }];
+  }
+
   return {
-    LIST, KIND, info, name, owned, has, shown, lookOf, worn, mine, drawOn, drawIcon, openWardrobe, tagName, preName,
+    LIST, KIND, info, name, lights, owned, has, shown, lookOf, worn, mine, drawOn, drawIcon, openWardrobe, tagName, preName,
     PRE_CHAR: PRES.potato.ch, preChar: (v) => (hasKey(PRES, v) ? PRES[v].ch : ''),
   };
 })();

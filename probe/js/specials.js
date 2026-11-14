@@ -97,7 +97,7 @@ function specialRecipe(grid) {
   FireworkRocket.prototype.tick = function () {
     const wasDead = this.dead;
     const ex = this.stackRef && this.stackRef.explosions;
-    if (ex && ex.length && !wasDead && (this.age + 1 >= this.life || this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1]), Math.floor(this.pos[2])))) {
+    if (ex && ex.length && !wasDead && (this.age + 1 >= this.life || !this.shot && this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1]), Math.floor(this.pos[2])))) {
       this.dead = true; Sound.ev(ex.some(e => e.shape === 'large_ball') ? 'entity.firework_rocket.large_blast' : 'entity.firework_rocket.blast', this.pos, 3, 1);
       for (const e of ex) {
         const cols = (e.colors || ['white']).map(c => { const v = DYE_RGB[c] || 0xffffff; return [v >> 16 & 255, v >> 8 & 255, v & 255]; });
@@ -110,6 +110,7 @@ function specialRecipe(grid) {
         }
         if (e.twinkle) Sound.ev('entity.firework_rocket.twinkle', this.pos, 3, 1);
       }
+      if (this.blastDamage) this.blastDamage();
       return;
     }
     return _ctor.call(this);
@@ -138,6 +139,13 @@ function shieldTex(r, st) {
   const _db = Game.prototype.dropBlockLoot;
   Game.prototype.dropBlockLoot = function (x, y, z, id, meta, tool, ...rest) {
     const k = x + ',' + y + ',' + z, be = this.blockEntities.get(k);
+    // a structure's pot (trial chambers) drops its loot table's items when broken
+    if (BLOCKS[id] && BLOCKS[id].key === 'decorated_pot' && be && be.loot && typeof Loot !== 'undefined') {
+      const r = RNG(hashStr('loot' + this.world.seed + ':' + x + ':' + y + ':' + z));
+      for (const s of Loot.roll(be.loot, r)) this.dropItem(x + 0.5, y + 0.5, z + 0.5, s);
+      delete be.loot;
+      if (!be.sherds) this.blockEntities.delete(k);
+    }
     if (BLOCKS[id] && BLOCKS[id].key === 'decorated_pot' && be && be.sherds) {
       this.blockEntities.delete(k);
       // broken with a tool (not silk touch): the sherds come out; otherwise the pot drops whole
@@ -186,21 +194,55 @@ function shieldTex(r, st) {
 // the debug stick (creative): right click cycles the selected property of a block's state, sneak + right click
 // picks the next property (vanilla uses the attack button for that; here it stays on the use button)
 (() => {
+  // the first blocks and those sharing their meta layout (slabs, stairs, doors, beds, logs, furnaces ...) keep no
+  // state list - "没有属性" on every one of them (players' feedback 2026-11): their properties as vanillaState names
+  // them, a log's axis and a furnace's or chest's facing, with the lowest meta for each set of values. Stair shapes,
+  // fence and wall connections come from the neighbours: nothing to set
+  const SIDE = { 0: 'west', 1: 'east', 4: 'north', 5: 'south' }; // (meta: the DIRS index faced)
+  function metaStates(id) {
+    const c = metaStates.cache || (metaStates.cache = new Map());
+    if (c.has(id)) return c.get(id);
+    const b = BLOCKS[id], seen = new Map(), dom = {};
+    if (!b.fence) for (let m = 0; m < 256; m++) {
+      if (b.ladder && !SIDE[m]) continue;
+      if (b.key === 'torch' && m && m !== 1 && m !== 4 && m !== 5) continue; // standing + the 3 wall metas the game places
+      const vs = vanillaState(b, m, null), p = {};
+      for (const k in vs.p) if (k !== 'shape' && k !== 'occupied') p[k] = String(vs.p[k]);
+      if (b.axis) { if ((m & 3) === 3) continue; p.axis = ['y', 'x', 'z'][m & 3]; }
+      if (b.facing && b.key !== 'crafting_table') { if (!SIDE[m]) continue; p.facing = SIDE[m]; }
+      const s = vs.key + JSON.stringify(p);
+      if (!seen.has(s)) { seen.set(s, { meta: m, key: vs.key, p }); for (const k in p) (dom[k] = dom[k] || new Set()).add(p[k]); }
+    }
+    const list = [...seen.values()], props = Object.keys(dom).filter(k => dom[k].size > 1);
+    const r = list.length && props.length ? { list, props } : null;
+    c.set(id, r); return r;
+  }
+  // [the state's properties, all its states (each with .p), the meta for a state] of a block without a state list
+  function legacyState(id, meta) {
+    const S = metaStates(id); if (!S) return null;
+    const vs = vanillaState(BLOCKS[id], meta, null);
+    const cur = S.list.find(e => e.meta === meta) || S.list.find(e => e.key === vs.key && Object.keys(e.p).every(k => vs.p[k] === undefined || String(vs.p[k]) === e.p[k]));
+    if (!cur) return null;
+    const list = S.list.filter(e => e.key === cur.key), st = {};
+    for (const k of S.props) if (k in cur.p && new Set(list.map(e => e.p[k])).size > 1) st[k] = cur.p[k];
+    return [st, list.map(e => Object.assign({}, e.p)), (k, v) => { const e = list.find(e => e.p[k] === v && Object.keys(st).every(o => o === k || e.p[o] === st[o])); return e ? e.meta : meta; }];
+  }
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
     const p = this.player, t = this.target, held = p.inv.held;
     // (an id not in ITEMS in the hand - telemetry 11-02/03, 'reading key': using anything threw here)
     if (held && ITEMS[held.id] && ITEMS[held.id].key === 'debug_stick' && t && !this.targetEntity && !this.net) {
       const w = this.world, [x, y, z] = t.pos, id = w.getBlock(x, y, z), b = BLOCKS[id];
-      const st = b.states && b.states[w.getMeta(x, y, z)];
+      const L = !b.states && legacyState(id, w.getMeta(x, y, z));
+      const st = L ? L[0] : b.states && b.states[w.getMeta(x, y, z)];
       if (!st || !Object.keys(st).length) { this.ui.actionBar = { text: 'minecraft:' + b.key + ' 没有属性', t: performance.now() }; p.swing(); return; }
       const props = Object.keys(st);
       held.dbg = held.dbg || {};
       let k = held.dbg[b.key] && props.includes(held.dbg[b.key]) ? held.dbg[b.key] : props[0];
       if (p.sneaking) { k = props[(props.indexOf(k) + 1) % props.length]; held.dbg[b.key] = k; this.ui.actionBar = { text: '已选择“' + k + '”（' + st[k] + '）', t: performance.now() }; p.swing(); return; }
-      const vals = [...new Set(b.states.map(s => s[k]))];
+      const vals = [...new Set((L ? L[1] : b.states).map(s => s[k]))];
       const nv = vals[(vals.indexOf(st[k]) + 1) % vals.length];
-      w.setBlock(x, y, z, id, Features.withProp(id, w.getMeta(x, y, z), k, nv));
+      w.setBlock(x, y, z, id, L ? L[2](k, nv) : Features.withProp(id, w.getMeta(x, y, z), k, nv));
       held.dbg[b.key] = k;
       this.ui.actionBar = { text: '“' + k + '”设为' + nv, t: performance.now() };
       this.flushMesh && this.flushMesh(); p.swing(); return;
@@ -222,6 +264,17 @@ function shieldTex(r, st) {
     const k = x + ',' + y + ',' + z; let be = g.blockEntities.get(k);
     if (!be || be.type !== 'campfire') { be = { type: 'campfire', pos: [x, y, z], items: [null, null, null, null], times: [0, 0, 0, 0] }; g.blockEntities.set(k, be); }
     return be;
+  };
+  // put a lit campfire out (vanilla CampfireBlock.dowse - a shovel, water poured into it, a splash of water): unlit,
+  // with a puff of smoke; the food on it stays. There was no way to - "营火不能用锹、水桶熄灭". True if it was lit
+  Game.prototype.dowseCampfire = function (x, y, z, sound) {
+    const w = this.world, id = w.getBlock(x, y, z);
+    if (!isCamp(id) || !lit(w, x, y, z, id)) return false;
+    w.setBlock(x, y, z, id, Features.withProp(id, w.getMeta(x, y, z), 'lit', 'false'));
+    if (sound) Sound.ev(sound, [x + 0.5, y + 0.5, z + 0.5], sound === 'block.fire.extinguish' ? 0.5 : 1, sound === 'block.fire.extinguish' ? 2.6 + (Math.random() - Math.random()) * 0.8 : 1);
+    if (sound) for (let i = 0; i < 20; i++) this.particles.spawn('smoke', x + 0.3 + Math.random() * 0.4, y + 0.4, z + 0.3 + Math.random() * 0.4, 0, 0.07, 0);
+    this.flushMesh();
+    return true;
   };
   const _use = Game.prototype.use;
   Game.prototype.use = function () {
@@ -391,14 +444,21 @@ if (typeof MOB_TYPES !== 'undefined' && MOB_TYPES.wandering_trader && MOB_TYPES.
     const r = _fc.call(this, ch, saved);
     if (saved || this.net || this.p2pGuest || !ch || !ch.bs) return r;
     const w = this.world, x0 = ch.cx * 16, z0 = ch.cz * 16;
-    const free = (x, y, z) => { if (y < 0) return false; const lx = x - x0, lz = z - z0, id = lx >= 0 && lx < 16 && lz >= 0 && lz < 16 ? ch.getB((y << 8) | (lz << 4) | lx) : w.isLoaded(x, z) ? w.getBlock(x, y, z) : -1; return id === 0 || (id > 0 && !!REPLACEABLE[id] && !IS_FLUID[id] && !WLOG[id]); };
+    const at = (x, y, z) => { if (y < 0 || y >= HEIGHT) return -1; const lx = x - x0, lz = z - z0; return lx >= 0 && lx < 16 && lz >= 0 && lz < 16 ? ch.getB((y << 8) | (lz << 4) | lx) : w.isLoaded(x, z) ? w.getBlock(x, y, z) : -1; };
+    const free = (x, y, z) => { const id = at(x, y, z); return id === 0 || (id > 0 && !!REPLACEABLE[id] && !IS_FLUID[id] && !WLOG[id]); };
+    const wet = (x, y, z) => { const id = at(x, y, z); return id === WATER || (id > 0 && !!WLOG[id]); };
+    // (lava touching water - a ruined portal's in a lake or a river - is ticked too, past the cap: it has nowhere free
+    // to flow, so it stayed lava in the water, "水里废弃传送门的岩浆不变黑曜石")
     let n = 0;
-    for (let si = 0; si < ch.bs.length && n < 400; si++) {
+    for (let si = 0; si < ch.bs.length; si++) {
       const s = ch.bs[si]; if (!s || !s.p.some((id) => IS_FLUID[id])) continue;
-      for (let j = 0; j < 4096 && n < 400; j++) {
+      const both = s.p.includes(LAVA) && s.p.includes(WATER); // (lava and water in the section)
+      if (n >= 400 && !both) continue;
+      for (let j = 0; j < 4096 && (n < 400 || both); j++) {
         const i = (si << 12) | j, id = ch.getB(i); if (!IS_FLUID[id]) continue;
         const y = i >> 8, x = x0 + (i & 15), z = z0 + ((i >> 4) & 15);
-        if (free(x, y - 1, z) || free(x + 1, y, z) || free(x - 1, y, z) || free(x, y, z + 1) || free(x, y, z - 1)) { w.schedule(x, y, z, id === WATER ? 5 : 30); n++; }
+        if (n < 400 && (free(x, y - 1, z) || free(x + 1, y, z) || free(x - 1, y, z) || free(x, y, z + 1) || free(x, y, z - 1))) { w.schedule(x, y, z, id === WATER ? 5 : 30); n++; }
+        else if (both && id === LAVA && (wet(x, y + 1, z) || wet(x + 1, y, z) || wet(x - 1, y, z) || wet(x, y, z + 1) || wet(x, y, z - 1))) w.schedule(x, y, z, 2);
       }
     }
     return r;

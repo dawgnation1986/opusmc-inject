@@ -39,6 +39,16 @@ const beKey = (k) => typeof k === 'string' && /^-?\d+,-?\d+,-?\d+$/.test(k);
 // an item id from the other side, if this game has it: a phone still on an older (cached) or newer version sends ids
 // missing here, and a held item or dropped item drawn with one threw every frame
 const p2pItem = (id) => (id != null && ITEMS[id] ? id : null);
+// what a held or worn stack looks like beyond its id (enchantment glint, armour trim), and the stack drawn from both
+const p2pLooks = (s) => { const g = !!s && typeof stackGlint === 'function' && stackGlint(s); return s && (g || s.trim) ? { g: g ? 1 : 0, trim: s.trim || null } : null; };
+const p2pArmx = (list) => { const x = list.map(p2pLooks); return x.some((v) => v) ? x : undefined; }; // (left out when plain)
+const p2pStack = (id, x) => {
+  if (p2pItem(id) == null) return null;
+  const s = { id, count: 1, dmg: 0 }, t = x && x.trim, w = (v) => typeof v === 'string' && /^[a-z_]{1,32}$/.test(v);
+  if (x && x.g) s.g = true;
+  if (t && w(t.pattern) && w(t.material)) s.trim = { pattern: t.pattern, material: t.material };
+  return s;
+};
 // a message's size on the wire: bytes as they are, a string as UTF-8 (at most 3 bytes a character: encoded only when
 // that could matter)
 const p2pBytes = (d) => (typeof d !== 'string' ? d.length : d.length * 3 <= 65536 ? d.length * 3 : new TextEncoder().encode(d).length);
@@ -111,6 +121,9 @@ class GuestAvatar extends NetPlayer {
     super(game, x, y, z, peer.name);
     this.peer = peer; this.remote = true; this.alwaysTick = true; this.persistent = false; this.creative = false; this.spectator = false;
     this.netPos = [x, y, z]; this.lerpN = 0; this.tick = netEntityTick;
+    // (netEntityTick turns toward netYaw: without one until the guest's first state - it is still loading - the yaw
+    // became NaN for good, and the body with it once the guest walked: the host saw only its name tag)
+    this.netYaw = this.netHead = this.yaw;
     // (what mob code reads of "the player")
     const self = this;
     this.inv = { get held() { return self.heldId != null ? { id: self.heldId, count: 1, dmg: 0 } : null; }, get slots() { return [...new Array(36).fill(null), ...(self.armorItems || [null, null, null, null])]; }, armorPoints: () => 0, armorToughness: () => 0 };
@@ -146,7 +159,7 @@ class LocalHost {
         else if (m.t === 'signal') { const p = this.peers.get(m.from); if (p) p.link.signal(m.data, (d) => this.sig(p.id, d)).catch((err) => console.warn('p2p signal', err)); }
         else if (m.t === 'gone') this.dropPeer(m.id, '离开了');
       };
-      ws.onclose = () => { if (this.state === 'connecting') rej(new Error('连不上游戏服务器')); if (this.state === 'open') { this.state = 'closed'; this.g.ui.message('和游戏服务器的连接断了：已经在房间里的朋友不受影响，新的人进不来了', '#FFAA00'); } };
+      ws.onclose = () => { if (this.state === 'connecting') rej(new Error('游戏正在更新中…请稍后')); if (this.state === 'open') { this.state = 'closed'; this.g.ui.message('游戏正在更新中…请稍后：已经在房间里的朋友不受影响，新的人暂时进不来', '#FFAA00'); } };
     });
   }
   sig(id, data) { if (this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'signal', to: id, data })); }
@@ -200,7 +213,7 @@ class LocalHost {
     // (flat and structures: what the guest's world generates from the seed - without them a superflat host's guests
     // walked on normal terrain, feedback 11-01 20:36 / 20:38)
     p.link.send({
-      t: 'welcome', name: m.name, seed: m.seed, gen: m.gen, flat: !!m.flat, structures: m.structures !== false, mode: g.mode === 'spectator' ? 'survival' : g.mode, difficulty: g.difficulty, hardcore: !!g.hardcore,
+      t: 'welcome', name: m.name, seed: m.seed, gen: m.gen, flat: !!m.flat, flatClassic: !!m.flatClassic, structures: m.structures !== false, mode: g.mode === 'spectator' ? 'survival' : g.mode, difficulty: g.difficulty, hardcore: !!g.hardcore,
       time: g.worldTime, weather: g.weather, rain: g.rainTarget, spawn: g.player.spawn || m.spawn, near: [sp[0], sp[1], sp[2]], host: (Account.loggedIn && Account.name) || 'Host',
       saved, sponsor: this.sponsor, players: [...this.peers.values()].filter((q) => q.joined).map((q) => q.name),
     });
@@ -229,8 +242,9 @@ class LocalHost {
       case 'state': {
         p.state = m; if (!p.joined || !Array.isArray(m.pos) || !m.pos.slice(0, 3).every(Number.isFinite)) return;
         const a = this.avatarOf(p);
-        a.netPos = m.pos.slice(0, 3); a.lerpN = 2; a.netYaw = m.yaw; a.netHead = m.yaw; a.netPitch = m.pitch; a.sneaking = !!m.sneak;
-        if (m.swing) a.swingT = 6; a.heldId = p2pItem(m.held); a.armorItems = (Array.isArray(m.armor) ? m.armor : []).map((id) => (p2pItem(id) == null ? null : { id, count: 1 }));
+        a.netPos = m.pos.slice(0, 3); a.lerpN = 2; if (Number.isFinite(m.yaw)) a.netYaw = a.netHead = m.yaw; a.netPitch = Number.isFinite(m.pitch) ? m.pitch : 0; a.sneaking = !!m.sneak;
+        if (m.swing) a.swingT = 6; a.heldId = p2pItem(m.held); a.hand = p2pStack(m.held, m.heldx); a.offhand = p2pStack(m.off, m.offx);
+        a.armorItems = (Array.isArray(m.armor) ? m.armor : []).map((id, i) => p2pStack(id, Array.isArray(m.armx) ? m.armx[i] : null));
         a.creative = m.mode === 'creative'; a.spectator = m.mode === 'spectator'; a.deadGuest = !!m.dead; a.flying = !!m.flying; a.netSwim = !!m.swim;
         if (m.look) a.look = p2pLook(m.look);
         break;
@@ -309,19 +323,21 @@ class LocalHost {
       if (dx * dx + dz * dz > R2 && !(e instanceof GuestAvatar)) continue;
       if (!e.p2pId) e.p2pId = this.nextEnt++;
       const r = [e.p2pId, 0, +e.pos[0].toFixed(2), +e.pos[1].toFixed(2), +e.pos[2].toFixed(2), +(e.yaw || 0).toFixed(2)];
-      if (e instanceof GuestAvatar) { r[1] = 'player'; r.push({ name: e.name, look: e.look || null, held: e.heldId ?? null, armor: (e.armorItems || []).map((s) => s && s.id), sneak: !!e.sneaking, swing: e.swingT > 0, pitch: e.netPitch || 0, swim: !!e.netSwim }); }
+      if (e instanceof GuestAvatar) { r[1] = 'player'; r.push({ name: e.name, look: e.look || null, held: e.heldId ?? null, heldx: p2pLooks(e.hand), off: (e.offhand && e.offhand.id) ?? null, offx: p2pLooks(e.offhand), armor: (e.armorItems || []).map((s) => s && s.id), armx: p2pArmx(e.armorItems || []), sneak: !!e.sneaking, swing: e.swingT > 0, pitch: e.netPitch || 0, swim: !!e.netSwim }); }
       else if (e instanceof ItemEntity) { if (!e.stack) continue; r[1] = 'item'; r.push({ id: e.stack.id, n: e.stack.count }); }
       else if (e instanceof ExperienceOrb) { r[1] = 'xp'; r.push({ v: e.value || e.v || 1 }); }
       else if (e instanceof Mob && e.type) {
         r[1] = e.type;
         r.push({ b: +(e.bodyYaw ?? e.yaw ?? 0).toFixed(2), h: +(e.headYaw || 0).toFixed(2), p: +(e.pitch || 0).toFixed(2), ls: +(e.limbSwing || 0).toFixed(2), la: +(e.limbAmt || 0).toFixed(2),
-          baby: e.baby ? 1 : 0, sh: e.sheared ? 1 : 0, wc: e.woolColor || 0, sz: typeof e.size === 'number' ? e.size : undefined, fuse: e.fuse, ht: e.hurtTime || 0, dt: e.deathTime || 0, sw: e.swingT || 0, held: e.heldId ?? (e.hand && e.hand.id), name: e.customName });
+          baby: e.baby ? 1 : 0, sh: e.sheared ? 1 : 0, wc: e.woolColor || 0, sz: typeof e.size === 'number' ? e.size : undefined, fuse: e.fuse, ht: e.hurtTime || 0, dt: e.deathTime || 0, sw: e.swingT || 0, held: e.heldId ?? (e.hand && e.hand.id), name: e.customName,
+          // (a wither's boss bar: filling while it charges, then its health - the guest's mirror has neither)
+          boss: typeof Wither !== 'undefined' && e instanceof Wither ? +(e.invulT > 0 ? 1 - e.invulT / 220 : e.health / e.maxHealth).toFixed(3) : undefined });
       } else continue;
       ents.push(r);
     }
     // the host itself, as a player
     const hp = g.player;
-    ents.push([-1, 'player', +hp.pos[0].toFixed(2), +hp.pos[1].toFixed(2), +hp.pos[2].toFixed(2), +hp.yaw.toFixed(2), { name: (Account.loggedIn && Account.name) || 'Host', look: Skins.mine(g), held: hp.inv.held ? hp.inv.held.id : null, armor: hp.inv.slots.slice(36, 40).map((s) => s && s.id), sneak: !!hp.sneaking, swing: hp.swingT > 0, pitch: hp.pitch, swim: !!hp.swimming }]);
+    ents.push([-1, 'player', +hp.pos[0].toFixed(2), +hp.pos[1].toFixed(2), +hp.pos[2].toFixed(2), +hp.yaw.toFixed(2), { name: (Account.loggedIn && Account.name) || 'Host', look: Skins.mine(g), held: hp.inv.held ? hp.inv.held.id : null, heldx: p2pLooks(hp.inv.held), off: hp.inv.slots[40] ? hp.inv.slots[40].id : null, offx: p2pLooks(hp.inv.slots[40]), armor: hp.inv.slots.slice(36, 40).map((s) => s && s.id), armx: p2pArmx(hp.inv.slots.slice(36, 40)), sneak: !!hp.sneaking, swing: hp.swingT > 0, pitch: hp.pitch, swim: !!hp.swimming }]);
     return { t: 'E', list: ents };
   }
   // a block changed in the host's world (game play, not generation): to the guests, and the chunk marked changed
@@ -358,7 +374,7 @@ class LocalGuest {
         else if (m.t === 'error') { this.state = 'left'; rej(new Error(m.reason)); }
         else if (m.t === 'closed') this.lost('房主关闭了房间');
       };
-      ws.onerror = () => { if (this.state === 'connecting') { this.state = 'left'; rej(new Error('连不上游戏服务器')); } };
+      ws.onerror = () => { if (this.state === 'connecting') { this.state = 'left'; rej(new Error('游戏正在更新中…请稍后')); } };
     });
   }
   lost(why) {
@@ -380,7 +396,7 @@ class LocalGuest {
   async onWelcome(m) {
     const g = this.g, id = 'p2p~' + this.code;
     this.meta = {
-      id, name: m.name + '（本地房间）', seed: String(m.seed), gen: m.gen || 2, mode: m.mode, flat: !!m.flat, structures: m.structures !== false, difficulty: m.difficulty, hardcore: m.hardcore, cheats: false,
+      id, name: m.name + '（本地房间）', seed: String(m.seed), gen: m.gen || 2, mode: m.mode, flat: !!m.flat, ...(m.flatClassic ? { flatClassic: true } : {}), structures: m.structures !== false, difficulty: m.difficulty, hardcore: m.hardcore, cheats: false,
       time: m.time, weather: m.weather, rainTarget: m.rain, spawn: m.spawn, tutorial: -1, dims: { overworld: { blockEntities: Object.fromEntries(this.wbes || []), mobs: [] } },
       player: m.saved || null, created: Date.now(), lastPlayed: Date.now(),
     };
@@ -487,11 +503,12 @@ class LocalGuest {
         g.entities.push(e); this.mirrors.set(id, e);
       }
       e.netPos = [x, y, z]; e.lerpN = 3; e.netYaw = yaw;
-      if (type === 'player') { e.name = String(d.name || '?').slice(0, 32); e.look = p2pLook(d.look); e.heldId = p2pItem(d.held); e.armorItems = (Array.isArray(d.armor) ? d.armor : []).map((i) => (p2pItem(i) == null ? null : { id: i, count: 1 })); e.sneaking = d.sneak; if (d.swing && !(e.swingT > 0)) e.swingT = 6; e.netPitch = d.pitch; e.netHead = yaw; e.netSwim = d.swim; }
+      if (type === 'player') { e.name = String(d.name || '?').slice(0, 32); e.look = p2pLook(d.look); e.heldId = p2pItem(d.held); e.hand = p2pStack(d.held, d.heldx); e.offhand = p2pStack(d.off, d.offx); e.armorItems = (Array.isArray(d.armor) ? d.armor : []).map((i, k) => p2pStack(i, Array.isArray(d.armx) ? d.armx[k] : null)); e.sneaking = d.sneak; if (d.swing && !(e.swingT > 0)) e.swingT = 6; e.netPitch = d.pitch; e.netHead = yaw; e.netSwim = d.swim; }
       else if (d && type !== 'item' && type !== 'xp') {
         e.netHead = yaw + (d.h || 0); e.netPitch = d.p; e.limbSwing = d.ls; e.limbAmt = d.la; e.prevLimb = d.ls;
         if (d.baby) e.baby = true; e.sheared = !!d.sh; e.woolColor = d.wc; if (d.sz !== undefined) e.size = d.sz; if (d.fuse !== undefined) e.fuse = d.fuse;
         if (d.ht > (e.hurtTime || 0)) e.hurtTime = d.ht; if (d.dt && !e.deathTime) e.deathTime = 1; if (d.sw) e.swingT = d.sw; e.heldId = p2pItem(d.held); if (d.name) e.customName = d.name;
+        if (Number.isFinite(d.boss)) e.bossProg = d.boss;
       } else if (type === 'item' && (!e.stack || e.stack.id !== st.id || e.stack.count !== st.count)) e.stack = st;
     }
     for (const [id, e] of this.mirrors) if (!seen.has(id)) { if (!(e.deathTime > 0)) e.dead = true; this.mirrors.delete(id); this.picks.delete(id); }
@@ -499,8 +516,8 @@ class LocalGuest {
   // this player, ten times a second
   sendState(final) {
     const g = this.g, p = g.player; if (!p) return;
-    this.send({ t: 'state', pos: p.pos.map((v) => +v.toFixed(2)), yaw: +p.yaw.toFixed(3), pitch: +p.pitch.toFixed(3), sneak: !!p.sneaking, swing: p.swingT > 0, held: p.inv.held ? p.inv.held.id : null,
-      armor: p.inv.slots.slice(36, 40).map((s) => s && s.id), mode: g.mode, dead: p.deathTime > 0, flying: !!p.flying, swim: !!p.swimming, look: Skins.mine(g) });
+    this.send({ t: 'state', pos: p.pos.map((v) => +v.toFixed(2)), yaw: +p.yaw.toFixed(3), pitch: +p.pitch.toFixed(3), sneak: !!p.sneaking, swing: p.swingT > 0, held: p.inv.held ? p.inv.held.id : null, heldx: p2pLooks(p.inv.held), off: p.inv.slots[40] ? p.inv.slots[40].id : null, offx: p2pLooks(p.inv.slots[40]),
+      armor: p.inv.slots.slice(36, 40).map((s) => s && s.id), armx: p2pArmx(p.inv.slots.slice(36, 40)), mode: g.mode, dead: p.deathTime > 0, flying: !!p.flying, swim: !!p.swimming, look: Skins.mine(g) });
     if (final || g.tickCount % 200 === 0) this.send({ t: 'pstate', data: { pos: [...p.pos], yaw: p.yaw, pitch: p.pitch, health: p.health, food: p.food, sat: p.saturation, xp: p.xp, inv: p.inv.slots, sel: p.inv.sel, flying: p.flying, effects: [] } });
   }
   // the guest's own tick: the player and the mirrors; the host simulates the world

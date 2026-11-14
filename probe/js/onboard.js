@@ -7,18 +7,23 @@
 // tutorial and situational tips, the "what is different here" overview, the minimap / death marker / recipe hints
 // on or off, what changed in an update.
 // ---------------------------------------------------------------------------
+// (v 2, 11-13: the fan-work statement - support the original, never for profit, taken down when the rights holders ask;
+// the user approved the wording. A higher v asks everyone to agree once more)
 const LEGAL = {
-  v: 1,
+  v: 2,
   agreement: [
-    '《用户协议》（2026 年 10 月 30 日生效）',
-    '1. 本游戏是 UP 主「土豆味小哲」独立制作的非官方作品，与 Mojang、微软无关；免费游玩。',
-    '2. 游戏中保留的部分原版素材（音效、模型、方块结构等）版权归原作者所有；我们原创的代码、界面、披风、玩法等受著作权法保护。',
-    '3. 禁止：逆向、反编译游戏代码；抓取后未经书面许可公开或分发；搭建仿冒服务器或镜像站；使用作弊程序、改包连接我们的服务器。',
+    '《用户协议》（2026 年 11 月 13 日更新）',
+    '1. 本游戏是 UP 主「土豆味小哲」制作的 Minecraft（我的世界）粉丝二次创作作品，不是官方产品，与 Mojang Studios、微软（Microsoft）、网易都没有关联，也没有得到他们的授权或认可。',
+    '2. 支持正版：Minecraft 的名称、商标和原版素材，权利都属于 Mojang Studios 和微软；游戏中保留的部分原版素材（音效、模型、方块结构等）版权归原作者所有。如果你喜欢这个游戏，请支持正版 Minecraft（Java 版、基岩版或网易中国版）。',
+    '3. 永不盈利：本游戏永久免费，没有充值、付费道具、会员和广告，我们不会以任何形式通过本游戏盈利；游戏里的饰品、披风只能通过活动、签到等免费方式获得。',
+    '4. 配合下架：如果 Mojang Studios、微软或其他权利人认为本游戏侵犯了他们的权利并提出要求，我们会立即配合，下架游戏或删除相关内容。权利人可以通过 B站 私信 UP 主「土豆味小哲」联系我们。',
+    '5. 游戏中的模组是参照社区模组重新制作的，原模组的名称和设计归原作者所有。',
+    '6. 我们原创的代码、界面、披风、玩法等受著作权法保护。禁止：逆向、反编译游戏代码；抓取后未经书面许可公开或分发；搭建仿冒服务器或镜像站；使用作弊程序、改包连接我们的服务器。',
     '   违反的会被封号，必要时追究法律责任。',
-    '4. 联机时请文明游戏：不骂人、不刷屏、不破坏别人的建筑；房主可以踢人、禁言、封禁，我们也会处理举报。',
-    '5. 账号由你自己保管：个人识别码可以登录你的账号，请不要告诉别人。',
-    '6. 服务器可能维护或调整；云存档、房间按说明的时间清理。因不可抗力或第三方原因造成的数据损失，我们会尽力恢复但不承担责任。',
-    '7. 协议更新时会在游戏里再提示一次。问题和建议：游戏里的「反馈问题」，或 B站 私信 UP 主。',
+    '7. 联机时请文明游戏：不骂人、不刷屏、不破坏别人的建筑；房主可以踢人、禁言、封禁，我们也会处理举报。',
+    '8. 账号由你自己保管：个人识别码可以登录你的账号，请不要告诉别人。',
+    '9. 服务器可能维护或调整；云存档、房间按说明的时间清理。因不可抗力或第三方原因造成的数据损失，我们会尽力恢复但不承担责任。',
+    '10. 协议更新时会在游戏里再提示一次。问题和建议：游戏里的「反馈问题」，或 B站 私信 UP 主。',
   ],
   privacy: [
     '《隐私说明》',
@@ -81,7 +86,7 @@ class AgreementScreen extends MenuScreen {
     ui.dim(0.35);
     drawCard(c, B.x, B.y, B.w, B.h, false);
     Font.center(c, this.updated ? '用户协议有更新' : '欢迎来到 OpusMC', cx, B.y + 10, '#FFFFFF');
-    const intro = this.updated ? ['协议内容有调整，请重新阅读并同意后继续游戏。'] : ['这是 UP 主「土豆味小哲」自制的非官方作品，免费游玩。', '开始之前，请阅读并同意下面的协议。'];
+    const intro = this.updated ? ['协议内容有调整，请重新阅读并同意后继续游戏。'] : ['这是 UP 主「土豆味小哲」制作的 Minecraft 粉丝二创作品，非官方、永久免费。', '开始之前，请阅读并同意下面的协议。'];
     intro.forEach((t, i) => Font.center(c, fitText(t, B.w - 16), cx, B.y + 28 + i * 11, '#A0A0A0'));
     // the check row: the box, the words, the two links (blue, underlined; lighter under the pointer)
     const hit = this.rowHit(m.x, m.y);

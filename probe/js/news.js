@@ -30,17 +30,14 @@ const NewsBoard = {
   // the statistics, and a device that can't reach the service would add one every title open and every 5 minutes
   // (as checkin.js quiet())
   fetch(force, quiet) {
-    // [local offline copy] B 站服务端按页面来源拒绝非 bilibili 域（红字「不允许从这个网页访问」），
-    // 本地离线版直接跳过公告拉取，读 localStorage 缓存即可
-    if (!/(^|\.)bilibili(com|toy)\.com$/.test(location.hostname)) return Promise.resolve();
     if (this.pending) return force ? this.pending.then(() => this.fetch()) : this.pending;
     if (typeof RoomService === 'undefined' || !RoomService.base() || typeof Account === 'undefined') return Promise.resolve();
     this.loading = true; this.lastFetch = performance.now();
     const get = async () => {
       if (!quiet) return Account.api('/api/news');
       let f;
-      try { f = await fetch(RoomService.base() + '/api/news'); } catch (e) { throw new Error('连不上游戏服务器'); }
-      let j; try { j = await f.json(); } catch (e) { j = { error: '服务器没有回应（HTTP ' + f.status + '）' }; }
+      try { f = await fetch(RoomService.base() + '/api/news'); } catch (e) { throw new Error('游戏正在更新中…请稍后'); }
+      let j; try { j = await f.json(); } catch (e) { j = { error: '游戏正在更新中…请稍后' }; }
       if (!f.ok || j.error) throw new Error(j.error || 'HTTP ' + f.status);
       return j;
     };
@@ -572,7 +569,7 @@ class NewsEditScreen extends FormScreen {
     if (!ta) {
       const touch = navigator.maxTouchPoints > 0;
       ta = this.ta = document.createElement('textarea');
-      ta.maxLength = 1000; ta.value = this.body; ta.placeholder = '正文（换行就是分段）'; ta.spellcheck = false; ta.setAttribute('autocomplete', 'off');
+      ta.maxLength = 3000; ta.value = this.body; ta.placeholder = '正文（换行就是分段）'; ta.spellcheck = false; ta.setAttribute('autocomplete', 'off');
       // (16px on touch screens: iPhones zoom the page in on a smaller field; the page itself turns selection and
       // touch scrolling off, the box turns them back on)
       Object.assign(ta.style, {

@@ -131,9 +131,30 @@ out vec2 v_uv;
 void main(){ v_uv = a_uv; gl_Position = u_vp * u_model * vec4(a_pos, 1.0); }`;
 const TEX_FS = `#version 300 es
 precision highp float;
-uniform sampler2D u_tex; uniform vec4 u_color;
+uniform sampler2D u_tex; uniform vec4 u_color; uniform float u_cut; // u_cut: alpha below it discarded (0: none)
 in vec2 v_uv; out vec4 o;
-void main(){ vec4 t = texture(u_tex, v_uv); o = t * u_color; }`;
+void main(){ vec4 t = texture(u_tex, v_uv); if (t.a < u_cut) discard; o = t * u_color; }`;
+
+// the enchantment glint (vanilla's glint shader and TextureTransform.setupGlintTexturing): the glint texture through
+// u_tm (offset xy, scale z, turn w) over the model's own UVs, added on (render.js drawGlint), only where the model's
+// own texture is there (vanilla tests depth EQUAL against what it drew; here its alpha). C: item meshes in the terrain
+// format (tile UVs, the texture array's layer), E: entity models (their texture on unit 1)
+const glintVS = (C) => `#version 300 es
+layout(location=0) in vec3 a_pos; layout(location=1) in vec2 a_uv;${C ? ' layout(location=2) in uvec2 a_tex; flat out uint v_layer;' : ''}
+uniform mat4 u_vp; uniform mat4 u_model; uniform vec3 u_cam; uniform vec4 u_tm;
+out vec2 v_uv; out vec2 v_guv; out float v_dist;
+void main(){ vec4 wp = u_model * vec4(a_pos, 1.0); gl_Position = u_vp * wp; v_uv = a_uv;${C ? ' v_layer = a_tex.x;' : ''}
+  vec2 p = a_uv * u_tm.z; float c = cos(u_tm.w), s = sin(u_tm.w); v_guv = vec2(p.x * c - p.y * s, p.x * s + p.y * c) + u_tm.xy;
+  v_dist = length(wp.xz - u_cam.xz); }`;
+const glintFS = (C) => `#version 300 es
+precision highp float;${C ? ' precision highp sampler2DArray;\nuniform sampler2DArray u_tex; flat in uint v_layer;' : '\nuniform sampler2D u_tex;'}
+uniform sampler2D u_glint; uniform vec2 u_fog; uniform float u_alpha;
+in vec2 v_uv; in vec2 v_guv; in float v_dist; out vec4 o;
+void main(){
+  if (${C ? 'texture(u_tex, vec3(v_uv, float(v_layer))).a' : 'texture(u_tex, v_uv).a'} < 0.1) discard;
+  vec4 c = texture(u_glint, v_guv); if (c.a < 0.1) discard;
+  float fade = (1.0 - clamp((v_dist - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0)) * u_alpha;
+  o = vec4(c.rgb * fade, c.a); }`;
 
 const COL_VS = `#version 300 es
 layout(location=0) in vec3 a_pos; layout(location=1) in vec4 a_col;
@@ -147,6 +168,8 @@ in vec4 v_col; in float v_dist; out vec4 o;
 void main(){ vec4 c = v_col * u_color; float f = clamp((v_dist - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0); o = vec4(mix(c.rgb, u_fogColor, f), c.a * (1.0 - f * f)); }`;
 
 const AMB0 = [0.08, 0.08, 0.08]; // (the ambient light where env has none)
+// does a stack shine (ui.js drawItem's test): its own override (g), else enchanted or an item that always does
+function stackGlint(st) { const d = st && ITEMS[st.id]; return !!d && !!(st.g || (st.g !== false && ((st.e && st.e.length) || d.glint))); }
 
 // more tiles than one texture array may hold: TEX_STACK tiles one above the other in each layer (16 x 16*TEX_STACK).
 // (it was a second array on unit 9 - black on older Mali phones, ~27% of them: Mali-G51/G52/G57/G72/G76, the
@@ -275,6 +298,7 @@ class VertexArena {
       gl.copyBufferSubData(gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, a.off, b.off, a.size);
       const off = a.off;
       src.allocs.delete(a); a.pg = b.pg; a.off = b.off; b.pg.allocs.add(a);
+      if (a.vao && this.onMove) this.onMove(a); // (a mesh with its own VAO, Apple's engine: pointed at its new place)
       this.release(src, off, a.size);
       moved += a.size;
     }
@@ -330,6 +354,9 @@ class Renderer {
     this.miscBuf = new MeshBuffer(1024);
     this.miscGL = this.makeDynamic();
     this.ufEpoch = 0; this.texEp = -1; this.matI = 0; // (uniform cache, matrix pool: see ufState, mat)
+    // terrain meshes with VAOs of their own on Apple's engine (makeSectionMesh; ?meshvao=1 / 0 in the address to try)
+    const mv = new URLSearchParams(location.search).get('meshvao');
+    this.meshVao = mv !== null ? mv === '1' : typeof WEBKIT_GL !== 'undefined' && WEBKIT_GL;
   }
   // a frame of game.render (the telemetry.js hook sets it around each one; resize waits while it is false): the matrix
   // pool starts over and the cached uniforms are checked again - also in frames with no world (a frozen title, previews)
@@ -340,10 +367,31 @@ class Renderer {
     const gl = this.gl;
     // ---- texture array
     // the tiles come in rows of ASSETS.cols (tileXY); the texture wants them one after another
-    const strip = await loadImage(ASSETS.strip);
     const n = ASSETS.count, sc = this.stripCols = ASSETS.cols || 1;
-    const cv = document.createElement('canvas'); cv.width = strip.width; cv.height = strip.height;
-    const cx = cv.getContext('2d'); cx.drawImage(strip, 0, 0);
+    // the mods' tiles (mods.js): strips of the same width, each starting on a row of its own (at: its first layer)
+    const extra = ASSETS.extra || [], rows = Math.ceil(n / sc);
+    // the pixels come back through a 2D canvas. On Android phones a GPU-backed canvas sometimes read back all transparent:
+    // every block, icon and held item invisible, Fast leaves black (feedback 10-31 .. 11-11, ~120 reports; the self test
+    // below never ran then - no opaque tile). willReadFrequently keeps the canvas in main memory, and an empty read is
+    // made again from a fresh decode
+    const tele = (k) => { let n = 0; const f = () => (typeof Telemetry === 'undefined' || !Telemetry.count ? (++n < 20 && setTimeout(f, 3000)) : Telemetry.count(k)); f(); };
+    let cv, cx;
+    for (let tries = 0; ; tries++) {
+      const strip = await loadImage(ASSETS.strip);
+      cv = document.createElement('canvas'); cv.width = strip.width; cv.height = Math.max(strip.height, rows * 16);
+      cx = cv.getContext('2d', { willReadFrequently: true }); cx.drawImage(strip, 0, 0);
+      const g0 = cx.getImageData(0, 0, strip.width, strip.height).data;
+      let some = false;
+      for (let i = 3; i < g0.length; i += 4) if (g0[i]) { some = true; break; }
+      if (some || tries >= 3) { if (tries) tele(some ? 'tex_src_retry_ok' : 'tex_src_empty'); break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    for (const e of extra) {
+      if (e.src) { const im = await loadImage(e.src); cx.drawImage(im, 0, Math.floor(e.at / sc) * 16); continue; }
+      // (an SDK mod's textures - modapi.js: a 16 x 16 picture each, one tile after another; a taller one - frames - its first)
+      const ims = await Promise.all(e.files.map((f) => loadImage(f).catch(() => null)));
+      ims.forEach((im, i) => { if (!im) return; const k = e.at + i; cx.drawImage(im, 0, 0, Math.min(16, im.width), Math.min(16, im.width), (k % sc) * 16, Math.floor(k / sc) * 16, 16, 16); });
+    }
     const grid = cx.getImageData(0, 0, cv.width, cv.height).data, data = new Uint8ClampedArray(n * 1024);
     for (let k = 0; k < n; k++) {
       const x0 = (k % sc) * 16, y0 = Math.floor(k / sc) * 16;
@@ -424,11 +472,11 @@ class Renderer {
       this.entityTex[k] = this.tex2D(this.images[k], ['rain', 'snowfall', 'end_portal_tex', 'end_sky', 'end_crystal_beam', 'beacon_beam'].includes(k));
     }
     // colormaps
-    const cm = (img) => { const c = document.createElement('canvas'); c.width = 256; c.height = 256; const x = c.getContext('2d'); x.drawImage(img, 0, 0); return x.getImageData(0, 0, 256, 256).data; };
+    const cm = (img) => { const c = document.createElement('canvas'); c.width = 256; c.height = 256; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0); return x.getImageData(0, 0, 256, 256).data; };
     this.grassMap = cm(this.images.grass_color); this.foliageMap = cm(this.images.foliage_color);
     // clouds
     {
-      const c = document.createElement('canvas'); c.width = 256; c.height = 256; const x = c.getContext('2d');
+      const c = document.createElement('canvas'); c.width = 256; c.height = 256; const x = c.getContext('2d', { willReadFrequently: true });
       x.drawImage(this.images.clouds, 0, 0);
       const d = x.getImageData(0, 0, 256, 256).data;
       this.cloudMap = new Uint8Array(256 * 256);
@@ -510,7 +558,23 @@ class Renderer {
     }))).alloc(data.byteLength);
     gl.bindBuffer(gl.ARRAY_BUFFER, a.pg.buf);
     gl.bufferSubData(gl.ARRAY_BUFFER, a.off, data);
+    // Apple's engine (meshVao): a VAO of its own whose attributes start at the mesh, drawn from the quad indices' start -
+    // as before 11-05. Drawn from its page's VAO at an offset into the shared indices, every mesh was a new index range
+    // for WebKit's WebGL to check, and each remesh another: on iPhones / iPads / Mac Safari frames over 500 ms doubled
+    // (stalls outside the page's own time) and pages died while a world loaded - one iPhone session in two, 11-07
+    if (this.meshVao) {
+      if (!this.arena.onMove) this.arena.onMove = (m) => this.pointMeshVao(m);
+      a.vao = gl.createVertexArray(); this.pointMeshVao(a);
+    }
     return { a };
+  }
+  // a mesh's own VAO at its range of its page (made, or moved by the arena's compaction)
+  pointMeshVao(a) {
+    const gl = this.gl;
+    gl.bindVertexArray(a.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, a.pg.buf); this.setupSectionAttribs(a.off);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadIdx);
+    gl.bindVertexArray(null);
   }
   // the sections in `list` (o: opaque meshes, else translucent) drawn with program P's u_model, in the list's order (rev:
   // last first); the page's VAO bound only when it changes - sorted by page, a page binds once. Returns the triangles
@@ -521,8 +585,10 @@ class Renderer {
       const s = list[rev ? n - 1 - k : k], m = o ? s.o : s.t;
       if (!m) continue;
       const a = m.a, cnt = o ? s.n : s.tn;
-      if (a.pg !== pg) { pg = a.pg; gl.bindVertexArray(pg.vao); }
       gl.uniformMatrix4fv(loc, false, s.m);
+      // (its own VAO, from the indices' start: meshVao)
+      if (a.vao) { gl.bindVertexArray(a.vao); pg = null; gl.drawElements(gl.TRIANGLES, cnt * 1.5, gl.UNSIGNED_INT, 0); tris += cnt / 2; continue; }
+      if (a.pg !== pg) { pg = a.pg; gl.bindVertexArray(pg.vao); }
       gl.drawElements(gl.TRIANGLES, cnt * 1.5, gl.UNSIGNED_INT, a.off / 4); // (off / 96 quads of 6 four-byte indices)
       tris += cnt / 2;
     }
@@ -598,8 +664,8 @@ class Renderer {
     s.dead = true; // the culling walk's list may still hold it until the next walk
     const c = this.cols.get(ckey(s.x >> 4, s.z >> 4));
     if (c && c.s[s.y >> 4] === s) c.s[s.y >> 4] = null;
-    if (s.o) this.arena.free(s.o.a);
-    if (s.t) this.arena.free(s.t.a);
+    if (s.o) { this.arena.free(s.o.a); if (s.o.a.vao) this.gl.deleteVertexArray(s.o.a.vao); }
+    if (s.t) { this.arena.free(s.t.a); if (s.t.a.vao) this.gl.deleteVertexArray(s.t.a.vao); }
   }
   dropChunk(cx, cz) {
     for (let sy = 0; sy < SECTIONS; sy++) {
@@ -1166,7 +1232,7 @@ void main(){ vec2 v_uv = vec2(0.53, 0.53); o = texture(u_tex, vec3(v_uv, float(u
     gl.uniform3fv(S.u.u_sunDir, env.sunDir);
     gl.uniform4fv(S.u.u_sunset, env.sunset);
     gl.uniform3fv(S.u.u_void, env.voidColor);
-    gl.uniform1f(S.u.u_voidOn, this.camPos[1] + (this.yOff || 0) < 63 ? 1 : 0);
+    gl.uniform1f(S.u.u_voidOn, this.camPos[1] + (this.yOff || 0) < (env.horizon ?? 63) ? 1 : 0);
     // with the shader pack the sky and the (round) sun are drawn in post: here only the stars and the moon, on black
     const fxSun = this.fxOn && this.fx && this.fx.sunDiscCol;
     if (fxSun) { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
@@ -1277,6 +1343,9 @@ void main(){ vec2 v_uv = vec2(0.53, 0.53); o = texture(u_tex, vec3(v_uv, float(u
     const P = this.useChunkProg(env, 'trans', 0.01);
     if (P.u.u_pass) gl.uniform1i(P.u.u_pass, 1);
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    // (shader pack: the target's alpha - 1 where the sky was cleared - keeps how much light gets through the translucent
+    // blocks, and post adds the sky behind them by it: through stained glass the sky was black)
+    if (this.fxOn) gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
     gl.disable(gl.CULL_FACE);
     gl.depthMask(false);
     if (P.u.u_sec) gl.uniform1i(P.u.u_sec, 1);
@@ -1300,12 +1369,15 @@ void main(){ vec2 v_uv = vec2(0.53, 0.53); o = texture(u_tex, vec3(v_uv, float(u
     }
     gl.depthMask(true);
     gl.enable(gl.CULL_FACE);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.disable(gl.BLEND);
   }
 
   drawClouds(env, px, pz) {
     if (!this.showClouds) return;
-    if (this.fxOn && this.fx.cloudsOn) return; // the shader pack draws its own (volumetric) clouds
+    // the shader pack draws its own (volumetric) clouds - and none where it leaves them out (the head in water or lava):
+    // these flat ones showed there instead, over its post-processed sky
+    if (this.fxOn) return;
     // vanilla's thick fogs (under water, blindness...) hide the clouds too: they were drawn with their own far fog and
     // showed through the water's ("在水下能看到云", feedback 11-01 19:37). Those fogs are spheres around the eye (vanilla
     // FogShape.SPHERE) and the cloud program's fog is a level distance, so the layer's height goes into its range: a layer
@@ -1352,12 +1424,50 @@ void main(){ vec2 v_uv = vec2(0.53, 0.53); o = texture(u_tex, vec3(v_uv, float(u
     // (the shader pack keeps what entities draw for their shadows next frame; shRecOnly: only that)
     if (this.shRec) this.shRec.push({ vao: g.vao, n: g.n, m: new Float32Array(model) });
     if (!this.shRecOnly) gl.drawElements(gl.TRIANGLES, g.n * 1.5, gl.UNSIGNED_INT, 0);
+    if (opts.glint) this.drawGlint([[g.vao, g.n, 0, model]], opts.glint, env, this.vp, true);
+  }
+  // the enchantment glint over parts just drawn ([vao, quads, offset, matrix] each), like vanilla's glint render types:
+  // kind 'item' (glint_item, scale 8 of the item atlas - an eighth of the glint over a 16 px tile), 'entity' (0.5: the
+  // shield and trident) or 'armor' (glint_armor, 0.16); chunk: item meshes, else entity models (their texture bound)
+  drawGlint(list, kind, env, vp, chunk) {
+    if (this.shRecOnly || !list.length) return;
+    const gl = this.gl, tex = this.glintTex(kind === 'armor');
+    if (!tex) return;
+    const k = chunk ? 'C' : 'E', P = (this.progGlint || (this.progGlint = {}))[k] || (this.progGlint[k] = compile(gl, glintVS(chunk), glintFS(chunk))), u = P.u;
+    gl.useProgram(P.p);
+    gl.uniformMatrix4fv(u.u_vp, false, vp || this.vp); gl.uniform3f(u.u_cam, this.camPos[0], this.camPos[1], this.camPos[2]);
+    // (Util.getMillis * glintSpeed 0.5 * 8)
+    const ms = performance.now() * 4, sc = kind === 'item' ? 0.125 : kind === 'armor' ? 0.16 : 0.5;
+    gl.uniform4f(u.u_tm, -(ms % 110000) / 110000, (ms % 30000) / 30000, sc, Math.PI / 18);
+    gl.uniform2f(u.u_fog, env.fogNear, env.fogFar); gl.uniform1f(u.u_alpha, 0.75); // (glintStrength's default)
+    gl.uniform1i(u.u_tex, chunk ? 0 : 1); gl.uniform1i(u.u_glint, 4);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tex); gl.activeTexture(this.u1 ? gl.TEXTURE1 : gl.TEXTURE0);
+    const blend = gl.isEnabled(gl.BLEND), cull = gl.isEnabled(gl.CULL_FACE), df = gl.getParameter(gl.DEPTH_FUNC);
+    const bf = [gl.BLEND_SRC_RGB, gl.BLEND_DST_RGB, gl.BLEND_SRC_ALPHA, gl.BLEND_DST_ALPHA].map((q) => gl.getParameter(q));
+    gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_COLOR, gl.ONE, gl.ZERO, gl.ONE);
+    gl.depthFunc(gl.LEQUAL); gl.depthMask(false); gl.disable(gl.CULL_FACE);
+    gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(-1, -1);
+    for (const [vao, n, off, m] of list) { gl.bindVertexArray(vao); gl.uniformMatrix4fv(u.u_model, false, m); gl.drawElements(gl.TRIANGLES, n * 1.5, gl.UNSIGNED_INT, off); }
+    gl.disable(gl.POLYGON_OFFSET_FILL); gl.depthMask(true); gl.depthFunc(df);
+    gl.blendFuncSeparate(bf[0], bf[1], bf[2], bf[3]); if (!blend) gl.disable(gl.BLEND);
+    if (cull) gl.enable(gl.CULL_FACE);
+  }
+  // the glint textures (etex.js: vanilla's misc/enchanted_glint_item / _armor), repeating and smoothed ("blur"); null
+  // until loaded
+  glintTex(armor) {
+    const k = armor ? 'armor' : 'item', G = this._glint || (this._glint = {});
+    if (G[k] !== undefined) return G[k];
+    G[k] = null;
+    const src = typeof window !== 'undefined' && window.ETEX && ETEX['misc/enchanted_glint_' + k];
+    if (src) { const im = new Image(); im.onload = () => { const gl = this.gl, t = this.tex2D(im, true); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); G[k] = t; }; im.src = src; }
+    return null;
   }
 
   drawModel(name, texName, model, poses, light, env, opts = {}) {
     const gl = this.gl, E = this.entBegin(texName, light, env, opts), mdl = this.models[name];
-    const attached = [], mats = {}, draw = !this.shRecOnly && !opts.hidden;
-    let vao = null;
+    // (opts.glintOnly: only the glint over a model drawn before - armour under its trim)
+    const attached = [], mats = {}, draw = !this.shRecOnly && !opts.hidden && !opts.glintOnly;
+    let vao = null, glint = null;
     for (const part of mdl.parts) {
       const pose = poses && poses[part.name];
       if (pose && pose.hidden) continue;
@@ -1381,14 +1491,16 @@ void main(){ vec2 v_uv = vec2(0.53, 0.53); o = texture(u_tex, vec3(v_uv, float(u
       // (opts.hidden: an invisible body - only what is attached to it, held items, is drawn. The record is drawn next
       // frame: its own copy of the matrix, not the pool's. A packed model's parts share a VAO: bound once - packParts)
       const ms = part.mesh, off = ms.off || 0;
-      if (this.shRec && !opts.vp && !opts.hidden) this.shRec.push({ vao: ms.vao, n: ms.n, off, m: new Float32Array(m), tex: this.entityTex[texName] });
+      if (this.shRec && !opts.vp && !opts.hidden && !opts.glintOnly) this.shRec.push({ vao: ms.vao, n: ms.n, off, m: new Float32Array(m), tex: this.entityTex[texName] });
       if (draw && ms.n) {
         if (ms.vao !== vao) { vao = ms.vao; gl.bindVertexArray(vao); }
         gl.uniformMatrix4fv(E.u.u_model, false, m);
         gl.drawElements(gl.TRIANGLES, ms.n * 1.5, gl.UNSIGNED_INT, off);
       }
+      if (opts.glint && ms.n && !opts.hidden) (glint || (glint = [])).push([ms.vao, ms.n, off, m]);
       if (opts.attach && opts.attach[part.name]) attached.push([opts.attach[part.name], this.mat(m)]);
     }
+    if (glint) this.drawGlint(glint, opts.glint, env, opts.vp || this.vp, false);
     this.unit0();
     for (const [fn, m] of attached) fn(m);
   }
@@ -1527,15 +1639,45 @@ void main(){ vec4 t = texture(u_tex, v_uv); o = t * vec4(1.0, 1.0, 1.0, v_a); }`
     const atlas = document.createElement('canvas'); atlas.width = cols * S; atlas.height = rows * S;
     const actx = atlas.getContext('2d');
     actx.imageSmoothingEnabled = false;
+    // the 3D icons a page at a time (PR rows of the atlas): each drawn into its own square of one framebuffer as wide
+    // as the atlas, the page read back once (11-10: read back once an icon - a wait for the GPU each, over a thousand
+    // of them - it was most of the start-up, seconds on a phone, the loading bar standing still at 84 %); the flat
+    // sprites go onto the atlas after their page
+    const PR = 16, PW = cols * S, PH = Math.min(rows, PR) * S;
     const fb = gl.createFramebuffer(), tex = gl.createTexture(), rb = gl.createRenderbuffer();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, S, S);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, PW, PH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, PW, PH);
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
-    gl.viewport(0, 0, S, S);
-    const px = new Uint8Array(S * S * 4), img = actx.createImageData(S, S);
+    const px = new Uint8Array(PW * PH * 4), img = actx.createImageData(PW, PH);
+    // an icon's square in the page (GL's rows count up from the bottom), only it cleared and drawn
+    let page = -1, drawn = 0;
+    const at = (cx, cy) => {
+      const y = PH - (cy - page * PH) - S;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(cx, y, S, S); gl.scissor(cx, y, S, S);
+      gl.enable(gl.SCISSOR_TEST); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      drawn++;
+    };
+    const flats = [];
+    // the page's 3D icons onto the atlas (its rows the right way up), then its sprites
+    const flush = () => {
+      if (page >= 0) {
+        if (drawn) {
+          gl.disable(gl.SCISSOR_TEST); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+          gl.readPixels(0, 0, PW, PH, gl.RGBA, gl.UNSIGNED_BYTE, px);
+          const RW = PW * 4;
+          for (let y = 0; y < PH; y++) img.data.set(px.subarray((PH - 1 - y) * RW, (PH - y) * RW), y * RW);
+        } else img.data.fill(0);
+        // the page's flat sprites into the same pixels, then the page onto the atlas once (11-13: they went onto the atlas
+        // through one small canvas used again for each - WebKit draws a canvas later than asked, with what it holds by
+        // then: on iPhones / iPads most item icons came out as other items' - a stick as a cookie, smithing templates)
+        for (const f of flats) f();
+        if (drawn || flats.length) actx.putImageData(img, 0, page * PH);
+      }
+      flats.length = 0; drawn = 0;
+    };
     const env = { tick: 0, day: 1, fogColor: [0, 0, 0], fogNear: 1e8, fogFar: 2e8, nightTint: [1, 1, 1] };
     const savedVP = this.vp; const savedCam = this.camPos;
     this.camPos = [0, 0, 0];
@@ -1545,6 +1687,8 @@ void main(){ vec4 t = texture(u_tex, v_uv); o = t * vec4(1.0, 1.0, 1.0, v_a); }`
     for (const id of ids) {
       const it = ITEMS[id];
       const cx = (slot[id] % cols) * S, cy = Math.floor(slot[id] / cols) * S;
+      const pg = Math.floor(slot[id] / cols / PR), py = cy - pg * PH;
+      if (pg !== page) { flush(); page = pg; gl.disable(gl.SCISSOR_TEST); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(0, 0, PW, PH); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
       const b = it.block !== undefined ? BLOCKS[it.block] : null;
       const info = VD && VD.items[it.key];
       // (the GUI's own model where the item has one: spears, the spyglass and the trident are small sprites there)
@@ -1552,28 +1696,25 @@ void main(){ vec4 t = texture(u_tex, v_uv); o = t * vec4(1.0, 1.0, 1.0, v_a); }`
       const model = mi !== undefined ? VD.models[mi] : null;
       const tint = info ? this.itemTint(info.tints) : null;
       // block-entity blocks (banners, heads, chests ...): their entity model (blockents.js); the shield: its model too
-      // (its item model has no shape of its own, only a planks particle texture)
+      // (its item model has no shape of its own, only a planks particle texture). The chest too: it was left to its old
+      // box mesh - no latch, the front the wrong way
       const shield = it.key === 'shield' && this.shieldIcon;
-      if (shield || (b && ((b.be && b.be !== 'invisible') || (b.chestLike && b.id !== 52)))) {
-        gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      if (shield || (b && ((b.be && b.be !== 'invisible') || b.chestLike))) {
+        at(cx, cy);
         gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
         if (shield) this.shieldIcon(model && model.display && model.display.gui, env, vp); else this.beIcon(b, env, vp);
-        gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(0, 0, S, S);
-        gl.readPixels(0, 0, S, S, gl.RGBA, gl.UNSIGNED_BYTE, px);
-        for (let y = 0; y < S; y++) img.data.set(px.subarray((S - 1 - y) * S * 4, (S - y) * S * 4), y * S * 4);
-        actx.putImageData(img, cx, cy);
         continue;
       }
       // flat sprite: vanilla "generated" item models (or no model data at all)
       if (model && model.gen && model.layers && model.layers.length) {
-        model.layers.forEach((l, k) => this.drawFlatIcon(actx, T(l), cx, cy, S, info ? this.itemTint(info.tints, k) : null));
+        const tints = model.layers.map((l, k) => info ? this.itemTint(info.tints, k) : null);
+        flats.push(() => model.layers.forEach((l, k) => this.flatInto(img.data, PW, T(l), cx, py, S, tints[k])));
         continue;
       }
       if (!model) {
         const flat = !it.block || it.flat || (b && (b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door));
-        if (flat) { this.drawFlatIcon(actx, it.block ? (it.flat ? T(it.flat) : b.tex[0]) : it.tex, cx, cy, S, b && b.tint === 'grass' ? [124, 189, 107] : null); continue; }
+        if (flat) { const l = it.block ? (it.flat ? T(it.flat) : b.tex[0]) : it.tex, t = b && b.tint === 'grass' ? [124, 189, 107] : null; flats.push(() => this.flatInto(img.data, PW, l, cx, py, S, t)); continue; }
       }
-      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       const d = (model && model.display.gui) || { r: [30, 225, 0], t: [0, 0, 0], s: [0.625, 0.625, 0.625] };
       const R = M4.create();
       M4.rotX(R, d.r[0] * Math.PI / 180); M4.rotY(R, d.r[1] * Math.PI / 180); M4.rotZ(R, d.r[2] * Math.PI / 180);
@@ -1582,13 +1723,15 @@ void main(){ vec4 t = texture(u_tex, v_uv); o = t * vec4(1.0, 1.0, 1.0, v_a); }`
       M4.mul(m, m, R);
       M4.scale(m, d.s[0], d.s[1], d.s[2]);
       // (a bed: both halves - its item model is the head's block model alone, and the icon showed half a bed, players
-      // said; the foot block at z 0, the head at z -1, so the pair is centred at z 0)
-      M4.translate(m, -0.5, -0.5, b && b.bed ? 0 : -0.5);
+      // said; vanilla's composite bed item: the head at z 0, the foot at z 1, from -0.5 like any model - centred on the
+      // pair it sat up and to the right of the slot)
+      M4.translate(m, -0.5, -0.5, -0.5);
       let mb;
-      if (b && b.bed) mb = Mesher.multi([[it.block, 0, 0, 0, 0], [it.block, 4, 0, 0, -1]]);
+      if (b && b.bed) mb = Mesher.multi([[it.block, 4, 0, 0, 0], [it.block, 0, 0, 0, 1]]);
       else if (model && model.elements && model.elements.length) mb = this.iconMesh(VM.bake(mi), R, tint, model.light);
       else if (b) { let meta = 0; if (b.facing) meta = 4; if (b.stairs) meta = 0; mb = Mesher.single(id, meta); }
-      else { this.drawFlatIcon(actx, it.tex, cx, cy, S, null); continue; }
+      else { const l = it.tex; flats.push(() => this.flatInto(img.data, PW, l, cx, py, S, null)); continue; }
+      at(cx, cy);
       this.useChunkProg(env);
       gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -1597,11 +1740,10 @@ void main(){ vec4 t = texture(u_tex, v_uv); o = t * vec4(1.0, 1.0, 1.0, v_a); }`
       gl.depthFunc(gl.LEQUAL);
       this.drawMesh(mb, m, env, [1, 0]);
       gl.depthFunc(gl.LESS);
-      gl.readPixels(0, 0, S, S, gl.RGBA, gl.UNSIGNED_BYTE, px);
-      for (let y = 0; y < S; y++) img.data.set(px.subarray((S - 1 - y) * S * 4, (S - y) * S * 4), y * S * 4);
-      actx.putImageData(img, cx, cy);
       if (mb.gl) { gl.deleteVertexArray(mb.gl.vao); gl.deleteBuffer(mb.gl.buf); }
     }
+    flush();
+    gl.disable(gl.SCISSOR_TEST);
     gl.disable(gl.BLEND); gl.enable(gl.CULL_FACE);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
@@ -1697,17 +1839,80 @@ void main(){ vec4 t = texture(u_tex, v_uv); o = t * vec4(1.0, 1.0, 1.0, v_a); }`
   }
   // where a tile (texture layer) sits in stripCanvas
   tileXY(k) { const c = this.stripCols; return [(k % c) * 16, Math.floor(k / c) * 16]; }
-  drawFlatIcon(ctx, layer, x, y, S, tint) {
-    const c = document.createElement('canvas'); c.width = 16; c.height = 16;
-    const cx = c.getContext('2d');
-    cx.drawImage(this.stripCanvas, ...this.tileXY(layer), 16, 16, 0, 0, 16, 16);
-    if (tint) {
-      const d = cx.getImageData(0, 0, 16, 16);
-      for (let i = 0; i < 1024; i += 4) { d.data[i] = d.data[i] * tint[0] / 255; d.data[i + 1] = d.data[i + 1] * tint[1] / 255; d.data[i + 2] = d.data[i + 2] * tint[2] / 255; }
-      cx.putImageData(d, 0, 0);
+  // a layer drawn again while playing (a mod's icons made per stack: Tinkers' tools in their materials): its 16 x 16
+  // RGBA pixels into the texture array (every mip level, point-sampled like the other item sprites), the item mesh's
+  // alpha and the strip canvas
+  setLayer(k, px) {
+    // (layer k / TEX_STACK, k % TEX_STACK tiles down in it - at every mip level)
+    const gl = this.gl, F = TEX_STACK, z = Math.floor(k / F), at = k % F;
+    const unit = gl.getParameter(gl.ACTIVE_TEXTURE);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.texArray);
+    let cur = px, size = 16;
+    for (let l = 0; l < 5; l++) {
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, l, 0, at * size, z, size, size, 1, gl.RGBA, gl.UNSIGNED_BYTE, cur);
+      const ns = size >> 1;
+      if (!ns) break;
+      const nx = new Uint8Array(ns * ns * 4);
+      for (let y = 0; y < ns; y++) for (let x = 0; x < ns; x++) nx.set(cur.subarray((y * 2 * size + x * 2) * 4, (y * 2 * size + x * 2) * 4 + 4), (y * ns + x) * 4);
+      cur = nx; size = ns;
     }
+    gl.activeTexture(unit);
+    for (let i = 0; i < 256; i++) _spriteAlpha[k * 256 + i] = px[i * 4 + 3];
+    ItemMeshCache.delete(k);
+    const im = new ImageData(new Uint8ClampedArray(px), 16, 16), [x, y] = this.tileXY(k);
+    this.stripCanvas.getContext('2d').putImageData(im, x, y);
+    // (and the tile's pixels kept: the tinted flat icons are drawn from them)
+    if (this.tileData && (k + 1) * 1024 <= this.tileData.length) this.tileData.set(px.subarray ? px.subarray(0, 1024) : px, k * 1024);
+  }
+  // a flat sprite into RGBA pixels (buf, bw wide) at x, y in an S square - as drawFlatIcon draws it (16 -> S - 8, 4 in from
+  // the edge, nearest texel picked as the browser does, over what is there), but in the page's own pixels: no canvas drawn
+  // from (buildIcons, 11-13)
+  flatInto(buf, bw, layer, x, y, S, tint) {
+    const td = this.tileData;
+    if (!td || !(layer >= 0 && (layer + 1) * 1024 <= td.length)) return;
+    const D = S - 8, o = layer * 1024, bh = buf.length / 4 / bw;
+    for (let dy = 0; dy < D; dy++) {
+      const ty = y + 4 + dy; if (ty < 0 || ty >= bh) continue;
+      const sy = Math.min(15, Math.floor(dy * 16 / D));
+      let p = (ty * bw + x + 4) * 4;
+      for (let dx = 0; dx < D; dx++, p += 4) {
+        const q = o + (sy * 16 + Math.min(15, Math.floor(dx * 16 / D))) * 4, sa = td[q + 3];
+        if (!sa) continue;
+        let r = td[q], g = td[q + 1], b = td[q + 2];
+        if (tint) { r = r * tint[0] / 255; g = g * tint[1] / 255; b = b * tint[2] / 255; }
+        const da = buf[p + 3];
+        if (sa === 255 || !da) { buf[p] = r; buf[p + 1] = g; buf[p + 2] = b; buf[p + 3] = sa; continue; }
+        const a = sa / 255, d = (da / 255) * (1 - a), oa = a + d;
+        buf[p] = (r * a + buf[p] * d) / oa; buf[p + 1] = (g * a + buf[p + 1] * d) / oa; buf[p + 2] = (b * a + buf[p + 2] * d) / oa; buf[p + 3] = oa * 255;
+      }
+    }
+  }
+  // (from the tile's own pixels - tileData - through one small canvas kept for it: it was a new canvas an icon, and a
+  // read back of it for a tint, 11-10; drawn straight from the strip the scaled pixels fell a column off here and there)
+  drawFlatIcon(ctx, layer, x, y, S, tint) {
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(c, 0, 0, 16, 16, x + 4, y + 4, S - 8, S - 8);
+    const td = this.tileData;
+    if (!td || !(layer >= 0 && (layer + 1) * 1024 <= td.length)) {
+      const c = document.createElement('canvas'); c.width = 16; c.height = 16;
+      const cx = c.getContext('2d');
+      cx.drawImage(this.stripCanvas, ...this.tileXY(layer), 16, 16, 0, 0, 16, 16);
+      if (tint) {
+        const d = cx.getImageData(0, 0, 16, 16);
+        for (let i = 0; i < 1024; i += 4) { d.data[i] = d.data[i] * tint[0] / 255; d.data[i + 1] = d.data[i + 1] * tint[1] / 255; d.data[i + 2] = d.data[i + 2] * tint[2] / 255; }
+        cx.putImageData(d, 0, 0);
+      }
+      ctx.drawImage(c, 0, 0, 16, 16, x + 4, y + 4, S - 8, S - 8);
+      return;
+    }
+    const k = this._flatTile || (this._flatTile = { c: document.createElement('canvas'), d: new ImageData(16, 16) });
+    if (k.c.width !== 16) { k.c.width = 16; k.c.height = 16; }
+    const o = layer * 1024, s = td, dd = k.d.data;
+    if (tint) for (let i = 0; i < 1024; i += 4) {
+      dd[i] = s[o + i] * tint[0] / 255; dd[i + 1] = s[o + i + 1] * tint[1] / 255; dd[i + 2] = s[o + i + 2] * tint[2] / 255; dd[i + 3] = s[o + i + 3];
+    }
+    else dd.set(s.subarray(o, o + 1024));
+    k.c.getContext('2d').putImageData(k.d, 0, 0);
+    ctx.drawImage(k.c, 0, 0, 16, 16, x + 4, y + 4, S - 8, S - 8);
   }
 }
 

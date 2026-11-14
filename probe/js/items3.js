@@ -122,29 +122,41 @@ class FishingHook extends Entity {
   tick() {
     this.savePrev(); this.age++;
     const g = this.game, o = this.owner, v = this.vel;
-    if (o.dead || o.deathTime || !o.inv.held || keyOf3(o.inv.held) !== 'fishing_rod' || this.distTo(o) > 32) { this.dead = true; o.fishHook = null; return; }
+    // (a rod in either hand keeps it: vanilla shouldStopFishing)
+    if (o.dead || o.deathTime || !(keyOf3(o.inv.held) === 'fishing_rod' || keyOf3(o.inv.slots[40]) === 'fishing_rod') || this.distTo(o) > 32) { this.dead = true; o.fishHook = null; return; }
     if (this.hooked) {
       if (this.hooked.dead) { this.hooked = null; return; }
       this.pos = [this.hooked.pos[0], this.hooked.pos[1] + this.hooked.h * 0.8, this.hooked.pos[2]]; return;
     }
     // hits an entity on the way
-    if (!this.inWaterT) for (const e of g.entities) {
+    if (!this.bobbing) for (const e of g.entities) {
       if (e === this || e === o || !(e instanceof Living) || e.dead || e.deathTime) continue;
       const b = e.box();
       if (this.pos[0] > b[0] - 0.1 && this.pos[0] < b[3] + 0.1 && this.pos[1] > b[1] - 0.1 && this.pos[1] < b[4] + 0.1 && this.pos[2] > b[2] - 0.1 && this.pos[2] < b[5] + 0.1) { this.hooked = e; e.hurt(0.0001, { type: 'mob', attacker: o }); return; }
     }
     const x = Math.floor(this.pos[0]), y = Math.floor(this.pos[1]), z = Math.floor(this.pos[2]), id = this.world.getBlock(x, y, z);
     const water = this.world.waterAt(x, y, z);
-    if (water) {
-      // float: bob at the surface
-      const surf = y + 0.88;
-      v[1] += (surf - this.pos[1]) * 0.1 - 0.02; v[0] *= 0.9; v[2] *= 0.9; v[1] *= 0.9;
-      if (!this.inWaterT) Sound.ev('entity.fishing_bobber.splash', this.pos, 0.25, 1 + (Math.random() - 0.5) * 0.4);
-      this.inWaterT++;
-      this.openWater = true;
-      this.fishTick(x, y, z);
-    } else { v[1] -= 0.03; v[0] *= 0.92; v[1] *= 0.92; v[2] *= 0.92; this.inWaterT = 0; }
+    // vanilla FishingHook.tick: flying, it is slowed hard as it lands in water (it slid on along the surface) and
+    // then bobs - pulled toward the water's top in its own block (a whole block when water is above: up from deep
+    // water - it sank and stayed under, aimed at the top of whatever block it was in); flying, it stops dead on the
+    // ground or against a wall (it slid along)
+    if (water && !this.bobbing) {
+      this.bobbing = true; v[0] *= 0.3; v[1] *= 0.2; v[2] *= 0.3;
+      Sound.ev('entity.fishing_bobber.splash', this.pos, 0.25, 1 + (Math.random() - 0.5) * 0.4);
+      return;
+    }
+    if (this.bobbing) {
+      const m = id === WATER ? this.world.getMeta(x, y, z) : 0;
+      const h = !water ? 0 : this.world.waterAt(x, y + 1, z) ? 1 : (m === 0 || m >= 8 ? 8 : 8 - m) / 9;
+      let force = this.pos[1] + v[1] - y - h;
+      if (Math.abs(force) < 0.01) force += Math.sign(force) * 0.1;
+      v[0] *= 0.9; v[1] -= force * Math.random() * 0.2; v[2] *= 0.9;
+      if (water) { this.inWaterT++; this.openWater = true; this.fishTick(x, y, z); } else this.inWaterT = 0;
+    }
+    if (!water && !this.onGround) v[1] -= 0.03;
     this.move(v[0], v[1], v[2]);
+    if (!this.bobbing && (this.onGround || this.collidedH)) { v[0] = 0; v[1] = 0; v[2] = 0; }
+    v[0] *= 0.92; v[1] *= 0.92; v[2] *= 0.92;
   }
   fishTick(x, y, z) {
     const g = this.game;
@@ -188,12 +200,34 @@ class FishingHook extends Entity {
     const m = M4.create(); M4.translate(m, ip[0], ip[1] + 0.1, ip[2]); M4.rotY(m, yaw); M4.rotX(m, -pitch); M4.rotX(m, Math.PI / 2); M4.scale(m, 0.25, 1, 0.25);
     const T2 = r.progTex; gl.useProgram(T2.p); gl.uniformMatrix4fv(T2.u.u_vp, false, r.vp); gl.uniformMatrix4fv(T2.u.u_model, false, m);
     const L = Math.max(l[0], l[1] * env.day) * 0.8 + 0.2; gl.uniform4f(T2.u.u_color, L, L, L, 1);
+    // (cut out like vanilla's entity_cutout: drawn unblended, its clear pixels came out black)
+    if (T2.u.u_cut) gl.uniform1f(T2.u.u_cut, 0.1);
     gl.disable(gl.CULL_FACE); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, r.entityTex[tex]); gl.bindVertexArray(r.quadVao); gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, 0); gl.enable(gl.CULL_FACE);
-    // the line: from the rod's tip to the hook, sagging a little
-    const o = this.owner, op = o.ipos ? o.ipos(a) : o.pos, yw = o.yaw, fp = g.perspective === 0 && o === g.player;
-    const sx = op[0] - Math.sin(yw) * (fp ? 0.6 : 0.8) - Math.cos(yw) * (fp ? 0.35 : 0.4), sz = op[2] - Math.cos(yw) * (fp ? 0.6 : 0.8) + Math.sin(yw) * (fp ? 0.35 : 0.4), sy = op[1] + (fp ? o.eye() - 0.25 + Math.sin(o.pitch) * 0.6 : 1.9);
-    const v = [], n = 16;
-    for (let i = 0; i < n; i++) for (const t of [i / n, (i + 1) / n]) v.push(lerp(sx, ip[0], t), lerp(sy, ip[1] + 0.1, t) - Math.sin(t * Math.PI) * 0.15 * (this.inWaterT ? 1 : 0.3), lerp(sz, ip[2], t), 0, 0, 0, 1);
+    if (T2.u.u_cut) gl.uniform1f(T2.u.u_cut, 0);
+    // the line (vanilla FishingHookRenderer): from the hand holding the rod - in first person a point on the view's near
+    // plane (right 0.525, down 0.1, scaled by 960 / fov) swung with the arm, else 0.35 right of and 0.8 ahead of the body,
+    // 0.45 below the eye - to the top of the hook, sagging as y * (a² + a) / 2. It was guessed from the yaw alone, on
+    // the left side
+    const o = this.owner, op = o.ipos ? o.ipos(a) : o.pos, fp = g.perspective === 0 && o === g.player;
+    const side = !o.inv || keyOf3(o.inv.held) === 'fishing_rod' ? 1 : -1; // (a rod cast from the off hand: the left side)
+    const eye = [op[0], op[1] + (o === g.player && g.smoothEye != null ? g.smoothEye : o.eye ? o.eye() : o.sneaking ? 1.27 : 1.62), op[2]];
+    const st = o.swingT > 0 ? clamp((6 - o.swingT + a) / 6, 0, 1) : 0, sw = Math.sin(Math.sqrt(st) * Math.PI);
+    let h;
+    if (fp) {
+      const yw = o.yaw, f = g.lookDir(), R = [Math.cos(yw), 0, -Math.sin(yw)], U = [R[1] * f[2] - R[2] * f[1], R[2] * f[0] - R[0] * f[2], R[0] * f[1] - R[1] * f[0]];
+      const fov = g.settings.fov || 70, k = 960 / fov, hh = Math.tan(fov * Math.PI / 360) * 0.05, ww = hh * r.canvas.width / r.canvas.height;
+      h = [0, 1, 2].map(i => (f[i] * 0.05 + U[i] * hh * -0.1 + R[i] * ww * 0.525 * side) * k);
+      // (Vec3.yRot then xRot, by the swing)
+      const ay = sw * 0.5, ax = -sw * 0.7;
+      h = [h[0] * Math.cos(ay) + h[2] * Math.sin(ay), h[1], h[2] * Math.cos(ay) - h[0] * Math.sin(ay)];
+      h = [h[0], h[1] * Math.cos(ax) + h[2] * Math.sin(ax), h[2] * Math.cos(ax) - h[1] * Math.sin(ax)];
+    } else {
+      const by = o === g.player && g.playerBodyYaw ? g.playerBodyYaw(a) : (o.bodyYaw ?? o.yaw), R = [Math.cos(by), -Math.sin(by)], F = [-Math.sin(by), -Math.cos(by)];
+      h = [R[0] * 0.35 * side + F[0] * 0.8, (o.sneaking && !o.flying ? -0.1875 : 0) - 0.45, R[1] * 0.35 * side + F[1] * 0.8];
+    }
+    const top = [ip[0], ip[1] + 0.35, ip[2]], d = [eye[0] + h[0] - top[0], eye[1] + h[1] - top[1], eye[2] + h[2] - top[2]];
+    const v = [], n = 16, at = (t) => [top[0] + d[0] * t, top[1] + d[1] * (t * t + t) * 0.5, top[2] + d[2] * t];
+    for (let i = 0; i < n; i++) for (const t of [i / n, (i + 1) / n]) v.push(...at(t), 0, 0, 0, 1);
     r.drawLines(v, [0, 0, 0, 1]);
   }
 }
@@ -249,10 +283,11 @@ Game.prototype.updateMap = function (m) {
       let h = 0, col = 0, depth = 0;
       const counts = {};
       for (let ix = 0; ix < s; ix++) for (let iz = 0; iz < s; iz++) {
-        let y = w.surfaceY(wx + ix, wz + iz) + 1, id = 0;
-        do { y--; id = w.getBlock(wx + ix, y, wz + iz); } while (y > -64 && (id === 0 || mapColorOf(id, 0) === 0));
+        // (from the top with water: it isn't solid, the sea showed as its floor; seagrass and kelp are water to it)
+        let y = w.surfaceY(wx + ix, wz + iz, true) + 1, id = 0;
+        do { y--; id = w.getBlock(wx + ix, y, wz + iz); if (WLOG[id]) id = WATER; } while (y > -64 && (id === 0 || mapColorOf(id, 0) === 0));
         let c = mapColorOf(id, w.getMeta(wx + ix, y, wz + iz));
-        if (IS_FLUID[id] && id === WATER) { let yy = y; while (yy > -64 && IS_FLUID[w.getBlock(wx + ix, yy, wz + iz)]) { yy--; depth++; } }
+        if (id === WATER) { let yy = y, b; while (yy > -64 && (IS_FLUID[b = w.getBlock(wx + ix, yy, wz + iz)] || WLOG[b])) { yy--; depth++; } }
         h += y; counts[c] = (counts[c] || 0) + 1;
       }
       h /= s * s; depth /= s * s;
@@ -389,11 +424,28 @@ class CartographyScreen extends StationScreen {
     else if (k === 'paper' && m && m.scale < 4 && !m.locked) { this.result = { ...a, count: 1, zoom: true }; this.mode = 'zoom'; }
     else if (k === 'glass_pane' && m && !m.locked) { this.result = { ...a, count: 1, lock: true }; this.mode = 'lock'; }
   }
-  take() {
+  // zooming out or locking makes a new map, as the result is taken and before it is handed over: made in take(), it
+  // came after the old map had gone to the cursor - the new one thrown away, the paper used for nothing
+  takeOutput(ui, s, shift) {
+    if (!s.output || (this.mode !== 'zoom' && this.mode !== 'lock')) return super.takeOutput(ui, s, shift);
+    const inv = this.game.player.inv;
+    while (this.result && (this.mode === 'zoom' || this.mode === 'lock')) {
+      if (shift ? !inv.slots.slice(0, 36).some(t => !t) : ui.cursor) break;
+      const st = this.make();
+      if (shift) inv.add(st); else ui.cursor = st;
+      this.take(); this.changed();
+      if (!shift) break;
+    }
+  }
+  make() {
     const g = this.game, a = this.S(0), src = g.mapData(a.mapId);
-    if (this.mode === 'zoom') { const id = g.newMap(null, src.scale + 1, null); const nm = g.mapData(id); const s = 128 << nm.scale; nm.cx = Math.floor((src.cx + 64) / s) * s + s / 2 - 64; nm.cz = Math.floor((src.cz + 64) / s) * s + s / 2 - 64; this.result = { ...makeStack('filled_map', 1), mapId: id }; }
-    if (this.mode === 'lock') { const id = g.newMap(null, src.scale, src); const nm = g.mapData(id); nm.px.set(src.px); nm.locked = true; this.result = { ...makeStack('filled_map', 1), mapId: id }; }
-    if (this.mode === 'copy') this.result = { ...a, count: 2 };
+    const id = g.newMap(null, this.mode === 'zoom' ? src.scale + 1 : src.scale, this.mode === 'zoom' ? null : src), nm = g.mapData(id);
+    nm.dim = src.dim;
+    if (this.mode === 'zoom') { const s = 128 << nm.scale; nm.cx = Math.floor((src.cx + 64) / s) * s + s / 2 - 64; nm.cz = Math.floor((src.cz + 64) / s) * s + s / 2 - 64; }
+    else { nm.px.set(src.px); nm.locked = true; }
+    return { ...a, count: 1, mapId: id };
+  }
+  take() {
     for (const i of [0, 1]) { const s = this.held[i]; if (s) { s.count--; if (!s.count) this.held[i] = null; } }
     Sound.ev('ui.cartography_table.take_result', null, 1, 1);
   }
@@ -644,6 +696,9 @@ Game.prototype.tickTrialSpawners = function () {
     const x0 = Math.floor(p.pos[0]), y0 = Math.floor(p.pos[1]), z0 = Math.floor(p.pos[2]);
     this._ts = [];
     if (BID.trial_spawner !== undefined) for (let dx = -14; dx <= 14; dx++) for (let dy = -6; dy <= 6; dy++) for (let dz = -14; dz <= 14; dz++) if (w.getBlock(x0 + dx, y0 + dy, z0 + dz) === BID.trial_spawner) this._ts.push([x0 + dx, y0 + dy, z0 + dz]);
+    // (when each one came into range: its saved mobs still waiting for their chunk count only for a while after that)
+    const seen = this._tsSeen || new Map();
+    this._tsSeen = new Map(this._ts.map(([x, y, z]) => { const k = this.dim + ':' + x + ',' + y + ',' + z; return [k, seen.get(k) ?? this.tickCount]; }));
   }
   for (const [x, y, z] of this._ts || []) {
     const be = this.getBlockEntity(x, y, z, 'trial_spawner'); be.pos = [x, y, z];
@@ -653,20 +708,34 @@ Game.prototype.tickTrialSpawners = function () {
     if (be.cooldown && tc < be.cooldown) continue;
     if (be.cooldown) { be.cooldown = 0; bsetProp(w, x, y, z, 'trial_spawner_state', 'waiting_for_players'); }
     const near = Math.hypot(p.pos[0] - x - 0.5, p.pos[1] - y, p.pos[2] - z - 0.5) < 14 && !p.creative;
-    if (!be.active) { if (!near) continue; be.active = true; be.spawned = 0; be.mobs = []; be.total = (C.total_mobs || 6) + (C.total_mobs_added_per_player || 2) * 0; bsetProp(w, x, y, z, 'trial_spawner_state', 'active'); Sound.ev('block.trial_spawner.detect_player', [x, y, z], 1, 1); }
-    be.mobs = be.mobs.filter(m => !m.dead && m.deathTime === 0);
+    // the mobs it waits on are kept out of the block entity: live mobs in it made every save fail (DataCloneError).
+    // Like vanilla's shouldMobBeUntracked, one gone from the world or over 47 blocks away no longer counts
+    const tsm = this._tsMobs || (this._tsMobs = new Map()), mk = this.dim + ':' + x + ',' + y + ',' + z;
+    if ('mobs' in be) delete be.mobs;
+    if (!be.active) { if (!near) continue; tsm.delete(mk + '#' + (be.trial || 0)); be.trial = (be.trial || 0) + 1; be.active = true; be.spawned = 0; be.total = (C.total_mobs || 6) + (C.total_mobs_added_per_player || 2) * 0; bsetProp(w, x, y, z, 'trial_spawner_state', 'active'); Sound.ev('block.trial_spawner.detect_player', [x, y, z], 1, 1); }
+    const d47 = (q) => (q[0] - x - 0.5) ** 2 + (q[1] - y) ** 2 + (q[2] - z - 0.5) ** 2 <= 47 * 47;
+    // (the key names this trial, so a mob left over from an earlier one never counts again)
+    const tk = mk + '#' + (be.trial || 0), was = tsm.get(tk) || [];
+    const mobs = was.filter(m => !m.dead && m.deathTime === 0 && this.entities.includes(m) && d47(m.pos));
+    for (const m of was) if (!mobs.includes(m)) delete m.tsKey; // untracked for good, as in vanilla
+    tsm.set(tk, mobs);
+    // (each one carries the trial's key and is saved with it, like vanilla's saved UUIDs: restoreMob tracks it again
+    // after a reload, and one still waiting for its chunk to load counts too - no early rewards, no extra spawns.
+    // That lasts 10 s after the spawner comes into range; then, like vanilla's unloaded mob, it is untracked for good)
+    const grace = tc - ((this._tsSeen && this._tsSeen.get(mk)) ?? tc) < 200;
+    const pend = (this.pendingMobs || []).reduce((n, r) => { if (r.ts !== tk) return n; if (grace && d47(r.pos)) return n + 1; delete r.ts; return n; }, 0);
     if (be.spawned < be.total) {
-      if (be.mobs.length < (C.simultaneous_mobs || 2) && tc - (be.lastSpawn || 0) >= (C.ticks_between_spawn || 40)) {
+      if (mobs.length < (C.simultaneous_mobs || 2) && tc - (be.lastSpawn || 0) >= (C.ticks_between_spawn || 40) && mobs.length + pend < (C.simultaneous_mobs || 2)) {
         const pot = C.spawn_potentials || [{ data: { entity: { id: 'minecraft:zombie' } }, weight: 1 }];
         const type = pickW(pot.map(q => [q.data.entity.id.replace('minecraft:', ''), q.weight || 1]));
         const sx = x + 0.5 + randInt(-4, 4), sz = z + 0.5 + randInt(-4, 4);
         if (MOB_TYPES[type] || type === 'zombie') {
-          const m = createMob(this, type, sx, y, sz); m.persistent = true; m.target = p;
+          const m = createMob(this, type, sx, y, sz); m.persistent = true; m.target = p; m.tsKey = tk;
           if (be.config.includes('baby_zombie') && m.makeBaby) m.makeBaby();
-          if (!m.collides(m.box())) { this.entities.push(m); be.mobs.push(m); be.spawned++; be.lastSpawn = tc; Sound.ev('block.trial_spawner.spawn_mob', [x, y, z], 1, 1); for (let i = 0; i < 10; i++) this.particles.spawn('flame', sx + (Math.random() - 0.5), y + Math.random() * 2, sz + (Math.random() - 0.5), 0, 0.02, 0); }
+          if (!m.collides(m.box())) { this.entities.push(m); mobs.push(m); be.spawned++; be.lastSpawn = tc; Sound.ev('block.trial_spawner.spawn_mob', [x, y, z], 1, 1); for (let i = 0; i < 10; i++) this.particles.spawn('flame', sx + (Math.random() - 0.5), y + Math.random() * 2, sz + (Math.random() - 0.5), 0, 0.02, 0); }
         }
       }
-    } else if (!be.mobs.length) {
+    } else if (!mobs.length && !pend) {
       // the trial is over: the rewards pop out, then a long cooldown
       const tables = C.loot_tables_to_eject || [{ data: 'minecraft:spawners/' + (ominous ? 'ominous/' : '') + 'trial_chamber/consumables', weight: 1 }, { data: 'minecraft:spawners/' + (ominous ? 'ominous/' : '') + 'trial_chamber/key', weight: 1 }];
       const tb = pickW(tables.map(q => [String(q.data).replace('minecraft:', ''), q.weight || 1]));

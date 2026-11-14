@@ -114,15 +114,21 @@ function showAnnounce(g, a) {
   g.ui.actionBar = { text: '公告：' + a.text, t: performance.now(), color: '#FFAA00' };
   Sound.ev && Sound.ev('block.note_block.bell', null, 0.6, 1.2);
 }
+// (how often: the admin panel's client.announceMin - js/live.js; the answer also says which live settings are out, so
+// a change made there reaches a player in single player at this pace too)
 (() => {
   const opened = Date.now();
-  setInterval(async () => {
+  const every = () => Math.max(1, Math.min(60, (typeof Live !== 'undefined' && +Live.get('client.announceMin', 5)) || 5)) * 60e3;
+  const tick = async () => {
+    setTimeout(tick, every());
     const g = typeof game !== 'undefined' && game;
     if (!g || g.state !== 'play' || g.net || document.hidden || typeof RoomService === 'undefined' || !RoomService.base()) return;
     let seen = 0; try { seen = +localStorage.getItem('mcjs-announce') || 0; } catch (e) { }
     try {
       const r = await RoomService.api('/api/announce?after=' + Math.max(seen, opened - 10 * 60e3));
       for (const a of r.list || []) showAnnounce(g, a);
+      if (r.live !== undefined && typeof Live !== 'undefined' && r.live !== Live.v) Live.fetch(r.live);
     } catch (e) { }
-  }, 5 * 60e3);
+  };
+  setTimeout(tick, every());
 })();

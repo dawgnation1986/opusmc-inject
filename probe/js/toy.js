@@ -15,8 +15,11 @@ class ToyError extends Error {
 }
 const Toy = (() => {
   const NS = 'toy-sdk-rpc';
-  // the UP (Toy author) and the video whose 三连 counts; the room service's gate config can replace the video
+  // the UP (Toy author), and the video whose 三连 counts - kept here in the game, not in the room service's gate config
+  // (the video: the room service's now - /api/gate, Account.loadGate - the user, 11-13: the update's new video for every
+  // 三连 and the old ones dropped, changed there without a new version of the game; none here)
   const AUTHOR_MID = 1987439458;
+  const VIDEOS = [];
   let inIframe = false;
   try { inIframe = window.parent && window.parent !== window; } catch (e) { inIframe = true; }
   let nextId = 1, hello = null, meta = null;
@@ -160,8 +163,11 @@ const Toy = (() => {
   }
 
   const api = {
-    ToyError, AUTHOR_MID, last,
+    ToyError, AUTHOR_MID, VIDEOS, last,
     get mock() { return mock; },
+    // a phone's own browser, not the Bilibili app: the host page answers there, but asking it about the user (profile,
+    // following, 三连) puts up its "open it in the Bilibili app" window - on every visit, as the unlocks are checked then
+    phoneWeb: !mock && /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) && !/BiliApp|BiliHarmony|bili-/i.test(navigator.userAgent),
     ready,
     async inToy() { return ready(); },
     // {nickname, avatar, toyOpenId}
@@ -216,9 +222,23 @@ const Toy = (() => {
     // the web page in a separate window there; if the page isn't left within a moment (the app didn't take it), the
     // web page after all
     async openNative(url, type, id) {
+      // (the game page may not come back: one in five iPhone pages and one in thirteen Android ones that went to the
+      // video's page today were opened afresh after - killed behind it, or a second page from the video's game entry,
+      // telemetry 11-07. The world saved first, and a mark that the next page checks the unlocks at once, aloud:
+      // account.js. Back on this page the mark goes - the screen here checks)
+      try { localStorage.setItem('mcjs-nav', JSON.stringify({ t: Date.now(), type })); } catch (e) { }
+      if (!this._navBack) { this._navBack = true; document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(() => { try { localStorage.removeItem('mcjs-nav'); } catch (e) { } }, 1500); }); }
+      try {
+        const g = typeof game !== 'undefined' ? game : null;
+        if (g && g.state === 'play' && !g.net && g.saveWorld) await Promise.race([g.saveWorld(true), new Promise((r) => setTimeout(r, 2000))]);
+      } catch (e) { }
+      if (typeof Crumbs !== 'undefined') Crumbs.mark('nav:' + type);
       if (/BiliApp|BiliHarmony/i.test(navigator.userAgent)) {
-        // (the app's navigate: the SDK's own form first, then a bilibili:// address; each given a moment to take the
-        // page away - hidden, or the window losing focus)
+        // (the app's navigate, each form given a moment to take the page away - hidden, or the window losing focus):
+        // first the official SDK's (toy-sdk.js 3.3: a number for the type - video 1, space 2 - and extra; the id a BV
+        // number or a mid. Our string type and the bilibili:// address were not taken: the app opened the web page in a
+        // browser window instead, players 11-06, TOY_SDK.md), then those two as before
+        const NAV = { video: 1, space: 2, search: 3, opus: 4, tribee: 5, toy: 6 };
         const left = () => new Promise((res) => {
           if (document.hidden) return res(true);
           let done = false; const end = (v) => { if (done) return; done = true; document.removeEventListener('visibilitychange', vis); window.removeEventListener('blur', end1); res(v); };
@@ -226,8 +246,9 @@ const Toy = (() => {
           document.addEventListener('visibilitychange', vis); window.addEventListener('blur', end1);
           setTimeout(() => end(document.hidden), 1500);
         });
-        for (const p of [{ type, id: String(id) }, { url }]) {
-          try { await jsb('toy.navigate', p); if (await left()) { if (typeof Telemetry !== 'undefined' && Telemetry.event) Telemetry.event('nav_native', { form: p.url ? 'url' : 'type' }); return; } } catch (e) { }
+        const forms = [{ type: NAV[type], id: String(id), extra: {} }, { type, id: String(id) }, { url }].filter((p) => p.type !== undefined || p.url);
+        for (const p of forms) {
+          try { await jsb('toy.navigate', p); if (await left()) { if (typeof Telemetry !== 'undefined' && Telemetry.event) Telemetry.event('nav_native', { form: p.url ? 'url' : typeof p.type === 'number' ? 'sdk' : 'type' }); return; } } catch (e) { }
         }
         if (typeof Telemetry !== 'undefined' && Telemetry.event) { Telemetry.event('nav_web', { type }); if (Telemetry.flush) Telemetry.flush(false); }
       }
@@ -235,6 +256,13 @@ const Toy = (() => {
     },
     openVideo(bv) { const av = /^BV/i.test(bv) ? bvToAv(bv) : Number(bv); return av ? this.openNative('bilibili://video/' + av, 'video', bv) : this.navigate('video', bv); },
     openAuthor() { return this.openNative('bilibili://space/' + AUTHOR_MID, 'space', AUTHOR_MID); },
+    // what to do there and how to come back (in the app: its back button, not the game's entry on the video's page -
+    // that opens a second game page, 11-07)
+    backHint(kind) {
+      const app = /BiliApp|BiliHarmony/i.test(navigator.userAgent);
+      if (kind === 'triple') return app ? '三连后按返回键回来（别点视频里的游戏入口）' : '完成三连后回到这里，会自动检查';
+      return app ? '关注后按返回键回来，会自动检查' : '关注后回到这里，会自动检查';
+    },
     share(path) { return call('share', { req: { path: path || '/' } }); },
     qrCode(path, size) { return call('qrCode', { req: { path: path || '/', size: size || 240 } }); },
     sharePicture(params) { return jsb('toy.sharePicture', params); },

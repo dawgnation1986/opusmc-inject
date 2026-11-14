@@ -21,7 +21,18 @@ const Stage = {
     el.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;overflow:hidden';
     document.body.insertBefore(el, document.body.firstChild);
     for (const id of ['gl', 'ui', 'textinput']) { const c = document.getElementById(id); if (c) el.appendChild(c); }
-    addEventListener('resize', () => this.update());
+    // (once a frame however many come: an on-screen keyboard sliding up sends a resize for each step of it, and each
+    // was a new size for both canvases and a layout - 11-07, iPhones in the Bilibili app: "一打开输入法就闪白")
+    // (the next frame, or 120 ms on if frames don't come - a web view drawing nothing for the moment)
+    addEventListener('resize', () => {
+      if (this.pend) return; this.pend = true;
+      const run = () => { if (!this.pend) return; this.pend = false; this.update(); };
+      requestAnimationFrame(run); setTimeout(run, 120);
+    });
+    // (the 3D canvas keeps its size while a field is typed in on an Apple device - Renderer.resize below: the size it
+    // missed, once the keyboard is gone)
+    const inp = document.getElementById('textinput');
+    if (inp) inp.addEventListener('blur', () => setTimeout(() => this.update(), 50));
     addEventListener('orientationchange', () => setTimeout(() => this.update(), 200));
     this.update();
   },
@@ -66,15 +77,30 @@ Renderer.prototype.resize = function () {
   let w = Math.floor(Stage.w() * dpr * this.resScale), h = Math.floor(Stage.h() * dpr * this.resScale);
   if (this.forceSize) [w, h] = this.forceSize; // panorama capture
   w = Math.max(1, w); h = Math.max(1, h);
+  // typing on an Apple device's on-screen keyboard (the field focused): the 3D picture keeps its size, stretched for
+  // the moment - a new size is a new drawing buffer (and the shader pack's), and the keyboard coming and going asked
+  // for several; on iPhones in the Bilibili app the page died at it (feedback 11-07: "一打开输入法就崩了…几乎必现").
+  // Stage's blur listener sizes it after
+  if (typeof WEBKIT_GL !== 'undefined' && WEBKIT_GL && this.canvas.width > 1 && !this.forceSize && navigator.maxTouchPoints > 0) {
+    const inp = document.getElementById('textinput');
+    if (inp && document.activeElement === inp) return;
+  }
   if (this.canvas.width !== w || this.canvas.height !== h) { this.canvas.width = w; this.canvas.height = h; }
 };
 UI.prototype.resize = function () {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  this.canvas.width = Math.floor(Stage.w() * dpr); this.canvas.height = Math.floor(Stage.h() * dpr);
+  // (only a new size is set: setting the same one still made the canvas over - a resize event that changed nothing)
+  const cw = Math.floor(Stage.w() * dpr), ch = Math.floor(Stage.h() * dpr);
+  if (this.canvas.width !== cw) this.canvas.width = cw;
+  if (this.canvas.height !== ch) this.canvas.height = ch;
   const auto = Math.max(1, Math.min(Math.floor(this.canvas.width / 320), Math.floor(this.canvas.height / 240)));
   const pref = this.game.settings.guiScale;
   this.scale = pref ? Math.min(pref * dpr, auto) : Math.min(auto, Math.round(3 * dpr));
   this.scale = Math.max(1, Math.floor(this.scale));
+  // (needW: a screen wider than vanilla's 320 - a mod's station with panels on both sides - gets a smaller scale while
+  // it is open; ui.open / close size again around it)
+  const need = this.screen && this.screen.needW;
+  if (need) while (this.scale > 1 && this.canvas.width / this.scale < need) this.scale--;
   this.w = Math.ceil(this.canvas.width / this.scale); this.h = Math.ceil(this.canvas.height / this.scale);
   this.dpr = dpr;
   if (this.screen && this.screen.layout) this.screen.layout();
@@ -85,7 +111,8 @@ UI.prototype.toGui = function (ev) { const [x, y] = ev.stage ? [ev.clientX, ev.c
 (() => {
   const P = TouchControls.prototype;
   P.gui = function (cx, cy) { const k = this.ui.dpr / this.ui.scale; return [cx * k, cy * k]; };
-  const turn = (e) => ({ target: e.target, preventDefault: () => e.preventDefault(), changedTouches: [...e.changedTouches].map((t) => { const [x, y] = Stage.toStage(t.clientX, t.clientY); return { identifier: t.identifier, clientX: x, clientY: y }; }) });
+  // (touches: the ids of all the fingers down - touch.js prune)
+  const turn = (e) => ({ target: e.target, preventDefault: () => e.preventDefault(), touches: e.touches ? [...e.touches].map((t) => ({ identifier: t.identifier })) : null, changedTouches: [...e.changedTouches].map((t) => { const [x, y] = Stage.toStage(t.clientX, t.clientY); return { identifier: t.identifier, clientX: x, clientY: y }; }) });
   for (const k of ['onStart', 'onMove']) { const f = P[k]; P[k] = function (e) { return f.call(this, turn(e)); }; }
   const oe = P.onEnd; P.onEnd = function (e, cancel) { return oe.call(this, turn(e), cancel); };
   const sy = P.synth;
@@ -120,6 +147,14 @@ Object.assign(TOUCH_ICONS, {
   use: ['..#.#.#..', '..#.#.#..', '..#.#.#.#', '..#######', '.########', '.########', '..#######', '...#####.', '....###..'],
   emote: ['..#####..', '.#.....#.', '#..#.#..#', '#.......#', '#.#...#.#', '#..###..#', '.#.....#.', '..#####..', '.........'],
 });
+// the D-pad's buttons: [row, column] in its 3 x 3
+const DPAD_RC = { ul: [0, 0], up: [0, 1], ur: [0, 2], left: [1, 0], sneak: [1, 1], right: [1, 2], down: [2, 1] };
+// the fly-down button follows jump unless given a place or a size of its own (an offset saved before the editor marked
+// it as the player's own - touchDescOwn - is the copy of jump's older versions made, stale once jump moved)
+const touchDescFollows = (st) => {
+  const d = (st.touchLayout || {}).descend, k = (st.touchScale || {}).descend;
+  return !(k && k !== 1) && (!d || !st.touchDescOwn);
+};
 (() => {
   const P = TouchControls.prototype;
   const stickOn = (g) => g.settings.touchStick !== false;
@@ -128,6 +163,11 @@ Object.assign(TOUCH_ICONS, {
   // (fixed by default; 动态摇杆 - the centre where the thumb lands - is the setting: the user, 11-03)
   const stickFixed = (g) => g.settings.touchStickDyn !== true, pushSprint = (g) => g.settings.touchPushSprint !== false;
   const classic = (g) => g.settings.touchClassic === true;
+  // inside Bilibili the container's capsule (分享 / ✕) floats over the top right corner whatever the safe area says: it
+  // covered 聊天 and 暂停 (a new player's screenshot, 11-13), and buttons moved under it in 触控设置 could not be dragged
+  // back - the touches went to the capsule. Its box in interface pixels: CSS 100 x 48 (the capsule ~87 x 32 with its
+  // margins); none outside Bilibili or while the page is turned by CSS (the turned stage is all safe - UI.safe)
+  const toyCapsule = (ui) => { if (!Stage.inToy || Stage.rot) return null; const k = ui.dpr / ui.scale; return { w: Math.ceil(100 * k), h: Math.ceil(48 * k) }; };
   const lay = P.layout;
   P.layout = function () {
     const L = lay.call(this), g = this.g, { W, H } = this.metrics(), { B, gp } = L, m = Math.max(3, Math.round(B * 0.3)), st = g.settings;
@@ -138,7 +178,7 @@ Object.assign(TOUCH_ICONS, {
       L.stickR = Math.round(B * 1.25);
       L.stickHome = { x: m + L.stickR, y: H - m - L.stickR };
       L.stickZone = { x: 0, y: Math.round(H * 0.28), w: Math.round(W * 0.42), h: H - Math.round(H * 0.28) };
-      if (!g.player.flying) L.sneak = { x: Math.min(m + 2 * L.stickR + gp * 2, Math.floor(W / 2 - 91 - B - 4)), y: H - m - B, w: B, h: B };
+      if (!g.player.flying || this.editAll) L.sneak = { x: Math.min(m + 2 * L.stickR + gp * 2, Math.floor(W / 2 - 91 - B - 4)), y: H - m - B, w: B, h: B };
     }
     const top = L.pause.y, ts = L.pause.w;
     L.emote = { x: L.view.x - ts - gp, y: top, w: ts, h: ts };
@@ -156,11 +196,13 @@ Object.assign(TOUCH_ICONS, {
     if (L.stickHome) { L.stickHome.x += sf.l; L.stickHome.y -= sf.b; L.stickZone.x += sf.l; }
     if (L.sneak) { L.sneak.x += sf.l; L.sneak.y -= sf.b; }
     if (L.hotbar) { L.hotbar.y -= sf.b; L.inv.y -= sf.b; }
+    // (the top row starts left of the capsule)
+    const cap = toyCapsule(this.ui);
+    if (cap && sf.t < cap.h) { const dx = Math.max(0, cap.w - sf.r - 4); for (const id of ['pause', 'chat', 'view', 'emote', 'f3']) if (L[id] && L[id].y < cap.h) L[id].x = Math.max(0, L[id].x - dx); }
     // the player's own arrangement (the layout editor): offsets per control
     const off = st.touchLayout || {};
     const dp0 = L.dpad && L.x0 > -1e3 ? { x: L.dpad.x, y: L.dpad.y } : null;
-    // (the fly-down button sits under jump: a jump moved alone left it behind, the two overlapped - feedback 11-01)
-    if (off.jump && !off.descend && L.descend) off.descend = off.jump;
+    if (L.descend) L.descBase = { ...L.descend }; // (where it is before the player's offset: the editor's starting point)
     for (const id in off) { const r = L[id], o = off[id]; if (r && o && r.x !== undefined) { r.x = clamp(r.x + o[0], 0, W - r.w); r.y = clamp(r.y + o[1], 0, H - r.h); } }
     if (dp0 && (L.dpad.x !== dp0.x || L.dpad.y !== dp0.y)) { // (the D-pad moved: its cells and corner with it)
       const dx = L.dpad.x - dp0.x, dy = L.dpad.y - dp0.y; L.x0 += dx; L.y0 += dy;
@@ -177,14 +219,39 @@ Object.assign(TOUCH_ICONS, {
       r.w = Math.min(W, Math.round(r.w * k)); r.h = Math.min(H, Math.round(r.h * k));
       r.x = clamp(Math.round(cx - r.w / 2), 0, W - r.w); r.y = clamp(Math.round(cy - r.h / 2), 0, H - r.h);
     }
+    // the D-pad resized: its buttons and where they answer with it (only the frame grew - the buttons stayed as they were)
+    if (L.dpad && L.x0 > -1e3 && (+sc.dpad || 1) !== 1) {
+      const d = L.dpad, b = Math.min(d.w, d.h) / 3, q = Math.max(1, Math.round(gp * b / B));
+      L.x0 = d.x; L.y0 = d.y; L.dB = b;
+      for (const k in L.cells) { const [r, c] = DPAD_RC[k]; L.cells[k] = { x: d.x + c * b + q, y: d.y + r * b + q, w: b - 2 * q, h: b - 2 * q }; }
+    }
+    // the fly-down button sits under jump and goes with it, moved or resized, unless the player placed or sized it: a jump
+    // moved alone left it behind (feedback 11-01), an enlarged one covered it (11-08). No room under: beside it, where
+    // no other button is if it can
+    if (L.descend && touchDescFollows(st)) {
+      const j = L.jump, d = L.descend, w = d.w, h = d.h, cx = Math.round(j.x + (j.w - w) / 2);
+      const others = ['jump', 'sprint', 'attack', 'use', 'interact', 'sneak', 'hotbar', 'inv'].map((k) => L[k]).filter(Boolean);
+      const hit = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+      const fits = (r, all) => r.x >= 0 && r.y >= 0 && r.x + w <= W && r.y + h <= H - sf.b && !(all ? others : [j]).some((o) => hit(o, { ...r, w, h }));
+      const spots = [{ x: cx, y: j.y + j.h + gp }, { x: j.x - gp - w, y: j.y + j.h - h }, { x: j.x - gp - w, y: j.y }, { x: j.x + j.w + gp, y: j.y + j.h - h }];
+      const side = spots.slice(1), at = (fits(spots[0], false) && spots[0]) || side.find((r) => fits(r, true)) || side.find((r) => fits(r, false));
+      if (at) { d.x = at.x; d.y = at.y; } else { d.x = clamp(cx, 0, W - w); d.y = clamp(j.y + j.h + gp, 0, H - h); }
+    }
     // a joystick moved or resized: where a thumb starts it goes with it (it stayed the bottom left - the stick drawn
     // somewhere else answered nothing, the player could not walk: players' feedback 2026-11-01)
     if (L.stickHome && ((off.stick && (off.stick[0] || off.stick[1])) || (sc.stick && sc.stick !== 1))) {
       const R2 = L.stickR * 2, x0 = Math.max(0, L.stickHome.x - R2), y0 = Math.max(0, L.stickHome.y - R2);
       L.stickZone = { x: x0, y: y0, w: Math.min(W, L.stickHome.x + R2) - x0, h: Math.min(H, L.stickHome.y + R2) - y0 };
     }
+    // (a button the player moved or sized under the capsule: down below it, where a finger reaches it again)
+    if (cap) for (const id of ['pause', 'chat', 'view', 'emote', 'f3', 'jump', 'descend', 'sprint', 'attack', 'use', 'interact', 'sneak', 'inv']) {
+      const r = L[id]; if (r && r.x + r.w > W - cap.w && r.y < cap.h) r.y = Math.max(0, Math.min(H - r.h, cap.h + 2));
+    }
     return L;
   };
+  // (what the HUD puts at the top - status effects, the ping bars - below the capsule too)
+  const ti = P.topInset;
+  P.topInset = function () { const t = ti.call(this), cap = t ? toyCapsule(this.ui) : null; return cap ? Math.max(t, cap.h + 2) : t; };
   // a screen's close button: kept clear of the safe area; inside Bilibili top left, as the container's capsule
   // (… and ✕) floats over the top right corner whatever the safe area says
   const cr = P.closeRect;
@@ -376,15 +443,28 @@ class QuickChatScreen extends MenuScreen {
 class TouchLayoutScreen extends MenuScreen {
   constructor(game, parent, done) {
     super(game, null); this.parent = parent; this.done = done || null; this.blurBg = false; this.bgDim = 0.35; this.pauses = false; this.drag = null; this.touchDrag = true; this.sel = null;
-    const s = game.settings; this.was = { layout: JSON.stringify(s.touchLayout || {}), scale: JSON.stringify(s.touchScale || {}) };
+    const s = game.settings; this.was = { layout: JSON.stringify(s.touchLayout || {}), scale: JSON.stringify(s.touchScale || {}), descOwn: s.touchDescOwn };
   }
   scaleOf(id) { return (this.game.settings.touchScale || {})[id] || 1; }
-  setScale(id, k) { const s = this.game.settings; s.touchScale = Object.assign({}, s.touchScale || {}, { [id]: Math.round(clamp(k, 0.5, 4) * 100) / 100 }); }
+  setScale(id, k) {
+    const s = this.game.settings;
+    if (id === 'descend') { if (touchDescFollows(s)) s.touchLayout = Object.assign({}, s.touchLayout || {}, { descend: this.descOffset() }); s.touchDescOwn = true; } // (stays where it is)
+    s.touchScale = Object.assign({}, s.touchScale || {}, { [id]: Math.round(clamp(k, 0.5, 4) * 100) / 100 });
+  }
+  // the fly-down button's place now as an offset of its own (while it follows jump its offset says nothing)
+  descOffset() {
+    const L = this.game.ui.touch.L, r = L && L.descend, b = L && L.descBase;
+    return r && b ? [Math.round(r.x + r.w / 2 - b.x - b.w / 2), Math.round(r.y + r.h / 2 - b.y - b.h / 2)] : [0, 0];
+  }
   save() { this.game.saveSettings(); if (this.done) { const d = this.done; this.done = null; d(); } else this.game.ui.open(this.parent); }
-  discard() { const s = this.game.settings; s.touchLayout = JSON.parse(this.was.layout); s.touchScale = JSON.parse(this.was.scale); this.game.saveSettings(); this.game.ui.open(this.parent); }
+  discard() { const s = this.game.settings; s.touchLayout = JSON.parse(this.was.layout); s.touchScale = JSON.parse(this.was.scale); s.touchDescOwn = this.was.descOwn; this.game.saveSettings(); this.game.ui.open(this.parent); }
   ids() { return ['stick', 'dpad', 'sneak', 'jump', 'descend', 'sprint', 'attack', 'use', 'interact', 'inv', 'pause', 'chat', 'emote', 'f3', 'view']; }
   rects() {
-    const tc = this.game.ui.touch, L = tc.layout(), out = {};
+    // (editAll: fly-down, interact and the stick's sneak too, which the game only shows now and then - touch.js layout)
+    const tc = this.game.ui.touch, out = {};
+    let L;
+    tc.editAll = true;
+    try { L = tc.layout(); } finally { tc.editAll = false; }
     for (const id of this.ids()) {
       if (id === 'stick') { if (L.stickHome) out.stick = { x: L.stickHome.x - L.stickR, y: L.stickHome.y - L.stickR, w: 2 * L.stickR, h: 2 * L.stickR }; }
       else if (L[id]) out[id] = L[id];
@@ -411,12 +491,14 @@ class TouchLayoutScreen extends MenuScreen {
   mouseDown(ui, mx, my, b) {
     for (const w of this.widgets) if (ui.hit(w, mx, my)) return super.mouseDown(ui, mx, my, b);
     const R = this.rects();
-    for (const id in R) { const r = R[id]; if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h) { const o = (this.game.settings.touchLayout || {})[id] || [0, 0]; this.drag = { id, mx, my, o: [...o] }; if (this.sel !== id) { this.sel = id; this.layout(); } return; } }
+    for (const id in R) { const r = R[id]; if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h) { const s = this.game.settings, o = id === 'descend' && touchDescFollows(s) ? this.descOffset() : (s.touchLayout || {})[id] || [0, 0]; this.drag = { id, mx, my, o: [...o] }; if (this.sel !== id) { this.sel = id; this.layout(); } return; } }
   }
   mouseMove(ui, mx, my) {
     if (!this.drag || !ui.mouse.down) return;
-    const s = this.game.settings, d = this.drag;
+    const s = this.game.settings, d = this.drag, follows = d.id === 'jump' && touchDescFollows(s);
     s.touchLayout = Object.assign({}, s.touchLayout || {}, { [d.id]: [Math.round(d.o[0] + mx - d.mx), Math.round(d.o[1] + my - d.my)] });
+    if (follows) delete s.touchLayout.descend; // (an old copy of jump's offset: fly-down keeps following it)
+    if (d.id === 'descend') s.touchDescOwn = true;
   }
   mouseUp() { if (this.drag) this.drag = null; }
   drawExtra(ui) {

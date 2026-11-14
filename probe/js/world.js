@@ -10,17 +10,23 @@ const TORCHLIKE = new Uint8Array(MAX_BLOCKS); // the torches, standing and on wa
 // the four ways a fluid spreads, in vanilla's order (north, east, south, west: k ^ 2 is the way back)
 const FLUID_HDIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]];
 const FLUID_HDIR_D = [4, 1, 5, 0]; // the same as DIRS indices
+// a mod's fluids (mods.js): 1 flows like water, 2 like lava (molten metal); they meet neither water nor lava
+const FLUID_MOD = new Uint8Array(MAX_BLOCKS);
 for (let i = 0; i < MAX_BLOCKS; i++) {
   const b = BLOCKS[i]; if (!b) { OPACITY[i] = 15; continue; }
   OPACITY[i] = b.opacity; EMIT[i] = b.light; SOLIDCUBE[i] = b.opaque ? 1 : 0;
   AOCUBE[i] = b.opaque || (b.shape === SH_CUBE && b.solid && b.render !== 'translucent') ? 1 : 0;
   IS_FLUID[i] = b.shape === SH_LIQUID ? 1 : 0; REPLACEABLE[i] = b.replaceable ? 1 : 0; WLOG[i] = b.waterlogged ? 1 : 0;
+  FLUID_MOD[i] = b.fluidKind === 'water' ? 1 : b.fluidKind === 'lava' ? 2 : 0;
   TORCHLIKE[i] = /(^|_)torch$/.test(b.key || '') && !b.solid ? 1 : 0;
 }
 // blocks whose light depends on their state (lit campfires, candles, lamps, copper bulbs)
 const STATE_EMIT = new Array(MAX_BLOCKS).fill(null);
 for (let i = 0; i < MAX_BLOCKS; i++) if (BLOCKS[i] && BLOCKS[i].stateLight) STATE_EMIT[i] = BLOCKS[i].stateLight;
-const emitOf = (id, meta) => { const s = STATE_EMIT[id]; return s ? (s[meta] | 0) : EMIT[id]; };
+// blocks that give light only while waterlogged (sea pickles: SeaPickleBlock.isDead); wet = the cell's chunk.wl flag
+const WET_EMIT = new Uint8Array(MAX_BLOCKS);
+for (let i = 0; i < MAX_BLOCKS; i++) if (BLOCKS[i] && BLOCKS[i].wetLight) WET_EMIT[i] = 1;
+const emitOf = (id, meta, wet) => { if (WET_EMIT[id] && !wet) return 0; const s = STATE_EMIT[id]; return s ? (s[meta] | 0) : EMIT[id]; };
 const AIR = 0, WATER = 7, LAVA = 8;
 
 function ckey(cx, cz) { return (cx + 32768) * 65536 + (cz + 32768); }
@@ -263,7 +269,7 @@ function lightChunk(ch, hasSky) {
     for (let i = s << 12, e0 = i + 4096; i < e0; i++) {
       const id = B[i];
       if (!EMIT[id]) continue;
-      const e = emitOf(id, M ? M[i] : ch.getM(i));
+      const e = emitOf(id, M ? M[i] : ch.getM(i), ch.wl && ch.wl.has(i));
       if (e) { L[i] = (L[i] & 0xF0) | e; q.push(i); }
     }
   }
@@ -303,6 +309,7 @@ const BIOMES = ['海洋', '沙滩', '平原', '森林', '桦木森林', '针叶�
 const BIOME_WATER_DEFAULT = [63, 118, 228];
 const BIOME_WATER = [];
 BIOME_WATER[11] = [57, 56, 201];
+const DRY_FOLIAGE_DEFAULT = [92, 60, 50]; // (vanilla DryFoliageColor.FOLIAGE_DRY_DEFAULT: leaf litter)
 const BIOME_TEMP = [0.5, 0.8, 0.8, 0.7, 0.6, 0.25, 0.0, 2.0, 0.2, 0.5, -0.7, 0.0, 2.0, 0.5];
 function hsv2rgb(h, s, v) {
   const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
@@ -392,6 +399,7 @@ class World {
     if (v) (c.wl || (c.wl = new Set())).add(i); else c.wl.delete(i);
     c.modified = true;
     this.markBlock(c, x & 15, y, z & 15);
+    if (WET_EMIT[c.getB(i)]) this.relight(x, y, z);
     this.notify(x, y, z, -1);
     for (let d = 0; d < 6; d++) this.notify(x + DIRS[d][0], y + DIRS[d][1], z + DIRS[d][2], -1);
   }
@@ -464,14 +472,15 @@ class World {
   }
   skyAt(x, y, z) { return this.getLight(x, y, z) >> 4; }
   blockLightAt(x, y, z) { return this.getLight(x, y, z) & 15; }
-  surfaceY(x, z) {
+  surfaceY(x, z, fluids) {
     // from the top section down, skipping the empty ones: while it rains this runs for 441 columns a frame (rain
-    // or snow, isCold), and going block by block from the build limit cost several ms a frame
+    // or snow, isCold), and going block by block from the build limit cost several ms a frame. fluids: water and
+    // lava (and what is always in water) count as the top too - the maps' surface
     const c = this.chunks.get(ckey(x >> 4, z >> 4)); if (!c) return 0;
     const col = ((z & 15) << 4) | (x & 15);
     for (let s = SECTIONS - 1; s >= 0; s--) {
       if (c.bs[s] === null) continue;
-      for (let y = Math.min(HEIGHT - 1, s * 16 + 15); y >= s * 16 && y > 0; y--) { const b = c.getB((y << 8) | col); if (b && BLOCKS[b].solid) return y; }
+      for (let y = Math.min(HEIGHT - 1, s * 16 + 15); y >= s * 16 && y > 0; y--) { const b = c.getB((y << 8) | col); if (b && (BLOCKS[b].solid || (fluids && (IS_FLUID[b] || WLOG[b])))) return y; }
     }
     return 0;
   }
@@ -529,9 +538,10 @@ class World {
 
   // ---- generation ------------------------------------------------------------
   generateFlat(cx, cz) {
-    const ch = new Chunk(cx, cz).beginFlat();
+    // vanilla classic flat: bedrock, 2 dirt, grass (flatTop 3); older superflat worlds: stone up to 56, 3 dirt, grass at 60
+    const ch = new Chunk(cx, cz).beginFlat(), top = this.flatTop || 60;
     for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) {
-      for (let y = 0; y <= 60; y++) ch.blocks[(y << 8) | (z << 4) | x] = y === 0 ? 6 : y < 57 ? 1 : y < 60 ? 3 : 2;
+      for (let y = 0; y <= top; y++) ch.blocks[(y << 8) | (z << 4) | x] = y === 0 ? 6 : y < top - 3 ? 1 : y < top ? 3 : 2;
       ch.biome[z * 16 + x] = BI.PLAINS;
       this.tintFor(this.grassMap, 0.3, 0.2, ch.grass, (z * 16 + x) * 3);
       this.tintFor(this.foliageMap, 0.3, 0.2, ch.foliage, (z * 16 + x) * 3);
@@ -785,7 +795,8 @@ class World {
     }
     S.fill(X - 1, Y + 1, Z + L - 1, X + 1, Y + 1, Z + L + 1, NB); S.set(X, Y + 2, Z + L, 127, 3);
     room(X, Z - L, 5, 6);
-    for (let k = 0; k < 4; k++) S.set(X - 2 + k, Y + 1 + k, Z - L + 3, 125, 3);
+    // a staircase up eastwards on nether bricks (it was 4 stairs facing north hanging diagonally in the air)
+    for (let k = 0; k < 4; k++) { for (let y = Y + 1; y <= Y + k; y++) S.set(X - 2 + k, y, Z - L + 3, NB); S.set(X - 2 + k, Y + 1 + k, Z - L + 3, 125, 0); }
     // a few torches-free glowstone lights inside rooms
     for (const [x, z] of [[X - 5, Z - 5], [X + 5, Z + 5], [X + L, Z], [X - L, Z]]) S.set(x, Y + 6, z, 27);
     return S;
@@ -815,7 +826,9 @@ class World {
       S.set(X - 2, Y, Z + k, 174, r() < 0.1 ? 4 : 0); S.set(X + 2, Y, Z + k, 174, r() < 0.1 ? 4 : 0);
     }
     for (let k = -1; k <= 1; k++) S.set(X + k, Y, Z + 5, 62, 3);
-    for (const [x, z, m] of [[X - 5, Z - 6, 0], [X + 5, Z - 6, 1], [X - 5, Z + 6, 0], [X + 5, Z + 6, 1]]) S.set(x, Y + 3, z, 21, m);
+    // wall torches on the walls (meta 0 of the old torch is a standing one: two hung in the air)
+    const wt = (f) => { const id = BID.wall_torch; return id === undefined ? [21, 0] : [id, Math.max(0, BLOCKS[id].states.findIndex(s => s.facing === f))]; };
+    for (const [x, z, f] of [[X - 5, Z - 6, 'east'], [X + 5, Z - 6, 'west'], [X - 5, Z + 6, 'east'], [X + 5, Z + 6, 'west']]) S.set(x, Y + 3, z, ...wt(f));
     // corridors
     const corridor = (x0, z0, dx, dz, len) => {
       for (let t = 0; t < len; t++) {
@@ -825,7 +838,7 @@ class World {
           const edge = Math.abs(w) === 2 || y === Y - 1 || y === Y + 3;
           S.set(px, y, pz, edge ? brick() : AIR);
         }
-        if (t % 8 === 4) S.set(x + (dz ? 1 : 0), Y + 2, z + (dx ? 1 : 0), 21, dz ? 0 : 4);
+        if (t % 8 === 4) S.set(x + (dz ? 1 : 0), Y + 2, z + (dx ? 1 : 0), ...wt(dz ? 'west' : 'north')); // (on the wall beside it)
       }
     };
     corridor(X, Z - 9, 0, -1, 22); corridor(X, Z + 9, 0, 1, 22); corridor(X - 7, Z, -1, 0, 22); corridor(X + 7, Z, 1, 0, 22);
@@ -867,6 +880,8 @@ class World {
     this.endTop0 = this.endTop(0, 0);
   }
   endTop(x, z) { const d = Math.hypot(x, z), R = 88 + this.nEnd.fbm2(x / 40, z / 40, 3) * 12; return Math.round(60 + this.nEnd.n2(x / 60 + 50, z / 60) * 3 - Math.pow(Math.min(1, d / R), 4) * 6); }
+  // the exit portal's rim level: the top of its bedrock pillar - 3 (an End made before 2026-11-12 has it 2 higher)
+  podiumY() { for (let y = this.endTop0 + 8; y > this.endTop0 - 2; y--) if (this.getBlock(0, y, 0) === 6) return y - 3; return this.endTop0 + (this.oldPodium ? 2 : 0); }
   generateEnd(cx, cz) {
     const ch = new Chunk(cx, cz).beginFlat(), B = ch.blocks;
     const x0 = cx * 16, z0 = cz * 16;
@@ -886,20 +901,26 @@ class World {
       }
       if (p.x >= x0 && p.x <= x0 + 15 && p.z >= z0 && p.z <= z0 + 15) B[((p.h + 1) << 8) | ((p.z - z0) << 4) | (p.x - x0)] = 6;
     }
-    // exit portal fountain (inactive)
-    const yb = this.endTop0 + 1;
+    // exit portal fountain (inactive), as vanilla EndPodiumFeature at the surface block: the base one below it
+    // (end stone in the outer ring), the bedrock rim at the surface, the pillar, and wall torches facing out
+    // (oldPodium: an End made before 2026-11-12 - the old podium 2 higher, all bedrock base, 5 blocks cleared above,
+    // so chunks generated now match its saved ones)
+    const old = !!this.oldPodium, yb = this.endTop0 + (old ? 2 : 0);
     for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) {
       const wx = x, wz = z;
       if (wx < x0 || wx > x0 + 15 || wz < z0 || wz > z0 + 15) continue;
       const d = Math.hypot(x, z), lx = wx - x0, lz = wz - z0;
-      if (d <= 3.5) B[(yb << 8) | (lz << 4) | lx] = 6;
-      if (d > 2.5 && d <= 3.5) B[((yb + 1) << 8) | (lz << 4) | lx] = 6;
-      else if (d <= 2.5) B[((yb + 1) << 8) | (lz << 4) | lx] = AIR;
-      for (let y = yb + 2; y <= yb + 6; y++) if (d <= 3.5) B[(y << 8) | (lz << 4) | lx] = AIR;
-      if (x === 0 && z === 0) for (let y = yb + 1; y <= yb + 4; y++) B[(y << 8) | (lz << 4) | lx] = 6;
+      if (d > 3.5) continue;
+      B[((yb - 1) << 8) | (lz << 4) | lx] = d <= 2.5 || old ? 6 : 172;
+      B[(yb << 8) | (lz << 4) | lx] = d <= 2.5 ? AIR : 6;
+      for (let y = yb + 1; y <= Math.min(yb + (old ? 5 : 32), HEIGHT - 1); y++) B[(y << 8) | (lz << 4) | lx] = AIR;
+      if (x === 0 && z === 0) for (let y = yb; y <= yb + 3; y++) B[(y << 8) | (lz << 4) | lx] = 6;
     }
-    for (const [dx, dz, m] of [[1, 0, 0], [-1, 0, 1], [0, 1, 4], [0, -1, 5]]) {
-      if (dx >= x0 && dx <= x0 + 15 && dz >= z0 && dz <= z0 + 15) { const i = ((yb + 3) << 8) | ((dz - z0) << 4) | (dx - x0); B[i] = 21; ch.meta[i] = m; }
+    const WT = typeof BID !== 'undefined' ? BID.wall_torch : undefined;
+    for (const [dx, dz, f] of [[1, 0, 'east'], [-1, 0, 'west'], [0, 1, 'south'], [0, -1, 'north']]) {
+      if (WT === undefined || dx < x0 || dx > x0 + 15 || dz < z0 || dz > z0 + 15) continue;
+      const i = ((yb + 2) << 8) | ((dz - z0) << 4) | (dx - x0);
+      B[i] = WT; ch.meta[i] = Math.max(0, BLOCKS[WT].states.findIndex(s => s.facing === f));
     }
     ch.recount();
     return ch;
@@ -1218,7 +1239,7 @@ class World {
       }
       // emission
       if (!sky) {
-        const b0 = ch.getB(i0), e = EMIT[b0] && emitOf(b0, ch.getM(i0));
+        const b0 = ch.getB(i0), e = EMIT[b0] && emitOf(b0, ch.getM(i0), ch.wl && ch.wl.has(i0));
         if (e) { ch.setL(i0, (ch.getL(i0) & 0xF0) | e); add.push(x, y, z); }
       } else if (y === HEIGHT - 1 && OPACITY[ch.getB(i0)] === 0) { ch.setL(i0, ch.getL(i0) | 0xF0); add.push(x, y, z); }
       for (let d = 0; d < 6; d++) add.push(x + DIRS[d][0], Math.max(0, Math.min(HEIGHT - 1, y + DIRS[d][1])), z + DIRS[d][2]);
@@ -1248,9 +1269,10 @@ class World {
     const i = (y << 8) | ((z & 15) << 4) | (x & 15);
     const old = ch.getB(i), oldMeta = ch.getM(i);
     if (old === id && oldMeta === meta) return false;
+    const wet0 = !!(ch.wl && ch.wl.has(i));
     // a waterlogged block taken away leaves its water (vanilla removeBlock: the fluid state stays); another block, or
     // a slab made double, takes it away
-    if (ch.wl && ch.wl.has(i) && (old !== id || !canWaterlog(id, meta))) {
+    if (wet0 && (old !== id || !canWaterlog(id, meta))) {
       ch.wl.delete(i);
       if (!id) { id = WATER; meta = 0; }
     }
@@ -1258,7 +1280,7 @@ class World {
     if (!old && id) ch.sectionCount[y >> 4]++; else if (old && !id) ch.sectionCount[y >> 4]--;
     ch.modified = true;
     this.markBlock(ch, x & 15, y, z & 15);
-    if (!(flags & 2) && (OPACITY[old] !== OPACITY[id] || emitOf(old, oldMeta) !== emitOf(id, meta))) this.relight(x, y, z);
+    if (!(flags & 2) && (OPACITY[old] !== OPACITY[id] || emitOf(old, oldMeta, wet0) !== emitOf(id, meta, ch.wl && ch.wl.has(i)))) this.relight(x, y, z);
     if (flags & 1) {
       this.notify(x, y, z, old);
       for (let d = 0; d < 6; d++) this.notify(x + DIRS[d][0], y + DIRS[d][1], z + DIRS[d][2], -1);
@@ -1282,7 +1304,7 @@ class World {
   notify(x, y, z, changedOld) {
     if (y < 0 || y >= HEIGHT) return;
     const id = this.getBlock(x, y, z);
-    if (IS_FLUID[id]) this.schedule(x, y, z, id === WATER ? 5 : (this.dim === 'nether' ? 10 : 30));
+    if (IS_FLUID[id]) this.schedule(x, y, z, id === WATER || FLUID_MOD[id] === 1 ? 5 : (this.dim === 'nether' ? 10 : 30));
     else if (id === 171) this.schedule(x, y, z, 30 + ((Math.random() * 10) | 0));
     else if (this.isWaterlogged(x, y, z)) this.schedule(x, y, z, 5);
     if (this.listener && id) this.listener.onNeighborUpdate(x, y, z, id);
@@ -1308,8 +1330,9 @@ class World {
 
   // (every kind of torch is washed away - the wall ones, soul, redstone, copper - as vanilla; they held the water back
   // and lava too: "水冲不掉插在方块侧面的火把", "火把能挡岩浆", feedback 2026-11-01/02)
-  // (kelp, seagrass, coral ... already hold water: never washed away - an ocean's kelp popped into items, feedback 11-03)
-  canFlowInto(id) { if (WLOG[id]) return false; return id === AIR || (REPLACEABLE[id] && !IS_FLUID[id]) || id === 21 || TORCHLIKE[id] === 1 || (BLOCKS[id] && BLOCKS[id].needsSupport && !BLOCKS[id].solid); }
+  // (kelp, seagrass, coral ... already hold water: never washed away - an ocean's kelp popped into items, feedback 11-03;
+  // nor a sea pickle, which holds it when waterlogged)
+  canFlowInto(id) { if (WLOG[id]) return false; return id === AIR || (REPLACEABLE[id] && !IS_FLUID[id]) || id === 21 || TORCHLIKE[id] === 1 || (BLOCKS[id] && BLOCKS[id].needsSupport && !BLOCKS[id].solid && id !== BID.sea_pickle); }
 
   fluidTick(x, y, z) {
     if (!this.isLoaded(x, z)) return;
@@ -1318,9 +1341,9 @@ class World {
     const id = wl ? WATER : this.getBlock(x, y, z);
     if (!IS_FLUID[id]) return;
     let meta = wl ? 0 : this.getMeta(x, y, z);
-    const water = id === WATER, drop = water || this.dim === 'nether' ? 1 : 2, other = water ? LAVA : WATER;
+    const mod = FLUID_MOD[id], water = id === WATER || mod === 1, drop = water || this.dim === 'nether' ? 1 : 2, other = mod ? -1 : water ? LAVA : WATER, src = id === WATER;
     // fluid contact
-    if (!water) {
+    if (!water && !mod) {
       for (let d = 0; d < 6; d++) {
         if (d === 2) continue;
         const ax = x + DIRS[d][0], ay = y + DIRS[d][1], az = z + DIRS[d][2];
@@ -1332,12 +1355,12 @@ class World {
       }
     }
     // vanilla LiquidBlock.shouldSpreadLiquid: lava on soul soil next to blue ice turns to basalt
-    if (!water && BID.basalt !== undefined && this.getBlock(x, y - 1, z) === BID.soul_soil && [0, 1, 3, 4, 5].some(d => this.getBlock(x + DIRS[d][0], y + DIRS[d][1], z + DIRS[d][2]) === BID.blue_ice)) {
+    if (id === LAVA && BID.basalt !== undefined && this.getBlock(x, y - 1, z) === BID.soul_soil && [0, 1, 3, 4, 5].some(d => this.getBlock(x + DIRS[d][0], y + DIRS[d][1], z + DIRS[d][2]) === BID.blue_ice)) {
       this.setBlock(x, y, z, BID.basalt, 0); if (this.listener) this.listener.onFizz(x, y, z); return;
     }
     // a flow takes its level from its neighbours (vanilla FlowingFluid.tick / getNewLiquid); a source keeps its own
     if (meta !== 0) {
-      const nm = this.newLiquid(id, x, y, z, water, drop);
+      const nm = this.newLiquid(id, x, y, z, src, drop);
       if (nm !== meta) {
         if (nm < 0) { this.setBlock(x, y, z, AIR, 0); return; }
         // LavaFluid.getSpreadDelay: lava rising (not falling) waits four times as long, three times out of four
@@ -1371,7 +1394,7 @@ class World {
     for (const k of pick) {
       const d = FLUID_HDIRS[k], nx = x + d[0], nz = z + d[1], nid = this.getBlock(nx, y, nz);
       if (nid === other) { this.setBlock(nx, y, nz, water ? (this.getMeta(nx, y, nz) === 0 ? 28 : 4) : 1, 0); if (this.listener) this.listener.onFizz(nx, y, nz); continue; }
-      const nm = this.newLiquid(id, nx, y, nz, water, drop);
+      const nm = this.newLiquid(id, nx, y, nz, src, drop);
       if (nm < 0) continue;
       if (nid && this.listener) this.listener.onFluidDestroy(nx, y, nz, nid, water);
       this.setBlock(nx, y, nz, id, nm);

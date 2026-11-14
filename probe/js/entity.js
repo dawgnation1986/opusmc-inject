@@ -12,8 +12,16 @@ function cellWet(c, x, y, z) { return y >= 0 && y < HEIGHT && !!(c && c.wl && c.
 function blockBy(w, c, fx, fz, x, y, z) { return ((x ^ fx) | (z ^ fz)) >> 4 ? w.getBlock(x, y, z) : cellB(w, c, x, y, z); }
 // The collision boxes of the blocks in a region (a wall for a column not loaded) into out. The box arrays are out's
 // own (out.pool), filled again by its next call: each move made 10-30 new arrays and copied the list - with ~100
-// mobs about a third of the entity tick went to allocating and to the map lookups (profiled 2026-11-03)
-function blockBoxes(world, x0, y0, z0, x1, y1, z1, out) {
+// mobs about a third of the entity tick went to allocating and to the map lookups (profiled 2026-11-03). ent: the
+// entity they are for, if any (powder snow holds up only some - collide(m, ent, y))
+// is the block at x, y, z a full solid cube to collide with (vanilla BlockState.isCollisionShapeFullBlock)
+const _fullBoxes = [];
+function fullCollisionAt(world, x, y, z) {
+  blockBoxes(world, x + 0.01, y + 0.01, z + 0.01, x + 0.99, y + 0.99, z + 0.99, _fullBoxes, null);
+  for (const b of _fullBoxes) if (b[0] <= x + 1e-6 && b[1] <= y + 1e-6 && b[2] <= z + 1e-6 && b[3] >= x + 1 - 1e-6 && b[4] >= y + 1 - 1e-6 && b[5] >= z + 1 - 1e-6) return true;
+  return false;
+}
+function blockBoxes(world, x0, y0, z0, x1, y1, z1, out, ent) {
   const pool = out.pool || (out.pool = []);
   let n = 0;
   const ix0 = Math.floor(x0), iy0 = Math.floor(y0) - 1, iz0 = Math.floor(z0);
@@ -25,12 +33,13 @@ function blockBoxes(world, x0, y0, z0, x1, y1, z1, out) {
       const id = cellB(world, c, x, y, z);
       if (!id) continue;
       const b = BLOCKS[id];
-      if (!b.solid) continue;
+      // (a block this page doesn't know - a mod's, the world opened without that mod - 11-13: it threw here every tick)
+      if (!b || (!b.solid && !b.collide)) continue; // (one that isn't solid with a collide still collides - blocks.js)
       if (b.shape === SH_BOXES || b.shape === SH_MODEL) {
         // (the meta from the chunk in hand: World.getMeta looked the chunk up again for every stair, slab, door ...)
         const m = b.fence ? world.fenceMeta(x, y, z, b) : y >= 0 && y < HEIGHT ? c.getM((y << 8) | ((z & 15) << 4) | (x & 15)) : 0;
-        for (const bx of (b.collide ? b.collide(m) : b.boxes(m))) n = boxPut(out, pool, n, x + bx[0] / 16, y + bx[1] / 16, z + bx[2] / 16, x + bx[3] / 16, y + bx[4] / 16 * (b.key === 'snow' ? 0 : 1), z + bx[5] / 16);
-      } else if (b.shape === SH_CACTUS) n = boxPut(out, pool, n, x + 1 / 16, y, z + 1 / 16, x + 15 / 16, y + 1, z + 15 / 16);
+        for (const bx of (b.collide ? b.collide(m, ent, y) : b.boxes(m))) n = boxPut(out, pool, n, x + bx[0] / 16, y + bx[1] / 16, z + bx[2] / 16, x + bx[3] / 16, y + bx[4] / 16, z + bx[5] / 16);
+      } else if (b.shape === SH_CACTUS) n = boxPut(out, pool, n, x + 1 / 16, y, z + 1 / 16, x + 15 / 16, y + 15 / 16, z + 15 / 16); // (vanilla: 15 high - what lands on it is in it)
       else n = boxPut(out, pool, n, x, y, z, x + 1, y + 1, z + 1);
     }
   }
@@ -43,7 +52,47 @@ function boxPut(out, pool, n, a0, a1, a2, a3, a4, a5) {
   a[0] = a0; a[1] = a1; a[2] = a2; a[3] = a3; a[4] = a4; a[5] = a5; out[n] = a;
   return n + 1;
 }
-const _boxes = [], _moveBoxes = [], _stepBoxes = [], _sightBoxes = [];
+const _boxes = [], _moveBoxes = [], _stepBoxes = [], _sightBoxes = [], _stepHs = [], _stepBox = [0, 0, 0, 0, 0, 0];
+// ---- where one can stand (vanilla BlockGetter.getBlockFloorHeight, DismountHelper): out of a bed, off a mount ----
+// the top of block x,y,z's collision shape over its bottom: null for none, Infinity where the chunk isn't here.
+// climb: ladders, vines ... count as none (DismountHelper.nonClimbableShape)
+const _floorBoxes = [];
+function cellTop(w, x, y, z, climb) {
+  if (!w.isLoaded(x, z)) return Infinity;
+  const b = BLOCKS[w.getBlock(x, y, z)];
+  if (!b || !b.solid || (climb && b.climbable)) return null;
+  blockBoxes(w, x + 1e-3, y + 1e-3, z + 1e-3, x + 1 - 1e-3, y + 1 - 1e-3, z + 1 - 1e-3, _floorBoxes);
+  let top = null;
+  for (const bx of _floorBoxes) if (bx[1] >= y - 1e-7 && bx[1] < y + 1 - 1e-7 && (top === null || bx[4] - y > top)) top = bx[4] - y;
+  return top;
+}
+// how high over block x,y,z's bottom one stands in it: its own top, or for an empty one the top of a full-height block
+// under it less 1; NaN where that is no floor (DismountHelper.isBlockFloorValid: below 1 - not in a full block)
+function blockFloor(w, x, y, z, climb) {
+  let f = cellTop(w, x, y, z, climb);
+  if (f === null) { const b = cellTop(w, x, y - 1, z, climb); f = b !== null && b >= 1 ? b - 1 : NaN; }
+  return f < 1 ? f : NaN;
+}
+// a player's box (standing, crouching or swimming height h) at x,y,z clear of blocks
+function standsFree(e, x, y, z, h) { const r = PLAYER_W / 2; return !e.collides([x - r, y, z - r, x + r, y + h, z + r]); }
+// vanilla EntityType.isBlockDangerous for a player: burning blocks, wither roses, berry bushes, cacti, powder snow
+function dangerBlock(w, x, y, z) {
+  const id = w.getBlock(x, y, z), b = BLOCKS[id]; if (!b) return false;
+  if (/^(fire|soul_fire|lava|magma_block|lava_cauldron|wither_rose|sweet_berry_bush|cactus|powder_snow)$/.test(b.key)) return true;
+  return /campfire$/.test(b.key) && !(typeof Features !== 'undefined' && Features.propOf(id, w.getMeta(x, y, z), 'lit') === 'false');
+}
+// vanilla DismountHelper.findSafeDismountLocation for a player: standing in block x,y,z (on its floor, room for the
+// standing box, not in an end portal); danger: not on or in a dangerous block. null where not
+function safeStandAt(e, x, y, z, danger) {
+  const w = e.world;
+  if (danger && dangerBlock(w, x, y, z)) return null;
+  const f = blockFloor(w, x, y, z, true);
+  if (!(f < 1)) return null;
+  if (danger && f <= 0 && dangerBlock(w, x, y - 1, z)) return null;
+  if (!standsFree(e, x + 0.5, y + f, z + 0.5, PLAYER_H.stand)) return null;
+  const portal = (yy) => { const b = BLOCKS[w.getBlock(x, yy, z)]; return !!b && /^end_(portal|gateway)$/.test(b.key); };
+  return portal(y) || portal(y + 1) ? null : [x + 0.5, y + f, z + 0.5];
+}
 
 class Entity {
   constructor(game, x, y, z, w, h) {
@@ -60,7 +109,7 @@ class Entity {
   ipos(a) { return [lerp(this.prev[0], this.pos[0], a), lerp(this.prev[1], this.pos[1], a), lerp(this.prev[2], this.pos[2], a)]; }
 
   collides(bb) {
-    blockBoxes(this.world, bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], _boxes);
+    blockBoxes(this.world, bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], _boxes, this);
     for (const b of _boxes) if (bb[0] < b[3] && bb[3] > b[0] && bb[1] < b[4] && bb[4] > b[1] && bb[2] < b[5] && bb[5] > b[2]) return true;
     return false;
   }
@@ -77,6 +126,10 @@ class Entity {
 
   move(dx, dy, dz) {
     if (this.noClip) { this.pos[0] += dx; this.pos[1] += dy; this.pos[2] += dz; return; }
+    // stuck in a block last tick (vanilla makeStuckInBlock: a sweet berry bush): this move slowed by its factors, the
+    // speed gone
+    const st = this.stuckIn;
+    if (st) { this.stuckIn = null; dx *= st[0]; dy *= st[1]; dz *= st[2]; if (this.vel) this.vel[0] = this.vel[1] = this.vel[2] = 0; }
     // sneaking: don't walk off edges
     if (this.sneakEdge && this.onGround && !this.flying) {
       const step = 0.05, dx0 = dx, dz0 = dz;
@@ -94,34 +147,60 @@ class Entity {
     const ox = dx, oy = dy, oz = dz;
     const bb = this.box();
     const boxes = blockBoxes(this.world, Math.min(bb[0], bb[0] + dx) - 0.01, Math.min(bb[1], bb[1] + dy) - 0.01, Math.min(bb[2], bb[2] + dz) - 0.01,
-      Math.max(bb[3], bb[3] + dx) + 0.01, Math.max(bb[4], bb[4] + dy) + 0.01, Math.max(bb[5], bb[5] + dz) + 0.01, _moveBoxes);
+      Math.max(bb[3], bb[3] + dx) + 0.01, Math.max(bb[4], bb[4] + dy) + 0.01, Math.max(bb[5], bb[5] + dz) + 0.01, _moveBoxes, this);
     // boats and minecarts are solid to the player, as vanilla (canBeCollidedWith): one can stand on one - it went through them into
     // the water, "船没有碰撞箱，站上去会沉下去" (feedback 2026-11-01/02). Not to its own rider; a box already overlapped
     // doesn't hold anyone back (clip only stops what comes from outside)
+    const nBlock = boxes.length;
+    // An adult happy ghast is solid to a player at or above its top (HappyGhast.canBeCollidedWith): one can stand on it
     if (this.game && this === this.game.player && !this.vehicle && typeof Boat !== 'undefined')
-      for (const e of this.game.entities) if ((e instanceof Boat || (typeof Minecart !== 'undefined' && e instanceof Minecart)) && !e.dead && Math.abs(e.pos[0] - bb[0]) < 4 && Math.abs(e.pos[2] - bb[2]) < 4 && Math.abs(e.pos[1] - bb[1]) < 4) boxes.push(e.box());
+      for (const e of this.game.entities) if (!e.dead && Math.abs(e.pos[0] - bb[0]) < 4 && Math.abs(e.pos[2] - bb[2]) < 4) {
+        if ((e instanceof Boat || (typeof Minecart !== 'undefined' && e instanceof Minecart)) && Math.abs(e.pos[1] - bb[1]) < 4) boxes.push(e.box());
+        else if (typeof HappyGhast !== 'undefined' && e instanceof HappyGhast && !e.baby && e.deathTime === 0 && bb[1] >= e.pos[1] + e.h - 1e-5 && bb[1] - e.pos[1] - e.h < 4) boxes.push(e.box());
+      }
     dy = Entity.clip(bb, boxes, dy, 1); bb[1] += dy; bb[4] += dy;
     dx = Entity.clip(bb, boxes, dx, 0); bb[0] += dx; bb[3] += dx;
     dz = Entity.clip(bb, boxes, dz, 2); bb[2] += dz; bb[5] += dz;
-    const grounded = this.onGround || (oy !== dy && oy < 0);
+    const landed = oy !== dy && oy < 0, grounded = this.onGround || landed;
     if (this.stepHeight > 0 && grounded && (dx !== ox || dz !== oz)) {
-      const sb = this.box();
-      const b2 = blockBoxes(this.world, Math.min(sb[0], sb[0] + ox) - 0.01, sb[1] - 0.01, Math.min(sb[2], sb[2] + oz) - 0.01,
-        Math.max(sb[3], sb[3] + ox) + 0.01, sb[4] + this.stepHeight + 0.01, Math.max(sb[5], sb[5] + oz) + 0.01, _stepBoxes);
-      let sy = Entity.clip(sb, b2, this.stepHeight, 1); sb[1] += sy; sb[4] += sy;
-      let sx = Entity.clip(sb, b2, ox, 0); sb[0] += sx; sb[3] += sx;
-      let sz = Entity.clip(sb, b2, oz, 2); sb[2] += sz; sb[5] += sz;
-      let down = Entity.clip(sb, b2, -sy, 1); sb[1] += down; sb[4] += down;
-      if (sx * sx + sz * sz > dx * dx + dz * dz + 1e-6) {
-        for (let i = 0; i < 6; i++) bb[i] = sb[i];
-        dx = sx; dz = sz; dy = sy + down;
-        this.stepped = true;
+      // vanilla Entity.collide: from the landed box, try each height a nearby box's bottom or top is at (up to the
+      // step height, lowest first) and take the first that gets further. It rose the whole 0.6 first, and from a dirt
+      // path or farmland (15/16) into a two-high doorway that put the head into the lintel - nothing stepped up
+      const g = this.box(); if (landed) { g[1] += dy; g[4] += dy; }
+      const b2 = blockBoxes(this.world, Math.min(g[0], g[0] + ox) - 0.01, g[1] - 0.01, Math.min(g[2], g[2] + oz) - 0.01,
+        Math.max(g[3], g[3] + ox) + 0.01, g[4] + this.stepHeight + 0.01, Math.max(g[5], g[5] + oz) + 0.01, _stepBoxes, this);
+      for (let i = nBlock; i < boxes.length; i++) b2.push(boxes[i]);
+      const hs = _stepHs; hs.length = 0;
+      for (const b of b2) for (let k = 1; k <= 4; k += 3) { const h = b[k] - g[1]; if (h > 1e-7 && h <= this.stepHeight + 1e-7 && !hs.includes(h)) hs.push(h); }
+      hs.sort((p, q) => p - q);
+      const sb = _stepBox;
+      for (const h of hs) {
+        for (let i = 0; i < 6; i++) sb[i] = g[i];
+        const sy = Entity.clip(sb, b2, h, 1); sb[1] += sy; sb[4] += sy;
+        const sx = Entity.clip(sb, b2, ox, 0); sb[0] += sx; sb[3] += sx;
+        const sz = Entity.clip(sb, b2, oz, 2); sb[2] += sz; sb[5] += sz;
+        if (sx * sx + sz * sz > dx * dx + dz * dz + 1e-6) {
+          dy = sb[1] - bb[1] + dy;
+          for (let i = 0; i < 6; i++) bb[i] = sb[i];
+          dx = sx; dz = sz;
+          this.stepped = true;
+          break;
+        }
       }
     }
     this.collidedH = Math.abs(dx - ox) > 1e-6 || Math.abs(dz - oz) > 1e-6;
     this.onGround = oy < 0 && Math.abs(dy - oy) > 1e-7 || (this.stepped && oy <= 0 && this.onGround);
     this.stepped = false;
-    if (Math.abs(dy - oy) > 1e-7) this.vel[1] = 0;
+    const vy = this.vel[1];
+    if (Math.abs(dy - oy) > 1e-7) {
+      // landing on a bed bounces back up (vanilla Entity.restituteMovementAfterCollisions, the bed's bounceRestitution
+      // 0.75, 0.8 of that for what isn't alive): not when falling slower than its gravity, nor a sneaking player; the
+      // gravity of the part of the tick not moved is given back, the air drag taken for the part moved
+      const v1 = this.vel[1], g = this instanceof Living ? (v1 <= 0 && this.effects && this.hasEffect('slow_falling') ? 0.01 : 0.08) : 0.04;
+      const bed = oy < 0 && -v1 >= g && !this.sneaking && BLOCKS[this.world.getBlock(Math.floor((bb[0] + bb[3]) / 2), Math.floor(bb[1] - 0.2), Math.floor((bb[2] + bb[5]) / 2))];
+      const k = bed && bed.bed ? clamp(dy / oy, 0, 1) : 0;
+      this.vel[1] = bed && bed.bed ? (k * g - v1) * (1 - 0.02 * k) * 0.75 * (this instanceof Living ? 1 : 0.8) : 0;
+    }
     if (Math.abs(dx - ox) > 1e-7) this.vel[0] = 0;
     if (Math.abs(dz - oz) > 1e-7) this.vel[2] = 0;
     this.pos[0] = (bb[0] + bb[3]) / 2; this.pos[1] = bb[1]; this.pos[2] = (bb[2] + bb[5]) / 2;
@@ -130,6 +209,17 @@ class Entity {
       if (this.fallDist > 0) this.onLand(this.fallDist);
       this.fallDist = 0;
     } else if (dy < 0) this.fallDist -= dy;
+    // landed on a bouncy block (slime) falling at least a tick's gravity, not sneaking: thrown back up (vanilla
+    // Entity.restituteMovementAfterCollisions - the part of the tick's gravity left after the hit made up for; things
+    // that aren't alive keep 0.8 of it)
+    if (oy < 0 && dy !== oy && dy <= 0 && vy < 0 && !this.sneaking && !this.sneakHeld) {
+      const g = this instanceof Living ? (this.effects && this.hasEffect('slow_falling') ? 0.01 : 0.08) : 0.04;
+      const ub = -vy >= g && BLOCKS[this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2]))];
+      if (ub && ub.bounce) {
+        const f = dy / vy, r = ub.bounce * (this instanceof Living ? 1 : 0.8);
+        this.vel[1] = (f * g - vy) * (1 + (0.98 - 1) * f) * r;
+      }
+    }
   }
   onLand(d) { }
 
@@ -155,7 +245,8 @@ class Entity {
       for (let y = y0; y <= y1; y++) {
         const id = cellB(w, c, x, y, z);
         if (id === WATER || WLOG[id] || (id && cellWet(c, x, y, z))) { this.inWater = true; this.fallDist = 0; }
-        else if (id === LAVA) this.inLava = true;
+        else if (id === LAVA || FLUID_MOD[id] === 2) this.inLava = true;
+        else if (FLUID_MOD[id] === 1) { this.inWater = true; this.fallDist = 0; } // (a mod's water-like fluid)
       }
     }
     if (cp === null) cp = chunkOf(w, px, pz);
@@ -218,6 +309,12 @@ Entity.nextId = 1;
 // Living entities
 // ---------------------------------------------------------------------------
 const speedFactorOf = (b) => (b && b.slow && b.key !== 'cobweb' ? b.slow : 0);
+// a block's jump factor (vanilla getBlockJumpFactor: the one at the feet if it has one, else the one under them; honey 0.5)
+const jumpFactorOf = (e) => {
+  const w = e.world, x = Math.floor(e.pos[0]), z = Math.floor(e.pos[2]), f = BLOCKS[w.getBlock(x, Math.floor(e.pos[1]), z)];
+  return f && f.jumpFactor ? f.jumpFactor : (BLOCKS[w.getBlock(x, Math.floor(e.pos[1] - 0.5), z)] || {}).jumpFactor || 1;
+};
+const BERRY_STUCK = [0.8, 0.75, 0.8]; // (vanilla SweetBerryBushBlock.entityInside: makeStuckInBlock)
 class Living extends Entity {
   constructor(game, x, y, z, w, h, hp) {
     super(game, x, y, z, w, h);
@@ -251,6 +348,7 @@ class Living extends Entity {
     this.age++;
     if (this.hurtTime > 0) this.hurtTime--;
     if (this.invuln > 0) this.invuln--;
+    if (this.impulseGrace > 0) this.impulseGrace--;
     this.updateFluids();
     if (this.inWater) this.bubbleColumn();
     if (this.inLava && !this.fireproof) { this.hurt(4, { type: 'lava' }); this.fire = 300; }
@@ -259,16 +357,44 @@ class Living extends Entity {
     {
       const b0 = this.box();
       this.inWeb = false;
+      let berry = 0, honey = false;
       const y0 = Math.floor(b0[1]), y1 = Math.floor(b0[4] - 0.001);
       for (let x = Math.floor(b0[0]); x <= Math.floor(b0[3] - 0.001); x++) for (let z = Math.floor(b0[2]); z <= Math.floor(b0[5] - 0.001); z++) {
         const c = ((x ^ fx) | (z ^ fz)) >> 4 ? chunkOf(w, x, z) : c0;
         for (let y = y0; y <= y1; y++) {
           const id = cellB(w, c, x, y, z);
           if (id === 177) this.inWeb = true;
-          else if (id === 171 && !this.fireproof) { if (this.fire < 160) this.fire = 160; if (this.age % 10 === 0) this.hurt(1, { type: 'fire' }); }
+          else if ((id === 171 || (id && id === BID.soul_fire)) && !this.fireproof) { if (this.fire < 160) this.fire = 160; if (this.age % 10 === 0) this.hurt(id === 171 ? 1 : 2, { type: 'fire' }); }
+          else if (id === BID.sweet_berry_bush) berry = Math.max(berry, Features.propOf(id, w.getMeta(x, y, z), 'age') !== '0' ? 2 : 1);
+          // sliding down a honey block's side (HoneyBlock.isSlidingDown: in the air, falling, beside it - not on top)
+          else if (id === BID.honey_block && !this.onGround && this.pos[1] <= y + 0.9375 - 1e-7 && this.vel[1] / 0.98 + 0.08 < -0.08) {
+            const o = 0.4375 + this.w / 2;
+            if (Math.abs(x + 0.5 - this.pos[0]) + 1e-7 > o || Math.abs(z + 0.5 - this.pos[2]) + 1e-7 > o) honey = true;
+          }
         }
       }
+      // a sweet berry bush (vanilla entityInside) holds back whoever is in it - not foxes and bees - and one past its
+      // first stage pricks them if they moved last tick (this tick's start against the last's: the player's prev is
+      // set just before this, so it never hurt a player - players' feedback 2026-10-31/11-07)
+      const lp = this.lastTickPos || (this.lastTickPos = [this.pos[0], this.pos[1], this.pos[2]]);
+      // (nothing for a noClip one - spectator, vex, dragon: vanilla isAffectedByBlocks)
+      if (berry && this.type !== 'fox' && this.type !== 'bee' && !this.noClip) {
+        // (not a flying player: vanilla Player.makeStuckInBlock does nothing then)
+        if (!this.flying) { this.stuckIn = BERRY_STUCK; this.fallDist = 0; }
+        if (berry === 2 && (Math.abs(this.pos[0] - lp[0]) >= 0.003 || Math.abs(this.pos[2] - lp[2]) >= 0.003)) this.hurt(1, { type: 'berry' });
+      }
+      lp[0] = this.pos[0]; lp[1] = this.pos[1]; lp[2] = this.pos[2];
+      // HoneyBlock.doSlideMovement: down at 0.05 a tick (before gravity), slower sideways when it came in fast
+      if (honey) {
+        const v = this.vel, od = v[1] / 0.98 + 0.08;
+        if (od < -0.13) { const k = -0.05 / od; v[0] *= k; v[2] *= k; }
+        v[1] = (-0.05 - 0.08) * 0.98; this.fallDist = 0;
+        if (Math.random() < 0.2) Sound.ev('block.honey_block.slide', this.pos, 1, 1);
+      }
     }
+    // (vanilla tryResetCurrentImpulseContext: a wind charge's impulse is over once its grace has run out and it stands,
+    // swims, climbs, glides or is caught in a cobweb - not only at its next landing)
+    if (this.impulseY != null && !(this.impulseGrace > 0) && (this.onGround || this.inWater || this.inLava || this.inWeb || this.gliding || this.onLadder(c0, fx, fz))) this.impulseY = null;
     if (this.fireproof) this.fire = 0;
     if (this.fire > 0) {
       this.fire--;
@@ -288,31 +414,48 @@ class Living extends Entity {
     {
       const hw = this.w / 2, px = this.pos[0], pz = this.pos[2], cy = Math.floor(this.pos[1] + 0.3);
       if (blockBy(w, c0, fx, fz, Math.floor(px - hw - 0.01), cy, Math.floor(pz)) === 37 || blockBy(w, c0, fx, fz, Math.floor(px + hw + 0.01), cy, Math.floor(pz)) === 37 ||
-        blockBy(w, c0, fx, fz, Math.floor(px), cy, Math.floor(pz - hw - 0.01)) === 37 || blockBy(w, c0, fx, fz, Math.floor(px), cy, Math.floor(pz + hw + 0.01)) === 37) this.hurt(1, { type: 'cactus' });
+        blockBy(w, c0, fx, fz, Math.floor(px), cy, Math.floor(pz - hw - 0.01)) === 37 || blockBy(w, c0, fx, fz, Math.floor(px), cy, Math.floor(pz + hw + 0.01)) === 37 ||
+        blockBy(w, c0, fx, fz, Math.floor(px), Math.floor(this.pos[1]), Math.floor(pz)) === 37) this.hurt(1, { type: 'cactus' }); // (or standing on its top)
     }
     if (this.onGround && blockBy(w, c0, fx, fz, Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.1), Math.floor(this.pos[2])) === 103 && !this.sneaking) this.hurt(1, { type: 'hotFloor' });
-    // a sweet berry bush past its first stage pricks whoever moves through it (vanilla: 1, not foxes and bees;
-    // players' feedback 2026-10-31: no damage)
-    if (BID.sweet_berry_bush !== undefined && this.type !== 'fox' && this.type !== 'bee') {
-      const bx = Math.floor(this.pos[0]), by = Math.floor(this.pos[1] + 0.2), bz = Math.floor(this.pos[2]);
-      if (blockBy(w, c0, fx, fz, bx, by, bz) === BID.sweet_berry_bush && Features.propOf(BID.sweet_berry_bush, w.getMeta(bx, by, bz), 'age') !== '0') {
-        const mx = this.pos[0] - (this.prev ? this.prev[0] : this.pos[0]), mz = this.pos[2] - (this.prev ? this.prev[2] : this.pos[2]);
-        if (Math.abs(mx) >= 0.003 || Math.abs(mz) >= 0.003) this.hurt(1, { type: 'berry' });
-      }
-    }
     if (this.pos[1] < -40) this.hurt(4, { type: 'void' });
   }
   onLand(d) {
     if (this.slowFall) return;
+    // thrown up by a wind charge (vanilla causeFallDamage with currentImpulseImpactPos): only the fall below where the
+    // burst caught it counts - the fall from the top of the jump hurt
+    if (this.impulseY != null) {
+      d = Math.min(d, this.impulseY - this.pos[1]);
+      if (d <= 0 || !(this.impulseGrace > 0)) this.impulseY = null;
+    }
     const id = this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2]));
+    // farmland trampled (vanilla FarmlandBlock.fallOn): a fall of d turns it to dirt one time in d - 0.5 under a player,
+    // or a mob of 0.8 x 0.8 x 0.8 or more while mob_griefing is on; what grew on it pops off. There was none
+    if (id === 63 && !this.game.net && !this.remote && Math.random() < d - 0.5 && this.w * this.w * this.h > 0.512 && (this instanceof Player || !this.game.rule || this.game.rule('mob_griefing') !== false)) {
+      const fx = Math.floor(this.pos[0]), fy = Math.floor(this.pos[1] - 0.2), fz = Math.floor(this.pos[2]);
+      this.world.setBlock(fx, fy, fz, 3, 0);
+      // (pushed up out of the full block, as pushEntitiesUp)
+      for (const e of [this.game.player, ...this.game.entities]) if (e && e.pos[1] >= fy + 0.5 && e.pos[1] < fy + 1 && Math.abs(e.pos[0] - fx - 0.5) < 0.5 + e.w / 2 && Math.abs(e.pos[2] - fz - 0.5) < 0.5 + e.w / 2) { e.pos[1] = fy + 1; if (e.prev) e.prev[1] = Math.max(e.prev[1], fy + 1); }
+      if (this.game.flushMesh) this.game.flushMesh();
+    }
     if (d > 1.5 && id && BLOCKS[id].shape !== SH_LIQUID) {
       const n = Math.min(30, Math.floor(d * 3));
-      for (let i = 0; i < n; i++) this.game.particles.spawn('block', this.pos[0] + (Math.random() - 0.5) * this.w, this.pos[1] + 0.1, this.pos[2] + (Math.random() - 0.5) * this.w, (Math.random() - 0.5) * 0.3, 0.1 + Math.random() * 0.1, (Math.random() - 0.5) * 0.3, { id, meta: 0, tint: BLOCKS[id].tint ? this.game.tintAt(Math.floor(this.pos[0]), Math.floor(this.pos[2]), BLOCKS[id].tint) : null });
+      for (let i = 0; i < n; i++) this.game.particles.spawn('block', this.pos[0] + (Math.random() - 0.5) * this.w, this.pos[1] + 0.1, this.pos[2] + (Math.random() - 0.5) * this.w, (Math.random() - 0.5) * 0.3, 0.1 + Math.random() * 0.1, (Math.random() - 0.5) * 0.3, { id, meta: 0, tint: this.game.blockTintAt(Math.floor(this.pos[0]), Math.floor(this.pos[2]), id, 0) });
       if (d > 3) Sound.block('step', BLOCKS[id].sound, this.pos);
     }
     const jb = this.effects ? this.effectAmp('jump_boost') + 1 : 0;
-    if (d > 3.0 + jb && !this.inWater && id !== 87) {
-      const dmg = Math.ceil(d - 3 - jb);
+    if (id && BLOCKS[id].bed) d *= 0.5; // (vanilla BedBlock.fallOn: half the fall)
+    // the water looked at again first (vanilla LivingEntity.checkFallDamage): a fall that went into shallow or flowing
+    // water and reached its floor in the same tick still had the dry state of the tick before - it hurt
+    if (!this.inWater && d > 3.0 + jb) this.updateFluids();
+    // a stalagmite's tip: the fall counts 2.5 blocks more, twice over (PointedDripstoneBlock.fallOn - it did nothing)
+    const fm = id && BLOCKS[id].key === 'pointed_dripstone' && typeof Features !== 'undefined' ? this.world.getMeta(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2])) : -1;
+    const spike = fm >= 0 && Features.propOf(id, fm, 'thickness') === 'tip' && Features.propOf(id, fm, 'vertical_direction') === 'up';
+    // the block's share of the damage (vanilla fallOn): honey a fifth; slime and powder snow none
+    const B = BLOCKS[id], mul = !B ? 1 : B.key === 'honey_block' ? 0.2 : B.bounce || B.key === 'powder_snow' ? 0 : 1;
+    const dmg = spike ? Math.floor((d - 0.5 - jb) * 2 + 1e-6) : Math.ceil((d - 3 - jb) * mul);
+    if ((spike || d > 3.0 + jb) && dmg > 0 && !this.inWater && id !== 87 && mul > 0) {
+      this.impulseY = null;
       this.hurt(dmg, { type: 'fall' });
       // vanilla causeFallDamage: the small / big fall sound (a player's own), then the landing block's fall sound -
       // it was the block's break sound (players' feedback 2026-10-31)
@@ -378,6 +521,11 @@ class Living extends Entity {
       const f = speedFactorOf(feet) || speedFactorOf(BLOCKS[below]); // (a cobweb slows by inWeb)
       if (f) { v[0] *= f; v[2] *= f; }
     }
+    // walking on slime, not bouncing (SlimeBlock.stepOn): sticky, not when sneaking
+    if (this.onGround && !this.sneaking && Math.abs(v[1]) < 0.1) {
+      const on = BLOCKS[blockBy(w, c0, fx, fz, Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2]))];
+      if (on && on.bounce) { const s = 0.4 + Math.abs(v[1]) * 0.2; v[0] *= s; v[2] *= s; }
+    }
   }
   accel(fwd, strafe, a) {
     let l = fwd * fwd + strafe * strafe;
@@ -408,7 +556,8 @@ class Living extends Entity {
 class Inventory {
   constructor() { this.slots = new Array(41).fill(null); this.sel = 0; } // 0-35, armour 36-39, offhand 40
   get held() { return this.slots[this.sel]; }
-  add(stack) {
+  // (slots: a shift-click's own order - inventory slots only, never the offhand - for both passes)
+  add(stack, slots) {
     if (!stack) return 0;
     // (an item this game doesn't have is not taken - whoever offered it drops it, and dropItem lets it go: one in the
     // inventory broke the hand, the hotbar and every use each tick, "interaction / render: reading 'tool' / 'block'",
@@ -416,9 +565,11 @@ class Inventory {
     if (!ITEMS[stack.id] || !(stack.count > 0)) { const f = knownStack(stack, null, 'inventory'); if (!f) return stack.count > 0 ? stack.count : 0; stack = f; }
     let n = stack.count;
     const ms = maxStack(stack.id);
-    const order = [];
-    for (let i = 0; i < 36; i++) order.push(i);
-    for (const i of order) {
+    const order = slots || [];
+    if (!slots) for (let i = 0; i < 36; i++) order.push(i);
+    // onto a stack of it: the selected slot's, the offhand's, then the rest (vanilla getSlotWithRemainingSpace - picked
+    // up torches went into the inventory past the offhand's)
+    for (const i of slots ? order : [this.sel, 40, ...order]) {
       const s = this.slots[i];
       if (s && sameKind(s, stack) && s.count < ms && !ITEMS[s.id].durability) { const k = Math.min(n, ms - s.count); s.count += k; n -= k; if (!n) return 0; }
     }
@@ -471,7 +622,9 @@ class Player extends Living {
   swing() { if (this.swingT <= 3) this.swingT = 6; }
   get creative() { return this.game.mode === 'creative' || this.game.mode === 'spectator'; }
   get spectator() { return this.game.mode === 'spectator'; }
-  eye() { return this.pose === 'swim' ? 0.4 : this.sneaking && !this.flying ? 1.27 : 1.62; }
+  // (asleep: vanilla's sleeping pose has the eyes 0.2 up - they were a standing player's, in the block two above the
+  // bed, and a block there choked the player awake: "睡觉扣血", "刚躺下就被弹起", feedback 11-03..11)
+  eye() { return this.game && this.game.sleeping && this === this.game.player ? 0.2 : this.pose === 'swim' ? 0.4 : this.sneaking && !this.flying ? 1.27 : 1.62; }
   reduceDamage(a, src) {
     if (this.creative && src && src.type !== 'void') return 0;
     // protection enchantments (they also work on falls, fire and drowning): 4% per point, at most 80%
@@ -484,7 +637,7 @@ class Player extends Living {
         const s = this.inv.slots[i]; if (!s || !ITEMS[s.id].durability) continue;
         let n = 0; for (let k = 0; k < wear; k++) if (!unbreakingSkips(s, true)) n++;
         s.dmg = (s.dmg || 0) + n;
-        if (s.dmg >= ITEMS[s.id].durability) { this.inv.slots[i] = null; Sound.block('break', 'metal', this.pos); }
+        if (s.dmg >= ITEMS[s.id].durability) { this.inv.slots[i] = null; Sound.ev('entity.item.break', this.pos, 0.8, 0.8 + Math.random() * 0.4); }
       }
     }
     // vanilla's CombatRules: toughness keeps more of the armour against big hits
@@ -528,8 +681,9 @@ class Player extends Living {
   // hunger, regeneration and the arm's swing (also while riding)
   hungerTick() {
     const cr = this.creative;
-    // hunger
-    if (!cr) {
+    // hunger (on a server its own: food, saturation and health come from it - counted here as well, the food bar
+    // went down where the server keeps it full, a minigame's lobby and games, 11-07)
+    if (!cr && !this.game.net) {
       // vanilla peaceful: regenerate health every second and food every half second
       if (this.game.difficulty === 0) {
         if (this.age % 20 === 0 && this.health < this.maxHealth) this.health = Math.min(this.maxHealth, this.health + 1);
@@ -553,6 +707,8 @@ class Player extends Living {
     if (this.deathTime > 0) { this.deathTime++; return; }
     const cr = this.creative;
     if (!cr && this.flying) this.flying = false;
+    // (shift held, also while flying - no crouch pose then: vanilla isShiftKeyDown keeps slime from bouncing)
+    this.sneakHeld = !!input.sneak;
     // vanilla swimming: start by sprinting with the eyes under water, keep it while sprinting in water
     const eyeWater = this.world.waterAt(Math.floor(this.pos[0]), Math.floor(this.pos[1] + this.eye()), Math.floor(this.pos[2]));
     if (this.flying) this.swimming = false;
@@ -608,7 +764,7 @@ class Player extends Living {
       this.fallDist = 0;
     } else {
       if (input.jump && this.onGround && !this.inWater && !this.inLava) {
-        this.vel[1] = 0.42 + effectJumpBoost(this);
+        this.vel[1] = 0.42 * jumpFactorOf(this) + effectJumpBoost(this); // (honey: half)
         if (this.sprinting) { this.vel[0] += -Math.sin(this.yaw) * 0.2; this.vel[2] += -Math.cos(this.yaw) * 0.2; this.exhaust(0.2); }
         else this.exhaust(0.05);
         this.jumpT = 0;
@@ -628,14 +784,14 @@ class Player extends Living {
         // (only a step a jump clears - vanilla's auto-jump won't try a fence or wall, 1.5 high)
         blockBoxes(this.world, bx + 0.01, by + 0.01, bz + 0.01, bx + 0.99, by + 0.99, bz + 0.99, _boxes);
         let top = by; for (const b of _boxes) if (b[0] < bx + 1 && b[3] > bx && b[2] < bz + 1 && b[5] > bz) top = Math.max(top, b[4]);
-        if (solid(by) && !solid(by + 1) && !solid(by + 2) && top <= by + 1.01) { this.vel[1] = 0.42; this.exhaust(0.05); }
+        if (solid(by) && !solid(by + 1) && !solid(by + 2) && top <= by + 1.01) { this.vel[1] = 0.42 * jumpFactorOf(this); this.exhaust(0.05); }
       }
     }
     // walking distance & footsteps
     const dx = this.pos[0] - this.prev[0], dz = this.pos[2] - this.prev[2];
     if (this.sprinting && this.onGround && !this.inWater) {
       const bid = this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2]));
-      if (bid && BLOCKS[bid].shape !== SH_LIQUID) this.game.particles.spawn('block', this.pos[0] + (Math.random() - 0.5) * 0.6, this.pos[1] + 0.1, this.pos[2] + (Math.random() - 0.5) * 0.6, -dx * 2, 0.15, -dz * 2, { id: bid, meta: this.world.getMeta(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2])), tint: BLOCKS[bid].tint ? this.game.tintAt(Math.floor(this.pos[0]), Math.floor(this.pos[2]), BLOCKS[bid].tint) : null });
+      if (bid && BLOCKS[bid].shape !== SH_LIQUID) this.game.particles.spawn('block', this.pos[0] + (Math.random() - 0.5) * 0.6, this.pos[1] + 0.1, this.pos[2] + (Math.random() - 0.5) * 0.6, -dx * 2, 0.15, -dz * 2, { id: bid, meta: this.world.getMeta(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2])), tint: this.game.blockTintAt(Math.floor(this.pos[0]), Math.floor(this.pos[2]), bid, this.world.getMeta(Math.floor(this.pos[0]), Math.floor(this.pos[1] - 0.2), Math.floor(this.pos[2]))) });
     }
     const dist = Math.hypot(dx, dz);
     if (this.onGround && !this.flying) {
@@ -647,9 +803,14 @@ class Player extends Living {
         if (id && BLOCKS[id]) Sound.block('step', BLOCKS[id].sound, [this.pos[0], this.pos[1], this.pos[2]]);
       }
     } else if (this.inWater) {
-      // vanilla: a swim sound every ~1 block moved through water
-      this.swimDist = (this.swimDist || 0) + Math.hypot(dx, this.pos[1] - this.prev[1], dz);
-      if (this.swimDist > 1.2) { this.swimDist = 0; Sound.ev('entity.player.swim', null, 0.35 * Math.min(1, Math.hypot(dx, dz) * 3 + 0.1), 1 + (Math.random() - Math.random()) * 0.4); }
+      // vanilla Entity.applyMovementEmissionAndPlaySound: 0.6 x the distance across (not up and down - bobbing at the
+      // top counted, and every 1.2 blocks: too often), a swim sound each 1 of it (~1.7 blocks); waterSwimSound's volume
+      this.swimDist = (this.swimDist || 0) + dist * 0.6;
+      if (this.swimDist > 1) {
+        this.swimDist = 0;
+        const v = this.vel;
+        Sound.ev('entity.player.swim', null, Math.min(1, Math.sqrt(v[0] * v[0] * 0.2 + v[1] * v[1] + v[2] * v[2] * 0.2) * 0.35), 1 + (Math.random() - Math.random()) * 0.4);
+      }
     }
     // view bobbing
     this.prevBob = this.bob; this.prevBobAmt = this.bobAmt;
@@ -673,6 +834,61 @@ const WATER_MOBS = /^(cod|salmon|pufferfish|tropical_fish|squid|glow_squid|dolph
 const SINKING_MOBS = /^(zombie|zombie_villager|husk|drowned|giant|skeleton|stray|bogged|parched|wither_skeleton|zombified_piglin)$/;
 // the undead breathe under water (vanilla tag can_breathe_under_water: #undead) - sunk, they drowned in 15 s
 const UNDEAD_MOBS = /^(zombie|zombie_villager|husk|drowned|zombified_piglin|zombie_horse|zombie_nautilus|camel_husk|skeleton|stray|bogged|parched|wither_skeleton|skeleton_horse|phantom|wither|zoglin)$/;
+// the nearest a zombie goes for besides players (vanilla Zombie's target goals): villagers and wandering traders even
+// behind walls, iron golems in sight, baby turtles on land
+function zombiePrey(m) {
+  let best = null, bd = 16;
+  for (const e of m.game.entities) {
+    if (e === m || e.dead || e.deathTime || !(e instanceof Living)) continue;
+    const vil = e.type === 'villager' || e.type === 'wandering_trader';
+    if (!vil && e.type !== 'iron_golem' && !(e.type === 'turtle' && e.baby && !e.inWater)) continue;
+    const d = m.distTo(e);
+    if (d < bd && (vil || m.canSee(e))) { best = e; bd = d; }
+  }
+  return best;
+}
+// A cell's path type as vanilla WalkNodeEvaluator.getPathTypeFromState, coarsely: 0 open, 1 blocked (fences, walls,
+// doors, rails, leaves and cocoa too: each walkable on top), 2 water, 3 lava or fire (magma, lit campfires), 4 hurts
+// (cactus, berry bush, wither rose, dripstone), 5 the rest (trapdoors, lily pads, big dripleaf, honey, powder snow).
+// Open: no collision, or one of the low or thin solid blocks vanilla lets a path through (isPathfindable LAND; slabs,
+// stairs, farmland, paths, chests and the like say no)
+const PATH_OPEN_SOLID = /carpet$|candle$|^(ladder|scaffolding|daylight_detector|turtle_egg|pitcher_crop|item_frame|glow_item_frame)$/;
+const PATH_TYPE = new Int8Array(MAX_BLOCKS).fill(-1); // (by id; -2: by its state)
+function pathTypeOf(id) {
+  const b = BLOCKS[id], k = (b && b.key) || '';
+  if (!b) return 1;
+  if (IS_FLUID[id]) return id === LAVA || FLUID_MOD[id] === 2 ? 3 : 2;
+  if (b.waterlogged) return 2;
+  if (/^(fire|soul_fire|magma_block|lava_cauldron)$/.test(k)) return 3;
+  if (/^(cactus|sweet_berry_bush|wither_rose|pointed_dripstone|sulfur_spike)$/.test(k)) return 4;
+  if (b.trapdoor || /trapdoor$|^(lily_pad|big_dripleaf|honey_block|powder_snow)$/.test(k)) return 5;
+  if (/campfire$/.test(k) || b.gate) return -2;
+  if (b.solid ? !PATH_OPEN_SOLID.test(k) : /rail$|^cocoa$/.test(k)) return 1;
+  return 0;
+}
+function pathTypeAt(w, x, y, z) {
+  const id = w.getBlock(x, y, z);
+  if (!id) return 0;
+  let t = PATH_TYPE[id];
+  if (t === -1) t = PATH_TYPE[id] = pathTypeOf(id);
+  if (t === -2) {
+    const s = BLOCKS[id].states && BLOCKS[id].states[w.getMeta(x, y, z)];
+    if (!BLOCKS[id].gate) return s && s.lit === 'true' ? 3 : 1;
+    if (!s || s.open !== 'true') return 1;
+    t = 0;
+  }
+  return t === 0 && w.isWaterlogged(x, y, z) ? 2 : t;
+}
+// vanilla getPathTypeStatic(...) === WALKABLE: the cell open, the one below blocked, and no water, lava, fire or
+// harmful plant in the ring of cells around it, a level below to one above (checkNeighbourBlocks)
+function walkableAt(w, x, y, z) {
+  if (pathTypeAt(w, x, y, z) !== 0 || pathTypeAt(w, x, y - 1, z) !== 1) return false;
+  for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+    if (!dx && !dz) continue;
+    for (let dy = -1; dy <= 1; dy++) { const t = pathTypeAt(w, x + dx, y + dy, z + dz); if (t >= 2 && t <= 4) return false; }
+  }
+  return true;
+}
 const MOB_TYPES = {
   pig: { cn: '猪', hp: 10, w: 0.9, h: 0.9, speed: 0.25, model: 'pig', passive: true, food: 'carrot', drops: [['porkchop', 1, 3, 'cooked_porkchop']], scale: 1 },
   cow: { cn: '牛', hp: 10, w: 0.9, h: 1.4, speed: 0.2, model: 'cow', passive: true, food: 'wheat', drops: [['beef', 1, 3, 'cooked_beef'], ['leather', 0, 2]], scale: 1 },
@@ -726,7 +942,7 @@ class Mob extends Living {
       const n = mn + Math.floor(r() * (mx - mn + 1)) + (src && src.looting ? Math.floor(r() * (src.looting + 1)) : 0);
       if (n > 0) this.game.dropItem(this.pos[0], this.pos[1] + 0.5, this.pos[2], makeStack(this.fire > 0 && cooked ? cooked : k, n));
     }
-    if (this.type === 'sheep' && !this.sheared) this.game.dropItem(this.pos[0], this.pos[1] + 0.5, this.pos[2], makeStack(128 + this.woolColor, 1));
+    if (this.type === 'sheep' && !this.sheared) this.game.dropItem(this.pos[0], this.pos[1] + 0.5, this.pos[2], makeStack(woolKey(this.woolColor), 1));
     if (this.type === 'creeper' && src && src.type === 'arrow' && Math.random() < 0.2) this.game.dropItem(this.pos[0], this.pos[1] + 0.5, this.pos[2], makeStack('tnt', 1));
     this.game.onMobKilled(this, src);
   }
@@ -746,7 +962,7 @@ class Mob extends Living {
     this.baseTick();
     if (this.deathTick()) return;
     const g = this.game, p = g.player, T = this.T;
-    let fwd = 0, jump = false, mod = 1;
+    let fwd = 0, jump = false, mod = 1, strafe = 0;
     let lookAt = null;
     const dP = this.distTo(p);
     const day = (T.burns || this.type === 'spider') && g.isDay(); // (only those two ask - it was worked out for every mob)
@@ -765,13 +981,16 @@ class Mob extends Living {
       // vanilla NearestAttackableTargetGoal / HurtByTargetGoal (mustSee): a player is picked out only in sight, and a
       // target is let go after 3 s out of sight (TargetGoal.unseenMemoryTicks, 60) - zombies took up a player through
       // walls and kept him as long as he was near
+      // (a zombie after a villager turns to a player it sees: the player's goal comes first)
       if (this.type === 'spider' && day && !this.target) { }
-      else if (!this.target && playerOk && dP < seenWithin(p, 16) && this.sees(p)) this.target = p;
-      if (this.target && (this.target.dead || this.target.deathTime > 0 || (this.target === p && (!playerOk || dP > 24)))) this.target = null;
+      else if ((!this.target || this.target === this.prey) && playerOk && dP < seenWithin(p, 16) && this.sees(p)) this.target = p;
+      if (this.target && (this.target.dead || this.target.deathTime > 0 || (this.target === p && (!playerOk || dP > 24)) || (this.target !== p && this.distTo(this.target) > 24))) this.target = null;
       if (this.type === 'spider' && day && this.target && !this.provoked && this.age % 100 === 0) this.target = null;
+      // vanilla Zombie: villagers and wandering traders (seen or not), iron golems in sight, baby turtles on land
+      if (!this.target && (this.type === 'zombie' || this.type === 'zombie_villager') && (this.age + this.id) % 10 === 0) this.target = this.prey = zombiePrey(this);
       // (unseenT starts again with every new target - the target's setter)
       const t0 = this.target;
-      if (t0) { if (this.sees(t0)) this.unseenT = 0; else if (++this.unseenT > 60) this.target = null; }
+      if (t0) { if ((t0 === this.prey && (t0.type === 'villager' || t0.type === 'wandering_trader')) || this.sees(t0)) this.unseenT = 0; else if (++this.unseenT > 60) this.target = null; }
     }
     if (this.target) {
       const t = this.target;
@@ -780,15 +999,25 @@ class Mob extends Living {
       lookAt = t;
       if (T.ranged) {
         this.turnTo(want, 0.3);
-        if (d > 10) fwd = 1; else if (d < 5) fwd = -0.6;
-        if (this.attackCd <= 0 && d < 16 && this.sees(t)) { this.shoot(t); this.attackCd = 40 + Math.floor(Math.random() * 20); }
+        // vanilla RangedBowAttackGoal: walks up until within 15 blocks and in sight for a second, then strafes round the
+        // target - turning about or the other way now and then, backing off within 7.5 and coming on past 13 (it only
+        // walked straight to 10 and backed off under 5)
+        const seen = this.sees(t);
+        this.seeT = seen ? Math.max(0, this.seeT || 0) + 1 : Math.min(0, this.seeT || 0) - 1;
+        if (d <= 15 && this.seeT >= 20) {
+          this.strafeT = (this.strafeT ?? -1) + 1;
+          if (this.strafeT >= 20) { if (Math.random() < 0.3) this.strafeCw = !this.strafeCw; if (Math.random() < 0.3) this.strafeBack = !this.strafeBack; this.strafeT = 0; }
+          if (d > 13) this.strafeBack = false; else if (d < 7.5) this.strafeBack = true;
+          fwd = this.strafeBack ? -0.5 : 0.5; strafe = this.strafeCw ? 0.5 : -0.5;
+        } else { fwd = 1; this.strafeT = -1; }
+        if (this.attackCd <= 0 && d < 16 && seen) { this.shoot(t); this.attackCd = 40 + Math.floor(Math.random() * 20); }
       } else if (this.type === 'creeper') {
         this.turnTo(want, 0.4);
         // vanilla SwellGoal: lit within 3 blocks of a target it sees, it swells on while that one stays within 7 and in
         // sight, and back down otherwise - out of sight it went on and blew up behind the wall
         const dt = this.distTo(t);
         if (dt < 3 && this.sees(t)) { if (this.fuse < 0) { this.fuse = 0; Sound.fuse(this.pos); } }
-        else if (this.fuse >= 0 && (dt > 7 || !this.sees(t))) this.fuse = Math.max(-1, this.fuse - 2);
+        else if (this.fuse >= 0 && !this.ignited && (dt > 7 || !this.sees(t))) this.fuse = Math.max(-1, this.fuse - 2);
         if (this.fuse < 0) fwd = 1;
       } else {
         this.turnTo(want, 0.4);
@@ -799,7 +1028,7 @@ class Mob extends Living {
         const reach = this.w / 2 + t.w / 2 + 0.6, base = Math.min(this.pos[1], this.jumpFromY ?? this.pos[1]);
         if (d < reach && t.pos[1] < base + this.h && t.pos[1] + t.h > base && this.attackCd <= 0) {
           this.attackCd = 20; this.swingT = 6;
-          t.hurt(T.attack, { type: 'mob', attacker: this, knockFrom: this.pos });
+          this.hitLanded = t.hurt(T.attack, { type: 'mob', attacker: this, knockFrom: this.pos });
         }
       }
     } else if (this.panic > 0) {
@@ -813,11 +1042,16 @@ class Mob extends Living {
         lookAt = p;
         this.turnTo(Math.atan2(-(p.pos[0] - this.pos[0]), -(p.pos[2] - this.pos[2])), 0.3);
         fwd = 1;
-      } else if (dP < 8 && Math.random() < 0.02) lookAt = p;
+      } else {
+        // vanilla LookAtPlayerGoal: a 2% chance a tick to start, then it keeps looking 40-79 ticks while the player stays
+        // in range (it looked for that one tick only and the head turned straight back - cows, pigs, sheep hardly moved it)
+        if (!(this.lookT > 0) && dP < 8 && Math.random() < 0.02) this.lookT = 40 + Math.floor(Math.random() * 40);
+        if (this.lookT > 0) { if (dP < 8) { this.lookT--; lookAt = p; } else this.lookT = 0; }
+      }
     }
     // (SwellGoal with no target: back down too - one lit at a player who then went creative, died or got away blew up
     // all the same, 2026-11-04 review)
-    if (this.fuse >= 0 && !this.target && this.type === 'creeper') this.fuse = Math.max(-1, this.fuse - 2);
+    if (this.fuse >= 0 && !this.target && this.type === 'creeper' && !this.ignited) this.fuse = Math.max(-1, this.fuse - 2); // (lit by flint and steel: on to the end)
     if (this.creeperTick()) return;
     // in water: up (vanilla FloatGoal) - not the zombie and skeleton kinds, which sink
     const sinks = this.inWater && SINKING_MOBS.test(this.type);
@@ -830,6 +1064,13 @@ class Mob extends Living {
         if (Math.hypot(dx, dz) < 0.8 || this.wanderT <= 0) this.wander = null;
         else { this.turnTo(Math.atan2(-dx, -dz), 0.25); fwd = 1; }
       } else if (Math.random() < (this.panic > 0 ? 1 : 0.008)) this.pickWander(10);
+    }
+    // strafing (skeletons): vanilla MoveControl.strafe only steps where the path type is WALKABLE (walkableAt: not off
+    // any edge, nor into water, fire or a cactus, nor next to them); elsewhere it walks straight at its target instead
+    if (strafe) {
+      const s = Math.sin(this.yaw), c = Math.cos(this.yaw), mx = -s * fwd + c * strafe, mz = -c * fwd - s * strafe, ml = Math.hypot(mx, mz) || 1, r = this.w / 2 + 0.5;
+      const fx = Math.floor(this.pos[0] + mx / ml * r), fz = Math.floor(this.pos[2] + mz / ml * r), fy = Math.floor(this.pos[1]);
+      if (!walkableAt(this.world, fx, fy, fz)) { fwd = 1; strafe = 0; }
     }
     // obstacle avoidance: don't walk off cliffs or into lava
     if (fwd > 0) {
@@ -854,7 +1095,7 @@ class Mob extends Living {
     if (jump && this.onGround && !(sinks && this.waterDepth() > 0.4)) { this.vel[1] = 0.42; this.jumpFromY = this.pos[1]; }
     else if (this.onGround) this.jumpFromY = undefined;
     const speed = T.speed * T.speed * mod * (this.fuse >= 0 ? 0.4 : 1);
-    this.travel(fwd, 0, speed, jump);
+    this.travel(fwd, strafe, speed, jump);
     // body/head rotation
     let d = this.yaw - this.bodyYaw; while (d > Math.PI) d -= Math.PI * 2; while (d < -Math.PI) d += Math.PI * 2;
     this.bodyYaw += d * 0.3;
@@ -895,7 +1136,7 @@ class Mob extends Living {
       // 5 -> 29 22 15 9 4 at 1-5 blocks) and its craters on dry ground changed (stone 26-30 -> 7-9), 2026-11-04 review)
       const w = this.world, fx = Math.floor(this.pos[0]), fz = Math.floor(this.pos[2]);
       const wet = w.waterAt(fx, Math.floor(this.pos[1]), fz) || (!this.onGround && w.waterAt(fx, Math.floor(this.pos[1] - 0.2), fz));
-      this.game.explode(this.pos[0], this.pos[1] + 0.8, this.pos[2], 3, this, wet);
+      this.game.explode(this.pos[0], this.pos[1] + 0.8, this.pos[2], 3, this, wet, false, true);
       return true;
     }
     return false;
@@ -911,7 +1152,7 @@ class Mob extends Living {
     const w = this.world, fx = Math.floor(x), fz = Math.floor(z);
     for (let y = y0 + 2; y >= y0 - 4; y--) {
       const b = BLOCKS[w.getBlock(fx, y - 1, fz)];
-      if (!b || !b.solid || BLOCKS[w.getBlock(fx, y, fz)].solid) continue;
+      if (!b || !b.solid || BLOCKS[w.getBlock(fx, y, fz)]?.solid) continue;
       return w.waterAt(fx, y, fz) || w.waterAt(fx, y - 1, fz) || w.getBlock(fx, y, fz) === LAVA ? null : y;
     }
     return null;
@@ -995,6 +1236,12 @@ class Mob extends Living {
         P.rarm = { rx: raise + (this.type === 'zombie' ? 0 : r * 0.5) + (this.swingT > 0 ? Math.sin(this.swingT / 6 * Math.PI) * 0.6 : 0) };
         P.larm = { rx: raise + (this.type === 'zombie' ? Math.sin(this.age * 0.067 + 1) * 0.05 : l * 0.5) };
         P.rleg = { rx: l }; P.lleg = { rx: r };
+        // a skeleton after something holds its bow up and draws: vanilla HumanoidModel's BOW_AND_ARROW pose, both arms
+        // aimed with the head (yRot -0.1 / 0.5 and xRot -pi/2 plus the head's, negated in this model's space)
+        if (this.type === 'skeleton' && this.target) {
+          P.rarm = { ry: 0.1 + this.headYaw, rx: Math.PI / 2 + this.pitch, zx: true };
+          P.larm = { ry: -0.5 + this.headYaw, rx: Math.PI / 2 + this.pitch, zx: true };
+        }
         break;
       }
       case 'creeper': P.leg0 = { rx: l }; P.leg1 = { rx: r }; P.leg2 = { rx: r }; P.leg3 = { rx: l }; break;
@@ -1005,11 +1252,15 @@ class Mob extends Living {
         break;
       }
       case 'spider': {
+        // vanilla SpiderModel: the right legs' yRot / zRot (front to hind) and its walk, mirrored for the left legs; in
+        // this model's space yRot is negated and the order is vanilla's (zx). The front legs turned backwards and the
+        // hind ones forwards before, so they crossed
+        const Y = [-Math.PI / 4, -Math.PI / 8, Math.PI / 8, Math.PI / 4], Z = [-Math.PI / 4, -0.58119464, -0.58119464, -Math.PI / 4];
+        const PH = [Math.PI * 1.5, Math.PI / 2, Math.PI, 0];
         for (let i = 0; i < 8; i++) {
-          const right = i % 2 === 0, row = i >> 1;
-          const spread = [0.7, 0.3, -0.3, -0.7][row];
-          const ph = Math.cos(swing * 2 + (row % 2 ? Math.PI : 0) + (right ? 0 : Math.PI)) * 0.4 * amt;
-          P['leg' + i] = { ry: (right ? -spread : spread) + ph, rz: right ? -0.6 + Math.abs(ph) * 0.3 : 0.6 - Math.abs(ph) * 0.3 };
+          const right = i % 2 === 0, row = i >> 1, s = right ? 1 : -1;
+          const sw = -Math.cos(swing * 2 + PH[row]) * 0.4 * amt, st = Math.abs(Math.sin(swing + PH[row]) * 0.4) * amt;
+          P['leg' + i] = { ry: -s * (Y[row] + sw), rz: s * (Z[row] + st), zx: true };
         }
         break;
       }
@@ -1050,7 +1301,27 @@ function knownStack(st, game, what) {
   if (g && g.reportError && !seen.has(key) && seen.size < 50) { seen.add(key); g.reportError(what, new Error('unknown item ' + id + ' from ' + from), true); }
   return null;
 }
+// the items fire doesn't hurt (vanilla damage_resistant #is_fire)
+const ITEM_FIREPROOF = /^(ancient_debris|netherite_(axe|block|boots|chestplate|helmet|hoe|horse_armor|ingot|leggings|nautilus_armor|pickaxe|scrap|shovel|spear|sword))$/;
 class ItemEntity extends Entity {
+  // (north, south, west, east, up: x y z offset, axis, sign)
+  static SIDES = [[0, 0, -1, 2, -1], [0, 0, 1, 2, 1], [-1, 0, 0, 0, -1], [1, 0, 0, 0, 1], [0, 1, 0, 1, 1]];
+  // vanilla Entity.moveTowardsClosestSpace: of the four sides and up whose block isn't a full cube, the one closest to
+  // the item's middle; its speed that way 0.1-0.3, the rest three quarters of what it was (up when every side is shut)
+  closestSpace() {
+    const x = this.pos[0], y = this.pos[1] + this.h / 2, z = this.pos[2], bx = Math.floor(x), by = Math.floor(y), bz = Math.floor(z);
+    const f = [x - bx, y - by, z - bz], v = this.vel;
+    let best = 4, dist = Infinity;
+    for (let i = 0; i < 5; i++) {
+      const [dx, dy, dz, ax, s] = ItemEntity.SIDES[i];
+      if (fullCollisionAt(this.world, bx + dx, by + dy, bz + dz)) continue;
+      const dd = s > 0 ? 1 - f[ax] : f[ax];
+      if (dd < dist) { dist = dd; best = i; }
+    }
+    const [, , , ax, s] = ItemEntity.SIDES[best];
+    v[0] *= 0.75; v[1] *= 0.75; v[2] *= 0.75;
+    v[ax] = s * (Math.random() * 0.2 + 0.1);
+  }
   constructor(game, x, y, z, stack, vel) {
     super(game, x, y, z, 0.25, 0.25);
     // (not one this game can show: gone at once - see knownStack; a room's placeholder stays, its item comes later)
@@ -1073,6 +1344,26 @@ class ItemEntity extends Entity {
     return out;
   }
   static cell(x, y, z) { return (Math.floor(x / 2) & 2047) + (Math.floor(z / 2) & 2047) * 2048 + (Math.floor(y / 2) & 255) * 4194304; }
+  // fire, soul fire and cactus wear it out (vanilla ItemEntity: 5 health; a fire block it is in hurts 1 a tick - soul
+  // fire 2 - and sets it burning for 8 s, 1 a second; a cactus 1 a tick). Netherite things don't burn. True: gone
+  // (every tick, as vanilla's applyEffectsFromBlocksForLastMovements; the box bounds inline, no array)
+  burns() {
+    const w = this.world, p = this.pos, hw = this.w / 2;
+    const x1 = Math.floor(p[0] + hw - 1e-5), y1 = Math.floor(p[1] + this.h - 1e-5), z1 = Math.floor(p[2] + hw - 1e-5);
+    let dmg = 0;
+    for (let x = Math.floor(p[0] - hw + 1e-5); x <= x1; x++) for (let y = Math.floor(p[1] + 1e-5); y <= y1; y++) for (let z = Math.floor(p[2] - hw + 1e-5); z <= z1; z++) {
+      const id = w.getBlock(x, y, z);
+      if (id === 37) dmg += 1;
+      else if ((id === 171 || (id && id === BID.soul_fire)) && !this.fireproof()) { dmg += id === 171 ? 1 : 2; this.burn = 160; }
+    }
+    if (this.burn > 0) { this.burn--; if (this.inWater) this.burn = 0; else if (this.burn % 20 === 0) dmg += 1; }
+    if (!dmg) return false;
+    this.health = (this.health ?? 5) - dmg;
+    if (this.health > 0) return false;
+    this.dead = true;
+    return true;
+  }
+  fireproof() { const id = this.stack.id; if (this.fpId !== id) { this.fpId = id; this.fp = ITEM_FIREPROOF.test(ITEMS[id].key); } return this.fp; }
   tick() {
     this.savePrev();
     this.age++;
@@ -1087,14 +1378,21 @@ class ItemEntity extends Entity {
     // (vanilla ItemEntity.tick: one lying still on the ground moves every 4th tick only; the push out of a block put
     // into it waits for that tick here too - a tick or three later than vanilla's - as thousands lying about each ran
     // the collision every tick)
-    if (!this.onGround || v[0] * v[0] + v[2] * v[2] > 1e-5 || (this.age + this.id) % 4 === 0) {
-      if (this.collides(this.box())) { this.pos[1] += 0.1; v[1] = 0.1; }
-      this.move(v[0], v[1], v[2]);
+    // stuck in a block (dropped into one, a block put where it lay, taken off an item frame against the wall): pushed
+    // toward the closest open side, and that tick it goes through what holds it (vanilla ItemEntity.tick: noPhysics
+    // while its box less 1e-7 collides, moveTowardsClosestSpace). It went up 0.1 a tick through everything above until
+    // free - out on top of a wall, through a ceiling (the user, 11-13: drops going through walls)
+    const b = this.box(), stuck = this.collides([b[0] + 1e-7, b[1] + 1e-7, b[2] + 1e-7, b[3] - 1e-7, b[4] - 1e-7, b[5] - 1e-7]);
+    if (stuck) this.closestSpace();
+    if (stuck || !this.onGround || v[0] * v[0] + v[2] * v[2] > 1e-5 || (this.age + this.id) % 4 === 0) {
+      if (stuck) { this.pos[0] += v[0]; this.pos[1] += v[1]; this.pos[2] += v[2]; this.onGround = false; }
+      else this.move(v[0], v[1], v[2]);
       const f = this.onGround ? 0.6 * 0.98 : 0.98;
       v[0] *= f; v[2] *= f; v[1] *= 0.98;
-      if (this.onGround) v[1] *= -0.5;
+      if (this.onGround && v[1] < 0) v[1] *= -0.5; // (not one bouncing off a bed, as vanilla)
     }
     if (this.inLava) { this.dead = true; Sound.fizz(this.pos); return; }
+    if (this.burns()) return;
     if (this.age > 6000) { this.dead = true; return; }
     // merge with the stacks of the same kind nearby that fit (vanilla mergeWithNeighbours / ItemEntity.merge: the one
     // left keeps the younger age and the longer pick-up delay)
@@ -1125,7 +1423,7 @@ class ItemEntity extends Entity {
 }
 
 class FallingBlock extends Entity {
-  constructor(game, x, y, z, id, meta) { super(game, x + 0.5, y, z + 0.5, 0.98, 0.98); this.blockId = id; this.meta = meta; }
+  constructor(game, x, y, z, id, meta) { super(game, x + 0.5, y, z + 0.5, 0.98, 0.98); this.blockId = id; this.meta = meta; this.y0 = y; }
   tick() {
     this.savePrev(); this.age++;
     this.vel[1] = (this.vel[1] - 0.04) * 0.98;
@@ -1138,7 +1436,17 @@ class FallingBlock extends Entity {
       let y = Math.floor(this.pos[1] + 0.5);
       const free = (yy) => { const c = this.world.getBlock(x, yy, z); return c === 0 || REPLACEABLE[c]; };
       for (let k = 0; k < 8 && this.onGround && !free(y) && SOLIDCUBE[this.world.getBlock(x, y, z)]; k++) y++; // (not on a torch: that breaks it, as in vanilla)
-      if (free(y)) { this.world.setBlock(x, y, z, this.blockId, this.meta); Sound.block('place', BLOCKS[this.blockId].sound, this.pos); }
+      // a falling stalactite's tip hurts what it lands in (FallingBlockEntity.causeFallDamage, setHurtsEntities)
+      if (this.hurts && this.onGround) {
+        const n = Math.ceil(this.y0 - this.pos[1] - 1), dmg = Math.min(Math.floor(n * this.hurts[0]), this.hurts[1]), bb = this.box();
+        if (dmg > 0) for (const e of [this.game.player, ...this.game.entities]) {
+          if (!(e instanceof Living) || e.dead || e.deathTime > 0) continue;
+          const eb = e.box();
+          if (eb[0] < bb[3] && eb[3] > bb[0] && eb[1] < bb[4] && eb[4] > bb[1] && eb[2] < bb[5] && eb[5] > bb[2]) e.hurt(dmg, { type: 'falling_stalactite' });
+        }
+      }
+      // (one that can't stand where it lands - a stalactite on the ground - breaks into its item, as vanilla's)
+      if (free(y) && (!this.game.supported || this.game.supported(x, y, z, this.blockId, this.meta))) { this.world.setBlock(x, y, z, this.blockId, this.meta); Sound.block('place', BLOCKS[this.blockId].sound, this.pos); }
       else this.game.dropItem(this.pos[0], this.pos[1], this.pos[2], makeStack(this.blockId, 1));
     }
   }
@@ -1176,12 +1484,24 @@ class Arrow extends Entity {
     if (ITEMS[this.snowball].key === 'egg' && Math.random() < 0.125) { const c = new Mob(this.game, 'chicken', this.pos[0], this.pos[1], this.pos[2]).makeBaby(); c.persistent = true; this.game.addEntity(c); }
   }
   updateRot() { const v = this.vel; this.yaw = Math.atan2(-v[0], -v[2]); this.pitch = Math.atan2(v[1], Math.hypot(v[0], v[2])); }
+  // a burning arrow (flame) lights the TNT it sticks in (vanilla TntBlock.onProjectileHit)
+  lightTnt(x, y, z) {
+    const g = this.game;
+    if (!(this.fire > 0) || this.snowball || g.net || g.p2pGuest || this.world.getBlock(x, y, z) !== 26) return;
+    // Projectile.mayInteract: a mob's arrow needs mob_griefing
+    if (this.shooter instanceof Mob && g.rule('mob_griefing') === false) return;
+    this.world.setBlock(x, y, z, 0, 0);
+    g.entities.push(new PrimedTNT(g, x, y, z));
+  }
   tick() {
     this.savePrev(); this.age++;
     if (this.stuck) {
       if (++this.life > 1200) this.dead = true;
       const sa = this.stuckAt;
-      if (this.world.getBlock(sa[0], sa[1], sa[2]) === 0) { this.stuck = false; }
+      // the block gone (air or water there now): it drops, its flight's speed all but lost (vanilla startFalling:
+      // x random 0-0.2 each way) - it flew on at its old speed
+      const sb = this.world.getBlock(sa[0], sa[1], sa[2]);
+      if (!sb || IS_FLUID[sb]) { this.stuck = false; this.life = 0; this.vel = this.vel.map((c) => c * Math.random() * 0.2); return; }
       if (this.fromPlayer && this.age > 10) {
         const p = this.game.player;
         // infinity / creative arrows can't be picked up (they go when touched in creative)
@@ -1218,6 +1538,7 @@ class Arrow extends Entity {
           if (this.snowball) { this.breakSnowball(); this.dead = true; return; }
           this.stuck = true; this.stuckAt = [Math.floor(nx), Math.floor(ny), Math.floor(nz)];
           Sound.arrowHit(this.pos);
+          this.lightTnt(...this.stuckAt);
           return;
         }
       }
@@ -1233,7 +1554,13 @@ class Arrow extends Entity {
           if (this.trident) dmg = 8 + (e.inWater ? 2.5 * enchLevel(this.stack, 'impaling') : 0);
           if (this.fire > 0 && !this.snowball && !e.fireproof && e instanceof Living) e.fire = Math.max(e.fire || 0, 100);
           if (this.snowball) { this.breakSnowball(); }
-          if (e.parts) { e.hurtPart(part, dmg, { type: 'arrow', attacker: this.shooter, player: this.fromPlayer }); Sound.arrowHit(this.pos); this.dead = true; return; }
+          if (e.parts) {
+            const src = { type: 'arrow', attacker: this.shooter, player: this.fromPlayer };
+            e.hurtPart(part, dmg, src); if (!this.snowball) Sound.arrowHit(this.pos);
+            // (a perched dragon: it bounces off back the way it came - vanilla's arrow deflection, x -0.1)
+            if (src.deflected && !this.snowball) { v[0] *= -0.1; v[1] *= -0.1; v[2] *= -0.1; this.updateRot(); (this.hitSet || (this.hitSet = new Set())).add(e); return; }
+            this.dead = true; return;
+          }
           const hit = e.hurt(dmg, { type: this.trident ? 'trident' : 'arrow', attacker: this.shooter, knockFrom: [this.pos[0] - v[0], 0, this.pos[2] - v[2]], knock: 0.3 + (this.punch || 0) * 0.6, player: this.fromPlayer,
             fire: this.fire > 0 && !this.snowball, speed2: v[0] * v[0] + v[1] * v[1] + v[2] * v[2] });
           if (hit && e.addEffect) {
@@ -1242,7 +1569,7 @@ class Arrow extends Entity {
             if (this.tip && ITEMS[this.tip.id].key === 'spectral_arrow') e.addEffect('glowing', 0, 200);
           }
           if (hit && this.onHit) this.onHit(e);
-          Sound.arrowHit(this.pos);
+          if (!this.snowball) Sound.arrowHit(this.pos); // (snowballs and eggs make no hit sound of their own: vanilla Snowball.onHit)
           (this.hitSet || (this.hitSet = new Set())).add(e);
           if (this.trident) return; // it bounces off and falls
           if (this.pierce > 0) { this.pierce--; continue; }
@@ -1254,8 +1581,8 @@ class Arrow extends Entity {
       if (id && BLOCKS[id].solid) {
         if (this.snowball) { this.breakSnowball(); this.dead = true; return; }
         this.stuck = true; this.stuckAt = [bx, by, bz];
-        if (id === 26 && this.shooter && this.shooter.fire > 0) { }
         Sound.arrowHit(this.pos);
+        this.lightTnt(bx, by, bz);
         return;
       }
       this.pos[0] = nx; this.pos[1] = ny; this.pos[2] = nz;
@@ -1283,10 +1610,12 @@ class Particles {
     switch (type) {
       case 'block': {
         const b = BLOCKS[extra.id];
-        p.layer = extra.layer ?? (b.texFn ? b.texFn.call(b, 0, extra.meta || 0) : b.particle);
+        p.layer = extra.layer ?? (b.texFn && !b.particleOwn ? b.texFn.call(b, 0, extra.meta || 0) : b.particle);
         p.us = 0.25; p.u0 = r() * 0.75; p.v0 = r() * 0.75;
         p.life = 4 / (r() * 0.9 + 0.1); p.grav = 0.04; p.size = 0.05 + r() * 0.05;
-        if (b.tint) { const t = extra.tint || [124, 189, 107]; p.col = t; }
+        // (the block's colour there: Game.blockTintAt - none given, it is looked up)
+        const t = extra.tint !== undefined ? extra.tint : b.tint && extra.layer == null ? this.game.blockTintAt(Math.floor(x), Math.floor(z), extra.id, extra.meta || 0) : null;
+        if (t) p.col = t;
         break;
       }
       case 'smoke': p.frames = 12; p.base = T('p_big_smoke_0'); p.life = 20 + r() * 20; p.size = 0.15 + r() * 0.15; p.grav = -0.002; p.col = [80, 80, 80]; break;
@@ -1305,6 +1634,8 @@ class Particles {
       case 'note': p.layer = T('p_note'); p.life = 20; p.size = 0.15; p.bright = true; p.col = extra.col; break;
       case 'damage': p.layer = T('p_damage'); p.life = 15; p.size = 0.1; p.grav = 0.02; break;
       case 'glint': p.layer = T('p_glint'); p.life = 20; p.size = 0.08; p.bright = true; break;
+      // a barrier's / light block's marker, the size of the block (BlockMarker: 80 ticks)
+      case 'marker': p.layer = extra.layer; p.life = 80; p.size = 0.5; break;
       // potion swirls round whoever has an effect, and splash potions' burst (vanilla SpellParticle: 8-40 ticks, the
       // sprite running through the effect frames, in the effects' colour). Missing, they came out as layer 0 - stone
       case 'effect': p.frames = 3; p.base = T('p_effect_0'); p.life = Math.floor(8 / (r() * 0.8 + 0.2)); p.size = 0.06 + r() * 0.04; p.col = extra.col || [255, 255, 255]; break;
@@ -1317,7 +1648,7 @@ class Particles {
     return p;
   }
   blockBreak(x, y, z, id, meta) {
-    const tint = BLOCKS[id].tint ? this.game.tintAt(x, z, BLOCKS[id].tint) : null;
+    const tint = this.game.blockTintAt(x, z, id, meta);
     for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) for (let k = 0; k < 4; k++) {
       const px = x + (i + 0.5) / 4, py = y + (j + 0.5) / 4, pz = z + (k + 0.5) / 4;
       this.spawn('block', px, py, pz, (px - x - 0.5) * 0.3 + (Math.random() - 0.5) * 0.05, (py - y - 0.5) * 0.3 + Math.random() * 0.1, (pz - z - 0.5) * 0.3, { id, meta, tint });
@@ -1328,7 +1659,7 @@ class Particles {
     const px = x + 0.5 + D[0] * 0.52 + (D[0] ? 0 : (Math.random() - 0.5) * 0.9);
     const py = y + 0.5 + D[1] * 0.52 + (D[1] ? 0 : (Math.random() - 0.5) * 0.9);
     const pz = z + 0.5 + D[2] * 0.52 + (D[2] ? 0 : (Math.random() - 0.5) * 0.9);
-    const tint = BLOCKS[id].tint ? this.game.tintAt(x, z, BLOCKS[id].tint) : null;
+    const tint = this.game.blockTintAt(x, z, id, meta);
     this.spawn('block', px, py, pz, D[0] * 0.05, 0.05 + D[1] * 0.05, D[2] * 0.05, { id, meta, tint });
   }
   pickupAnim(e, p) { this.pickups.push({ stack: { ...e.stack }, from: [...e.pos], t: 0, target: p }); }
@@ -1394,7 +1725,8 @@ class ExperienceOrb extends Entity {
     if (this.inWater) { v[0] *= 0.99; v[2] *= 0.99; if (v[1] < 0.06) v[1] += 5e-4; }
     else v[1] -= 0.03;
     if (this.inLava) { v[1] = 0.2; v[0] = (Math.random() - Math.random()) * 0.2; v[2] = (Math.random() - Math.random()) * 0.2; }
-    if (this.collides(this.box())) { this.pos[1] += 0.1; v[1] = 0.1; }
+    // (in a block: toward the closest open side, as a dropped item - vanilla ExperienceOrb.tick moveTowardsClosestSpace)
+    if (this.collides(this.box())) ItemEntity.prototype.closestSpace.call(this);
     // drift toward the player within 8 blocks
     if (p.deathTime === 0 && g.mode !== 'spectator') {   // (creative players too, like vanilla: players' feedback 2026-10-31)
       const dx = p.pos[0] - this.pos[0], dy = p.pos[1] + p.eye() / 2 - this.pos[1], dz = p.pos[2] - this.pos[2];

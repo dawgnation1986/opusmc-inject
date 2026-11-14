@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN"><!-- synced from v47685 by tools/sync_v47685.py -->
 <head><script>(function(){try{
 var W=window;if(W.__TOY_PERF__){return;}
 var P=W.performance;if(!P||!P.getEntriesByType){return;}
@@ -216,12 +216,12 @@ var arm=function(){try{
 }catch(e){flush("err",false);}};
 if(document.readyState==="complete"){arm();}
 else{W.addEventListener("load",arm,false);}
-}catch(e){}})();</script><!-- local offline copy: removed the redirect-to-bilibili guard for personal offline play -->
+}catch(e){}})();</script><!-- local offline copy: removed the redirect-to-bilibili guard -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>OpusMC 离线版 · 同步自线上 v41351</title>
+<title>OpusMC 离线版 · 同步自线上 v47685</title>
 <style>
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000;
     touch-action: none; overscroll-behavior: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
@@ -242,116 +242,135 @@ else{W.addEventListener("load",arm,false);}
 <canvas id="gl"></canvas>
 <canvas id="ui"></canvas>
 <input id="textinput" type="text" autocomplete="off" spellcheck="false">
-<div id="boot"><b>OpusMC</b><div id="bootbar"><i></i></div><div id="boottext">正在加载… 0%</div><div id="bootnote">离线同步版 · 源版本 v41351 · 2026-11-06</div></div>
+<div id="boot"><b>OpusMC</b><div id="bootbar"><i></i></div><div id="boottext">正在加载… 0%</div><div id="bootnote">离线同步版 · 源版本 v47685 · 2026-11-13</div></div>
 <script>
   // the loading bar: the game's scripts as they arrive (how many there are: counted in this page itself), then the
   // start-up (textures, the title world) creeping on until the title screen is up
   (function () {
     var bar = document.querySelector('#bootbar i'), txt = document.getElementById('boottext'), total = 90, got = 0, shown = 0;
-    try { fetch(location.href, { cache: 'force-cache' }).then(function (r) { return r.text(); }).then(function (t) { var n = (t.match(/<script src=/g) || []).length; if (n) total = n; }).catch(function () { }); } catch (e) { }
+    // (the tags counted with a pattern that is not itself one: the plain one counted this line too, one more than there
+    // are - the bar waited at 84 % for a script that never came, all through the start-up, 11-10; the mods' scripts,
+    // written in by mods.js, are added as they are written: self.BOOT_EXTRA)
+    var tag = new RegExp('<scr' + 'ipt src=', 'g');
+    try { fetch(location.href, { cache: 'force-cache' }).then(function (r) { return r.text(); }).then(function (t) { var n = (t.match(tag) || []).length; if (n) total = n; }).catch(function () { }); } catch (e) { }
     document.addEventListener('load', function (e) { if (e.target && e.target.tagName === 'SCRIPT' && e.target.src) got++; }, true);
-    (function step() {
-      var b = document.getElementById('boot'); if (!b || b.style.display === 'none') return;
-      var want = got < total ? 85 * got / total : 85 + 14 * (1 - Math.exp(-(performance.now() - (step.t || (step.t = performance.now()))) / 4000));
+    // (all the scripts in - window load - is the end of loading whatever was counted)
+    var loaded = false; addEventListener('load', function () { loaded = true; });
+    var t0 = 0;
+    // (drawn again by the game too as it starts up a step - game.js init: self.BOOT_STEP, BOOT_DRAW)
+    var draw = self.BOOT_DRAW = function () {
+      var b = document.getElementById('boot'); if (!b || b.style.display === 'none') return false;
+      var all = total + (self.BOOT_EXTRA || 0), more = !loaded && got < all;
+      var want = more ? 85 * got / all : 85 + 14 * (1 - Math.exp(-(performance.now() - (t0 || (t0 = performance.now()))) / 4000));
       shown = Math.max(shown, Math.min(99, want));
       bar.style.width = shown.toFixed(1) + '%';
-      txt.textContent = (got < total ? '正在加载… ' : '正在准备世界… ') + Math.floor(shown) + '%';
-      setTimeout(step, 100);
-    })();
+      txt.textContent = (more ? '正在加载… ' : (self.BOOT_STEP || '正在准备世界') + '… ') + Math.floor(shown) + '%';
+      return true;
+    };
+    (function step() { if (draw()) setTimeout(step, 100); })();
   })();
 </script>
 <div id="err"></div>
-<script src="js/assets.js?v=41351b"></script>
-<script src="js/font.js?v=41351b"></script>
-<script src="js/emoji.js?v=41351b"></script>
-<script src="js/texts.js?v=41351b"></script>
-<script src="js/util.js?v=41351b"></script>
-<script src="js/worldgen_data.js?v=41351b"></script>
-<script src="js/worldgen.js?v=41351b"></script>
-<script src="js/blockdata.js?v=41351b"></script>
-<script src="js/itemdata.js?v=41351b"></script>
-<script src="js/recipedata.js?v=41351b"></script>
-<script src="js/blocks.js?v=41351b"></script>
-<script src="js/world.js?v=41351b"></script>
-<script src="js/mesher.js?v=41351b"></script>
-<script src="js/models.js?v=41351b"></script>
-<script src="js/vmodels.js?v=41351b"></script>
-<script src="js/render.js?v=41351b"></script>
-<script src="js/render2.js?v=41351b"></script>
-<script src="js/shaders.js?v=41351b"></script>
-<script src="js/audio.js?v=41351b"></script>
-<script src="js/subtitles.js?v=41351b"></script>
-<script src="js/entity.js?v=41351b"></script>
-<script src="js/mobs2.js?v=41351b"></script>
-<script src="js/ui.js?v=41351b"></script>
-<script src="js/save.js?v=41351b"></script>
-<script src="js/game.js?v=41351b"></script>
-<script src="js/terrain2.js?v=41351b"></script>
-<script src="js/features.js?v=41351b"></script>
-<script src="js/trees.js?v=41351b"></script>
-<script src="js/structures_data.js?v=41351b"></script>
-<script src="js/structgen.js?v=41351b"></script>
-<script src="js/structtypes.js?v=41351b"></script>
-<script src="js/gen_worker.js?v=41351b"></script>
-<script src="js/structures.js?v=41351b"></script>
-<script src="js/nbt.js?v=41351b"></script>
-<script src="js/anvil.js?v=41351b"></script>
-<script src="js/export.js?v=41351b"></script>
-<script src="js/screens.js?v=41351b"></script>
-<script src="js/commands.js?v=41351b"></script>
-<script src="js/controls.js?v=41351b"></script>
-<script src="js/dims.js?v=41351b"></script>
-<script src="js/nether_mobs.js?v=41351b"></script>
-<script src="js/village_mobs.js?v=41351b"></script>
-<script src="js/merchant.js?v=41351b"></script>
-<script src="js/effects.js?v=41351b"></script>
-<script src="js/enchant.js?v=41351b"></script>
-<script src="js/workstations.js?v=41351b"></script>
-<script src="js/equip.js?v=41351b"></script>
-<script src="js/vehicles.js?v=41351b"></script>
-<script src="js/redstone.js?v=41351b"></script>
-<script src="js/itemuse.js?v=41351b"></script>
-<script src="js/entitydata.js?v=41351b"></script>
-<script src="js/etex.js?v=41351b"></script>
-<script src="js/emodel.js?v=41351b"></script>
-<script src="js/vmobs.js?v=41351b"></script>
-<script src="js/mobs_animals.js?v=41351b"></script>
-<script src="js/mobs_water.js?v=41351b"></script>
-<script src="js/mobs_hostile.js?v=41351b"></script>
-<script src="js/mobitems.js?v=41351b"></script>
-<script src="js/spawning.js?v=41351b"></script>
-<script src="js/draw2.js?v=41351b"></script>
-<script src="js/blockents.js?v=41351b"></script>
-<script src="js/decor.js?v=41351b"></script>
-<script src="js/items3.js?v=41351b"></script>
-<script src="js/specials.js?v=41351b"></script>
-<script src="js/raids.js?v=41351b"></script>
-<script src="js/cmdrun.js?v=41351b"></script>
-<script src="js/main.js?v=41351b"></script>
-<script src="js/touch.js?v=41351b"></script>
-<script src="js/perf.js?v=41351b"></script>
-<script src="js/netconfig.js?v=41351b"></script>
-<script src="js/net.js?v=41351b"></script>
-<script src="js/beacon.js?v=41351b"></script>
-<script src="js/cmdblock.js?v=41351b"></script>
-<script src="js/telemetry.js?v=41351b"></script>
-<script src="js/toy.js?v=41351b"></script>
-<script src="js/account.js?v=41351b"></script>
-<script src="js/capes.js?v=41351b"></script>
-<script src="js/skins.js?v=41351b"></script>
-<script src="js/cloudsave.js?v=41351b"></script>
-<script src="js/social.js?v=41351b"></script>
-<script src="js/mobile.js?v=41351b"></script>
-<script src="js/onboard.js?v=41351b"></script>
-<script src="js/jing_tex.js?v=41351b"></script>
-<script src="js/companion.js?v=41351b"></script>
-<script src="js/extras.js?v=41351b"></script>
-<script src="js/cosmetics.js?v=41351b"></script>
-<script src="js/news.js?v=41351b"></script>
-<script src="js/checkin.js?v=41351b"></script>
-<script src="js/p2p.js?v=41351b"></script>
-<script src="js/panorama_data.js?v=41351b"></script>
-<script src="js/panorama.js?v=41351b"></script>
+<script>self.MODS_ALWAYS = ["tconstruct", "farmersdelight", "veinminer", "nightvision", "dynlights", "tcdemo", "fddemo"];</script>
+<script src="js/mods.js"></script>
+<script src="js/assets.js"></script>
+<script src="js/font.js"></script>
+<script src="js/emoji.js"></script>
+<script src="js/texts.js"></script>
+<script src="js/util.js"></script>
+<script src="js/worldgen_data.js"></script>
+<script src="js/worldgen.js"></script>
+<script src="js/blockdata.js"></script>
+<script src="js/itemdata.js"></script>
+<script src="js/recipedata.js"></script>
+<script src="js/modapi.js"></script>
+<script src="js/mods_data.js"></script>
+<script src="js/blocks.js"></script>
+<script src="js/world.js"></script>
+<script src="js/mesher.js"></script>
+<script src="js/models.js"></script>
+<script src="js/vmodels.js"></script>
+<script src="js/render.js"></script>
+<script src="js/render2.js"></script>
+<script src="js/shaders.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/subtitles.js"></script>
+<script src="js/entity.js"></script>
+<script src="js/mobs2.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/save.js"></script>
+<script src="js/game.js"></script>
+<script src="js/terrain2.js"></script>
+<script src="js/features.js"></script>
+<script src="js/trees.js"></script>
+<script src="js/structures_data.js"></script>
+<script src="js/structgen.js"></script>
+<script src="js/structtypes.js"></script>
+<script src="js/gen_worker.js"></script>
+<script src="js/structures.js"></script>
+<script src="js/nbt.js"></script>
+<script src="js/anvil.js"></script>
+<script src="js/export.js"></script>
+<script src="js/screens.js"></script>
+<script src="js/commands.js"></script>
+<script src="js/controls.js"></script>
+<script src="js/dims.js"></script>
+<script src="js/nether_mobs.js"></script>
+<script src="js/village_mobs.js"></script>
+<script src="js/merchant.js"></script>
+<script src="js/effects.js"></script>
+<script src="js/enchant.js"></script>
+<script src="js/workstations.js"></script>
+<script src="js/equip.js"></script>
+<script src="js/vehicles.js"></script>
+<script src="js/redstone.js"></script>
+<script src="js/itemuse.js"></script>
+<script src="js/entitydata.js"></script>
+<script src="js/etex.js"></script>
+<script src="js/emodel.js"></script>
+<script src="js/vmobs.js"></script>
+<script src="js/mobs_animals.js"></script>
+<script src="js/mobs_water.js"></script>
+<script src="js/mobs_hostile.js"></script>
+<script src="js/mobitems.js"></script>
+<script src="js/spawning.js"></script>
+<script src="js/draw2.js"></script>
+<script src="js/blockents.js"></script>
+<script src="js/decor.js"></script>
+<script src="js/items3.js"></script>
+<script src="js/specials.js"></script>
+<script src="js/raids.js"></script>
+<script src="js/cmdrun.js"></script>
+<script src="js/mods_ui.js"></script>
+<script src="js/mods_code.js"></script>
+<script src="js/main.js"></script>
+<script src="js/touch.js"></script>
+<script src="js/perf.js"></script>
+<script src="js/netconfig.js"></script>
+<script src="js/net.js"></script>
+<script src="js/beacon.js"></script>
+<script src="js/cmdblock.js"></script>
+<script src="js/telemetry.js"></script>
+<script src="js/toy.js"></script>
+<script src="js/account.js"></script>
+<script src="js/capes.js"></script>
+<script src="js/skins.js"></script>
+<script src="js/cloudsave.js"></script>
+<script src="js/social.js"></script>
+<script src="js/mobile.js"></script>
+<script src="js/onboard.js"></script>
+<script src="js/jing_tex.js"></script>
+<script src="js/companion.js"></script>
+<script src="js/extras.js"></script>
+<script src="js/cosmetics.js"></script>
+<script src="js/news.js"></script>
+<script src="js/checkin.js"></script>
+<script src="js/shareholders.js"></script>
+<script src="js/live.js"></script>
+<script src="js/minigame.js"></script>
+<script src="js/p2p.js"></script>
+<script src="js/panorama_data.js"></script>
+<script src="js/panorama.js"></script>
 <script>
   // hide boot splash once the title screen is up
   (function wait() { if (window.game && window.game.state !== 'boot') document.getElementById('boot').style.display = 'none'; else setTimeout(wait, 100); })();

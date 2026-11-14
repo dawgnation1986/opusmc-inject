@@ -1175,6 +1175,20 @@ const WG = {};
       S.colMode = false;
       return d;
     }
+    // getBaseColumn's block at y as a WG.SUB code: the noise plus the aquifer (cave air below sea level stays air)
+    substanceAt(x, y, z) {
+      const d = this.densityAt(x, y, z), SUB = WG.SUB;
+      if (!this.set.aquifers_enabled) return d > 0 ? SUB.NONE : y < this.sea ? (this.fluid === this.LAVA ? SUB.LAVA : SUB.WATER) : SUB.AIR;
+      const key = (x >> 4) * 67108864 + (z >> 4);
+      if (!this.colAq) this.colAq = new Map();
+      let aq = this.colAq.get(key);
+      if (!aq) {
+        if (this.colAq.size > 64) this.colAq.clear();
+        aq = new WG.Aquifer(this.rs, x >> 4, z >> 4, (a, b) => this.prelim(a, b));
+        this.colAq.set(key, aq);
+      }
+      return aq.compute(x, y, z, d);
+    }
     biomeAtQuart(qx, qy, qz) {
       qy = Math.max(this.minY >> 2, Math.min((this.minY + this.height >> 2) - 1, qy));
       return this.biomes.at(qx, qy, qz);

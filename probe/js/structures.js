@@ -28,6 +28,7 @@ const Loot = (function () {
       const t = strip(f.function);
       if (t === 'set_count') stack.count = Math.max(0, Math.floor(f.add ? stack.count + num(f.count, r) : num(f.count, r)));
       else if (t === 'set_damage' && ITEMS[stack.id] && ITEMS[stack.id].durability) stack.dmg = Math.floor(ITEMS[stack.id].durability * (1 - num(f.damage, r)));
+      else if (t === 'set_potion' && f.id) stack.pot = strip(f.id);
     }
     return stack;
   }
@@ -86,7 +87,7 @@ const Loot = (function () {
     for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
     for (const s of list) { if (!empty.length) break; slots[empty.pop()] = s; }
   }
-  return { roll, fill };
+  return { roll, fill, itemId };
 })();
 
 // block entities / entities / references the worker reported for a finished chunk
@@ -94,22 +95,54 @@ Game.prototype.structureExtras = function (ch, saved) {
   const w = this.world, sx = ch.sx, minY = w.minY || 0;
   ch.sx = null;
   if (saved) return;
+  // a template's own items: [key, count, slot, potion]
+  const stackOf = ([key, n, , pot]) => { const sid = Loot.itemId(key); if (sid === null) return null; const s = { id: sid, count: n || 1, dmg: 0 }; if (pot) s.pot = pot; return s; };
   for (const [x, vy, z, type, data] of sx.loot) {
     const y = vy - minY, ci = (y << 8) | ((z & 15) << 4) | (x & 15), id = ch.getB(ci), b = BLOCKS[id];
     if (!b) continue;
-    if (type === 'loot' && (b.key === 'chest' || b.key === 'barrel' || b.key === 'trapped_chest')) {
-      const k = `${x},${y},${z}`;
+    const k = `${x},${y},${z}`, chest = b.key === 'chest' || b.key === 'barrel' || b.key === 'trapped_chest';
+    if (type === 'loot' && chest) {
       if (!this.blockEntities.has(k)) this.blockEntities.set(k, { type: 'chest', pos: [x, y, z], slots: new Array(27).fill(null), loot: data });
       if (b.key === 'chest') ch.setM(ci, ch.getM(ci) | 8);
+    } else if (this.blockEntities.has(k)) continue;
+    // trial chambers' dispensers (filled at once - they are emptied by dispensing) and decorated pots (dropped when broken)
+    else if (type === 'loot' && (b.key === 'dispenser' || b.key === 'dropper')) {
+      const be = { type: b.key, pos: [x, y, z], slots: new Array(9).fill(null), cd: 0, loot: data };
+      this.blockEntities.set(k, be); this.fillLoot(be, x, y, z);
+    } else if (type === 'loot' && b.key === 'decorated_pot') this.blockEntities.set(k, { type: 'pot', pos: [x, y, z], loot: data });
+    // items written into the template (the igloo's brewing stand potion, an ancient city furnace and chest, ...)
+    else if (type === 'items' && Array.isArray(data)) {
+      let be = null;
+      if (chest) be = { type: 'chest', pos: [x, y, z], slots: new Array(27).fill(null) };
+      else if (b.key === 'dispenser' || b.key === 'dropper' || b.key === 'hopper') be = { type: b.key, pos: [x, y, z], slots: new Array(b.key === 'hopper' ? 5 : 9).fill(null), cd: 0 };
+      else if (b.key === 'brewing_stand') be = { type: 'brewing', pos: [x, y, z], bottles: [null, null, null], ingredient: null, fuel: null, fuelLeft: 0, brewTime: 0 };
+      else if (/^(furnace|smoker|blast_furnace)$/.test(b.key)) be = { type: 'furnace', pos: [x, y, z], input: null, fuel: null, output: null, burn: 0, burnMax: 0, cook: 0 };
+      if (!be) continue;
+      for (const it of data) {
+        const s = stackOf(it), i = it[2] || 0;
+        if (!s) continue;
+        if (be.slots) { if (i < be.slots.length) be.slots[i] = s; }
+        else if (be.bottles) { if (i < 3) be.bottles[i] = s; else if (i === 3) be.ingredient = s; else if (i === 4) be.fuel = s; }
+        else be[['input', 'fuel', 'output'][i] || 'output'] = s;
+      }
+      this.blockEntities.set(k, be);
+    }
+    // a spawner's mob (a template's SpawnData: the bastion's magma cubes, the mansion's spiders; the mineshaft's cave
+    // spiders) - they all spawned zombies, the spawner block's default
+    if (type === 'spawner' && b.key === 'spawner' && typeof data === 'string') {
+      const k = `${x},${y},${z}`;
+      if (!this.blockEntities.has(k)) this.blockEntities.set(k, { type: 'spawner', pos: [x, y, z], mob: data });
     }
   }
   // the chunk is saved from now on, so its structure mobs are not spawned again when it reloads
   if (sx.ent.length) ch.modified = true;
   for (const [x, vy, z, type, data] of sx.ent) {
-    if (!MOB_TYPES[type]) continue;
+    const cart = type === 'minecart:chest' && typeof Minecart !== 'undefined'; // (a mineshaft's chest minecart)
+    if (!MOB_TYPES[type] && !cart) continue;
     const m = createMob(this, type, x, vy - minY, z);
     if (!m) continue;
     m.persistent = true;
+    if (cart && data && data.loot) m.loot = data.loot;
     if (data && data.profession) m.profession = data.profession;
     if (data && data.type) m.vtype = data.type;
     this.entities.push(m);

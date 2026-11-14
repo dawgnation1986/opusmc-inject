@@ -70,8 +70,8 @@ const CloudSave = (() => {
     // (no headers - account.js: "OPMCT" and the token go before the bytes)
     const t = new TextEncoder().encode('OPMCT' + Account.token), all = new Uint8Array(t.length + bytes.length); all.set(t); all.set(bytes, t.length);
     try { r = await fetch(RoomService.base() + path, { method: 'POST', body: all }); }
-    catch (e) { throw new Error('连不上服务器，云存档没有同步'); }
-    const j = await r.json().catch(() => ({ error: '服务器没有回应' }));
+    catch (e) { throw new Error('游戏正在更新中…请稍后（云存档暂时没有同步）'); }
+    const j = await r.json().catch(() => ({ error: '游戏正在更新中…请稍后' }));
     return { status: r.status, j };
   }
   // the world record as it goes up (without its cloud bookkeeping)
@@ -196,7 +196,13 @@ class CloudScreen extends MenuScreen {
         { x: cx + 112, y, w: 48, h: 20, label: this.confirm === w.wid ? '确定？' : '删除', tip: ['只删云端的这一份，这台设备上的不动'], onClick: () => this.del(w) },
       );
     });
-    this.widgets.push({ x: cx - 100, y: u.h - 28, w: 200, h: 20, label: '完成', onClick: () => this.game.ui.open(this.parent) });
+    this.widgets.push({ x: cx - 100, y: u.h - 28, w: 200, h: 20, label: '完成', onClick: () => this.back() });
+  }
+  // back to the world list, read again: it was read once when it opened, so a world just downloaded wasn't in it
+  back() {
+    const p = this.parent;
+    if (p instanceof WorldListScreen) DB.listWorlds().then((w) => { p.worlds = w; p.sel = -1; if (this.game.ui.screen === p) p.layout(); }).catch(() => { });
+    this.game.ui.open(p);
   }
   async down(w) {
     const l = this.local.get(w.wid);
@@ -228,7 +234,7 @@ class CloudScreen extends MenuScreen {
     });
     if (this.note) Font.center(c, fitText(this.note, ui.w - 8), cx, ui.h - 40, this.noteColor);
   }
-  onEsc() { this.game.ui.open(this.parent); }
+  onEsc() { this.back(); }
 }
 // a world changed here and on another device: which copy stays
 class CloudConflictScreen extends MenuScreen {

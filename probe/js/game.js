@@ -2,6 +2,12 @@
 // ---------------------------------------------------------------------------
 // Game: state, main loop, chunk streaming, interaction, rendering glue
 // ---------------------------------------------------------------------------
+// an iPhone or iPad (iPads ask for the Mac page: a Mac with a touch screen) - see render's title freeze
+const IOS_WEBGL = typeof navigator !== 'undefined' && (/iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1));
+// Apple's engine anywhere: every browser on an iPhone / iPad, Safari on a Mac (render's freeze is off on all of them:
+// telemetry 11-07 - the WebGL context lost on Apple devices 0.9% -> 4.5% of sessions with the 11-06 version's freeze,
+// Mac Safari 7%, each one a "画面中断了" and a reload)
+const WEBKIT_GL = IOS_WEBGL || (typeof navigator !== 'undefined' && /Macintosh/.test(navigator.userAgent) && /Version\/[\d.]+.*Safari\//.test(navigator.userAgent) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(navigator.userAgent));
 const ADVANCEMENTS = {
   wood: ['获得木头', 'oak_log'], crafting_table: ['这是？工作台！', 'crafting_table'], pickaxe: ['采矿时间到！', 'wooden_pickaxe'],
   stone_pickaxe: ['获得升级', 'stone_pickaxe'], furnace: ['热门话题', 'furnace'], iron: ['来硬的', 'iron_ingot'],
@@ -18,6 +24,17 @@ const TUTORIAL = [
   { title: '制作工作台', text: '用 4 个木板合成工作台', icon: 'crafting_table', done: (g) => g.adv.crafting_table },
   { title: '制作木镐', text: '放下工作台，右键打开它', touch: '放下工作台，对准它点使用按钮', icon: 'wooden_pickaxe', done: (g) => g.adv.pickaxe },
 ];
+// the vanilla-state crops a random tick grows (Game.cropTick; wheat is the old block 64)
+const CROP_TICK = /^(carrots|potatoes|beetroots|torchflower_crop|pitcher_crop|melon_stem|pumpkin_stem|sweet_berry_bush)$/;
+
+// the third-person camera's ray (raycast vis), vanilla's getVisualShape: nothing for glass, panes, bars, copper grates
+// and powder snow; the outline for fences, soul sand, mud and snow layers, and for the non-solid blocks here without a
+// collide that vanilla does collide with (cocoa, candles, sea pickles, amethyst, dripstone, moss carpets, diodes)
+const VIS_NONE = new Uint8Array(BLOCKS.length), VIS_SEL = new Uint8Array(BLOCKS.length);
+for (const b of BLOCKS) if (b) {
+  if (/^(glass|tinted_glass|powder_snow|iron_bars|.*_stained_glass|.*glass_pane|.*copper_bars|.*copper_grate)$/.test(b.key)) VIS_NONE[b.id] = 1;
+  else if ((b.fence && b.fence !== 'wall') || /^(soul_sand|mud|snow|cocoa|sea_pickle|pointed_dripstone|sulfur_spike|repeater|comparator|(pale_)?moss_carpet|amethyst_cluster|.*amethyst_bud|.*candle)$/.test(b.key)) VIS_SEL[b.id] = 1;
+}
 
 class Game {
   constructor() {
@@ -35,7 +52,7 @@ class Game {
     this.keys = {}; this.mouseBtn = [false, false, false];
     this.tickCount = 0; this.worldTime = 1000; this.fps = 0;
     this.perspective = 0;
-    this.weather = 0; this.rainTarget = 0; this.weatherTimer = 12000 + Math.random() * 24000;
+    this.weather = 0; this.rainTarget = 0; this.weatherTimer = this.weatherSpan(0);
     this.breaking = null; this.useCd = 0; this.attackCd = 0;
     this.stats = { kills: 0, placed: 0, mined: 0 };
     this.adv = {}; this.openChests = new Set(); this.chestLids = new Map(); this.signs = new Map();
@@ -46,12 +63,26 @@ class Game {
   saveSettings() { try { localStorage.setItem('mcjs-settings', JSON.stringify(this.settings)); } catch (e) { } }
 
   async init() {
+    // the loading bar (index.html) says which step it is and gets a frame to show it before each long one (11-10: on a
+    // phone the start-up is seconds, and the bar stood still all through it); a hidden page has no frames: 100 ms
+    const step = (s) => new Promise((res) => {
+      self.BOOT_STEP = s; if (self.BOOT_DRAW) self.BOOT_DRAW();
+      let done = false; const go = () => { if (!done) { done = true; setTimeout(res, 0); } };
+      requestAnimationFrame(go); setTimeout(go, 100);
+    });
+    self.BOOT_STEP = '正在准备贴图';
     this.canvas = document.getElementById('gl');
     this.renderer = new Renderer(this.canvas);
     this.renderer.resScale = this.settings.resScale;
     await this.renderer.init();
     Font.init(this.renderer.images.font);
+    // the world generator's threads started now: their scripts load while the page builds its icons and the title
+    // (11-10: started with the title world, after all that - a world opened right after a reload, a world with mods,
+    // waited for them); the title's or the world's seed is given them after (GenPool.reseed)
+    if (typeof GenPool === 'function' && !this.genPool) { try { this.genSetup(window.PANORAMA ? PANORAMA.seed : 0); } catch (e) { } }
+    await step('正在生成物品图标');
     this.renderer.buildIcons();
+    await step('正在生成标题画面');
     this.ui = new UI(this, document.getElementById('ui'));
     this.particles = new Particles(this);
     initPresets(this, this.hadSettings);
@@ -59,7 +90,9 @@ class Game {
     this.applySettings();
     await DB.open();
     this.resize();
-    window.addEventListener('resize', () => this.resize());
+    // (with the phone stage up - mobile.js Stage - its own listener resizes, once a frame; this one made each resize
+    // event two, and an on-screen keyboard sends a run of them)
+    window.addEventListener('resize', () => { if (!(typeof Stage !== 'undefined' && Stage.el)) this.resize(); });
     bindInput(this);
     Sound.loadPack();
     this.startTitle();
@@ -189,7 +222,7 @@ class Game {
   }
   findSpawn() {
     const w = this.world;
-    if (w.flat) return [0, 61, 0];
+    if (w.flat) return [0, (w.flatTop || 60) + 1, 0];
     for (let r = 0; r < 400; r += 8) {
       for (let a = 0; a < 16; a++) {
         const x = Math.round(Math.cos(a / 16 * Math.PI * 2) * r), z = Math.round(Math.sin(a / 16 * Math.PI * 2) * r);
@@ -207,7 +240,8 @@ class Game {
     if (gen === 2) seed = parseSeed(seedStr);
     else { seed = parseInt(seedStr, 10); if (!seedStr) seed = (Math.random() * 2 ** 31) | 0; else if (isNaN(seed) || String(seed) !== seedStr.trim()) seed = hashStr(seedStr); }
     const id = 'w' + Date.now().toString(36);
-    const meta = { id, name: name || '新的世界', seed, gen, mode, flat: !!flat, created: Date.now(), lastPlayed: Date.now(), time: 1000, player: null,
+    // (flatClassic: vanilla's classic flat layers - superflat worlds made before it keep their stone + dirt layers)
+    const meta = { id, name: name || '新的世界', seed, gen, mode, flat: !!flat, ...(flat ? { flatClassic: true } : {}), created: Date.now(), lastPlayed: Date.now(), time: 1000, player: null,
       hardcore: !!opts.hardcore, difficulty: opts.difficulty ?? 2, cheats: opts.cheats ?? mode === 'creative', structures: opts.structures !== false, bonus: !!opts.bonus };
     await DB.putWorld(meta);
     return this.loadWorld(id);
@@ -233,6 +267,7 @@ class Game {
     this.worldMeta = meta;
     if (this.world) this.unloadAll();
     this.entities = []; this.particles.list = []; this.sleeping = null; this.portalOverlay = 0;
+    this._ts = this._tsSeen = this._tsMobs = null; // (trial spawners of the last world)
     this.welcome = true;
     setWorldFormat(meta.gen || 1);
     if (meta.gen === 2) this.genSetup(meta.seed);
@@ -242,6 +277,7 @@ class Game {
     this.iconAt = meta.icon ? 0 : performance.now() + 2500;
     this.worldTime = meta.time || 1000;
     this.weather = meta.weather || 0; this.rainTarget = meta.rainTarget || 0;
+    this.weatherTimer = meta.weatherTimer > 0 ? meta.weatherTimer : this.weatherSpan(this.rainTarget); // (saved like vanilla's rainTime)
     this.adv = meta.adv || {}; this.stats = meta.stats || { kills: 0, placed: 0, mined: 0 };
     this.tutorial = meta.tutorial ?? (meta.mode === 'survival' && !['mc', 'vet'].includes(this.settings.playerKind) ? 0 : -1); this.tutStat = { moved: 0 }; // (onboard.js: players who know the game skip it)
     let sp = meta.spawn;
@@ -258,8 +294,11 @@ class Game {
       p.inv.slots = d.inv.map(s => s ? fixSavedStack({ ...s }) : null); while (p.inv.slots.length < 41) p.inv.slots.push(null);
       p.inv.sel = d.sel || 0;
       for (const [k, a, t, amb] of d.effects || []) p.addEffect(k, a, t, amb);
-      p.absorption = d.absorption || 0; p.bedSpawn = !!d.bedSpawn;
+      p.absorption = d.absorption || 0; p.bedSpawn = !!d.bedSpawn; p.spawnYaw = d.spawnYaw;
       p.air = 300;
+      // saved dead (left from the death screen, the page closed): dead again, with the death screen (vanilla) - it
+      // came back alive with no health, a hardcore player too: "极限模式死后退出重进能复活"
+      if (typeof d.health === 'number' && d.health <= 0) { p.health = 0; p.deathTime = 1; }
       if (this.mode === 'spectator') p.noClip = true;
     } else {
       p.needsGround = true; // (a new world starts with an empty inventory in every mode, like vanilla)
@@ -303,7 +342,7 @@ class Game {
     const p = this.player;
     const lists = this.collectDimSave();
     const m = this.worldMeta;
-    m.lastPlayed = Date.now(); m.time = this.worldTime; m.mode = this.mode; m.difficulty = this.difficulty; m.weather = this.weather; m.rainTarget = this.rainTarget;
+    m.lastPlayed = Date.now(); m.time = this.worldTime; m.mode = this.mode; m.difficulty = this.difficulty; m.weather = this.weather; m.rainTarget = this.rainTarget; m.weatherTimer = Math.round(this.weatherTimer);
     m.spawn = p.spawn; m.adv = this.adv; m.stats = this.stats; m.tutorial = this.tutorial;
     if (this.animalChunks && this.animalChunksFor === m.id) m.animalChunks = [...this.animalChunks];
     // (what an open screen holds for now goes into empty slots of the saved copy - see Ui.pendingStacks)
@@ -311,7 +350,7 @@ class Game {
     const pend = this.ui && this.ui.pendingStacks ? this.ui.pendingStacks() : [];
     if (pend.length) { inv = inv.slice(); for (const st of pend) { const i = inv.findIndex((x, j) => j < 36 && !x); if (i >= 0) inv[i] = { ...st }; } }
     m.player = { pos: [...p.pos], yaw: p.yaw, pitch: p.pitch, health: p.health, food: p.food, sat: p.saturation, xp: p.xp, inv, sel: p.inv.sel, flying: p.flying,
-      effects: p.effects ? [...p.effects].map(([k, e]) => [k, e.amp, e.dur, e.ambient]) : [], absorption: p.absorption || 0, enchSeed: p.enchSeed, bedSpawn: !!p.bedSpawn };
+      effects: p.effects ? [...p.effects].map(([k, e]) => [k, e.amp, e.dur, e.ambient]) : [], absorption: p.absorption || 0, enchSeed: p.enchSeed, bedSpawn: !!p.bedSpawn, spawnYaw: p.spawnYaw };
     let done = 0;
     try {
       for (const [sid, list] of lists) { await DB.putChunks(sid, list); done++; }
@@ -345,7 +384,10 @@ class Game {
   // measured rest of the frame
   chunkBudget() { return this.pacer ? this.pacer.budget() : 6; }
   updateChunksIn(budgetMs) {
-    const w = this.world, R = this.state === 'title' ? 6 : this.settings.renderDist;
+    // (while a world loads only what the loading waits for - the 5 x 5 around the player meshed, so their neighbours
+    // finished: R 3 - then the view distance once it is up. 11-10: the whole view was made first, 260 chunks for 25, a
+    // new world took 5.4 s on a phone-slow CPU)
+    const w = this.world, R = this.state === 'title' ? 6 : this.state === 'loading' ? Math.min(3, this.settings.renderDist) : this.settings.renderDist;
     const center = this.state === 'title' ? this.titleCam : this.player.pos;
     const pcx = Math.floor(center[0]) >> 4, pcz = Math.floor(center[2]) >> 4;
     const t0 = performance.now();
@@ -382,9 +424,10 @@ class Game {
       if (ok) cand.push([ch, dx * dx + dz * dz]);
     }
     cand.sort((a, b) => a[1] - b[1]);
-    // streamed chunks are meshed in the chunk worker (only gathering their blocks happens here); while
-    // loading, and for the player's own edits (flushMesh), meshing stays immediate
-    const cw = this.chunkWorker, async = w.useCW && cw && cw.ready && !cw.failed && this.state !== 'loading';
+    // streamed chunks are meshed in the chunk worker (only gathering their blocks happens here); for the player's own
+    // edits (flushMesh) meshing stays immediate. (While a world loads too, 11-10: it was immediate then, the page's
+    // biggest part of the loading - the loading waits for the worker's meshes to be uploaded instead: frame)
+    const cw = this.chunkWorker, async = w.useCW && cw && cw.ready && !cw.failed;
     for (const [ch] of cand) {
       if (async && !ch.syncMesh) {
         if (cw.inflightMeshes() > 64 || !this.workFits(t0, budgetMs, 'gather')) break;
@@ -554,7 +597,9 @@ class Game {
       if (this.pendingMobs && this.pendingMobs.length) {
         this.pendingMobs = this.pendingMobs.filter(m => {
           if ((Math.floor(m.pos[0]) >> 4) === cx && (Math.floor(m.pos[2]) >> 4) === cz) {
-            this.entities.push(this.restoreMob(m)); return false;
+            // (a mob whose mod was taken off the world can't be made: it stays saved, for when the mod comes back)
+            let e; try { e = this.restoreMob(m); } catch (err) { console.warn('[mobs] not restored: ' + m.type, err); return true; }
+            this.entities.push(e); return false;
           }
           return true;
         });
@@ -567,7 +612,9 @@ class Game {
   }
   spawnAnimals(ch) {
     const r = RNG(hashStr('animals' + this.world.seed + ch.cx + ':' + ch.cz));
-    if (r() > 0.1) return;
+    // (with vanilla biome data - a superflat world's is plains: spawning.js spawnBiome - the biome's own list and chance)
+    const v = typeof spawnBiome === 'function' ? spawnBiome(this, ch.cx * 16, ch.cz * 16) : null, vl = v && v.def && v.def.spawners && v.def.spawners.creature ? v : null;
+    if (r() >= (vl ? vl.def.creature_spawn_probability ?? 0.1 : 0.1)) return;
     // like vanilla, only when the chunk is first generated: chunks the player never changed are not saved, so
     // without this record every reload of one added its animals again (worldMeta.animalChunks, saved with the world)
     const m = this.worldMeta, id = m ? m.id : null;
@@ -575,12 +622,13 @@ class Game {
     const k = ckey(ch.cx, ch.cz);
     if (this.animalChunks.has(k)) return;
     this.animalChunks.add(k);
+    if (vl && this.spawnChunkAnimals) { this.spawnChunkAnimals(ch, vl); return; }
     const types = ['pig', 'cow', 'sheep', 'sheep', 'chicken'];
     const t = types[r.int(types.length)];
     const n = 2 + r.int(3);
     for (let i = 0; i < n; i++) {
       const x = ch.cx * 16 + r.int(16), z = ch.cz * 16 + r.int(16);
-      for (let y = HEIGHT - 2; y > SEA; y--) {
+      for (let y = HEIGHT - 2; y > (this.world.flat ? 0 : SEA); y--) { // (a classic superflat's grass is at y 3)
         const id = ch.getB((y << 8) | ((z & 15) << 4) | (x & 15));
         if (id === 0 || !BLOCKS[id].solid) continue;
         if (id === 2) this.entities.push(new Mob(this, t, x + 0.5, y + 1, z + 0.5));
@@ -612,9 +660,14 @@ class Game {
       let ready = 0, need = 0;
       const R = Math.max(0, Math.min(2, (this.settings.renderDist | 0) - 1));
       for (let dx = -R; dx <= R; dx++) for (let dz = -R; dz <= R; dz++) { need++; const ch = this.world.getChunk(pcx + dx, pcz + dz); if (ch && !ch.dirty) ready++; }
-      this.loadProgress = ready / need;
+      // (meshed in the chunk worker - updateChunksIn: its meshes still on their way or not yet uploaded are waited for,
+      // so the world never shows with holes; not more than 5 s, a worker that went quiet aside)
+      const cw = this.chunkWorker, meshing = ready === need && ((this.meshResQ && this.meshResQ.length) || (cw && !cw.failed && cw.inflightMeshes() > 0));
+      if (meshing) { if (!this.meshWaitT) this.meshWaitT = now; } else this.meshWaitT = 0;
+      this.loadProgress = (ready - (meshing ? 0.5 : 0)) / need;
       this.chunkWatchdog(pcx, pcz, now);
-      if (ready === need) {
+      if (ready === need && (!meshing || now - this.meshWaitT > 5000)) {
+        this.meshWaitT = 0;
         if (this.onDimReady) { const f = this.onDimReady; this.onDimReady = null; f(); this.flushMesh(); }
         if (p.needsGround) {
           const x = Math.floor(p.pos[0]), z = Math.floor(p.pos[2]);
@@ -626,6 +679,7 @@ class Game {
         }
         this.state = 'play';
         this.ui.close();
+        if (!this.net && p.deathTime > 0 && p.health <= 0) this.ui.open(new DeathScreen(this)); // (saved dead: see load)
         // a new world (or dimension) starts at full resolution, whatever the last one had come down to
         if (typeof DynRes !== 'undefined') DynRes.reset(this);
         // the room service's sponsor line, held on the chat's bottom row from the moment the world shows
@@ -687,13 +741,16 @@ class Game {
     this.oFovMod = this.fovMod ?? 1;
     this.fovMod = this.oFovMod + (t - this.oFovMod) * 0.5;
   }
+  // how long the weather lasts once it turned clear (0) or rainy (1): vanilla ServerLevel's RAIN_DELAY 12000..180000 and
+  // RAIN_DURATION 12000..24000 ticks (it was 12000..48000 clear and 6000..18000 rain: raining three times as often)
+  weatherSpan(rain) { return rain ? 12000 + Math.random() * 12000 : 12000 + Math.random() * 168000; }
   // ---- 20 TPS tick ---------------------------------------------------------------------------
   tick() {
     if (!this.world) return;
     if (this.state === 'title') { this.world.time++; return; } // (the sun stays where it is behind the title screen)
     if (this.state !== 'play') return;
     if (this.ui.screen && this.ui.screen.pauses) return;
-    this.tickCount++;
+    this.tickCount++; this.frameA = 0;
     this.tickFov();
     this.world.time++;
     this.worldTime += this.net && this.timeRate != null ? this.timeRate : 1; // a server's clock may be stopped
@@ -704,16 +761,17 @@ class Game {
     for (let i = 0, s = p.inv.slots; i < s.length; i++) if (s[i] && !ITEMS[s[i].id]) s[i] = knownStack(s[i], this, 'inventory');
     // weather
     if (this.dim !== 'overworld') { /* no weather outside the overworld */ }
-    else if (!this.net && !this.p2pGuest && --this.weatherTimer < 0) { this.rainTarget = this.rainTarget ? 0 : 1; this.weatherTimer = this.rainTarget ? 6000 + Math.random() * 12000 : 12000 + Math.random() * 36000; }
+    else if (!this.net && !this.p2pGuest && --this.weatherTimer < 0) { this.rainTarget = this.rainTarget ? 0 : 1; this.weatherTimer = this.weatherSpan(this.rainTarget); }
     this.weather += clamp(this.rainTarget - this.weather, -0.01, 0.01);
     const input = this.ui.screen ? { fwd: 0, strafe: 0, jump: false, sneak: false, sprint: false } : this.readInput();
     if (this.tickSleep()) { }
     else if (!p.loadedHere()) { p.savePrev(); }
     else { if (p.respawnGround) this.guard('respawn', () => this.respawnSettle()); this.guard('player', () => p.tick(input)); }
     this.tickPlayerBody(p);
+    if (!this.net && this.tickCount % 5 === 0) this.guard('barrels', () => this.recheckBarrels());
     if (this.net) { this.guard('interaction', () => this.handleInteraction()); this.guard('net', () => this.netTick()); return; }
     if (this.p2pGuest) { this.guard('interaction', () => this.handleInteraction()); this.guard('p2p', () => this.p2pGuest.tick()); return; } // a local room's guest (p2p.js): the host runs the world // on a server: everything else is the server's (net.js)
-    if (p.pos[1] + (this.world.minY || 0) < 16 && p.pos[1] < SEA - 30 && !this.adv.deep) this.grant('deep');
+    if (p.pos[1] + (this.world.minY || 0) < 16 && p.pos[1] < SEA - 30 && !(this.world.flatTop < 16) && !this.adv.deep) this.grant('deep');
     if (!this.sleeping) this.guard('interaction', () => this.handleInteraction()); // (asleep: no mining the bed away)
     this.guard('portals', () => this.tickPortals());
     // in a wall (vanilla isInWall: a small box at the eyes inside a full, opaque block - sand fallen on the player,
@@ -767,6 +825,7 @@ class Game {
     if (this.headInWater && Math.random() < 0.1) this.particles.spawn('bubble', p.pos[0] + (Math.random() - 0.5), eyeY - 0.5, p.pos[2] + (Math.random() - 0.5), 0, 0.05, 0);
     // torch / lava ambient particles near player
     this.ambientParticles();
+    this.markerParticles();
     this.bubbleColumnFx();
     this.guard('ambient sounds', () => this.ambientSounds());
     Sound.listener = { x: p.pos[0], y: p.pos[1] + 1.6, z: p.pos[2], yaw: p.yaw };
@@ -841,6 +900,17 @@ class Game {
         this.particles.spawn('lava', x + Math.random(), y + 1, z + Math.random(), (Math.random() - 0.5) * 0.1, 0.25, (Math.random() - 0.5) * 0.1);
         if (Math.random() < 0.3) Sound.noise([x, y, z], { type: 'bandpass', freq: 400, q: 2, dur: 0.1, vol: 0.3 });
       }
+    }
+  }
+  // with a barrier or a light block in hand in creative, those near by show their marker (ClientLevel.animateTick and
+  // getMarkerParticleTarget: block_marker particles, 667 looks within 16 and 32 blocks a tick) - they were never seen
+  markerParticles() {
+    const p = this.player, held = p.inv.held, def = held && ITEMS[held.id];
+    if (this.mode !== 'creative' || !def || (def.key !== 'barrier' && def.key !== 'light') || BID[def.key] === undefined) return;
+    const id = BID[def.key], w = this.world, px = Math.floor(p.pos[0]), py = Math.floor(p.pos[1]), pz = Math.floor(p.pos[2]), R = Math.random;
+    for (const r of [16, 32]) for (let i = 0; i < 667; i++) {
+      const x = px + (R() * r | 0) - (R() * r | 0), y = py + (R() * r | 0) - (R() * r | 0), z = pz + (R() * r | 0) - (R() * r | 0);
+      if (w.getBlock(x, y, z) === id) this.particles.spawn('marker', x + 0.5, y + 0.5, z + 0.5, 0, 0, 0, { layer: T('i_' + def.key) });
     }
   }
   // bubble columns near the player (vanilla BubbleColumnBlock.animateTick): found once a second within 12 blocks, then
@@ -946,11 +1016,22 @@ class Game {
     return b === BI.SNOWY || b === BI.SNOWPEAK || b === BI.FROZEN_OCEAN;
   }
   tintAt(x, z, kind) {
+    if (typeof kind === 'string' && kind.startsWith('slime:')) return slimeTint(kind, x, z); // (匠魂's slime plants: mesher.js)
+    if (typeof kind === 'string' && kind[0] === '#') return [1, 3, 5].map((i) => parseInt(kind.slice(i, i + 2), 16));
     const ch = this.world.getChunk(x >> 4, z >> 4);
     if (!ch) return [124, 189, 107];
-    const i = (((z & 15) << 4) | (x & 15)) * 3, a = kind === 'foliage' ? ch.foliage : ch.grass;
-    if (kind === 'birch') return [128, 167, 85]; if (kind === 'spruce') return [97, 153, 97]; if (kind === 'water') return [63, 118, 228];
+    const i = (((z & 15) << 4) | (x & 15)) * 3, a = kind === 'foliage' ? ch.foliage : kind === 'water' ? ch.water : kind === 'dry_foliage' ? ch.dry : ch.grass;
+    if (kind === 'birch') return [128, 167, 85]; if (kind === 'spruce') return [97, 153, 97];
+    if (!a) return kind === 'water' ? BIOME_WATER[ch.biome[i / 3]] || BIOME_WATER_DEFAULT : DRY_FOLIAGE_DEFAULT;
     return [a[i], a[i + 1], a[i + 2]];
+  }
+  // the colour of a block's particles (vanilla TerrainParticle: its tint layer 0 at the spot; none for a grass block, whose
+  // particle is dirt, nor for pink petals' petals): null when untinted. Redstone dust's was the grass colour (tint 'rgb')
+  blockTintAt(x, z, id, meta) {
+    const b = BLOCKS[id];
+    if (!b || !b.tint || id === 2 || b.particleTint === false) return null;
+    if (b.tint === 'stem') return stemTint(b.states && b.states[meta] ? b.states[meta].age : 0);
+    return b.tintRGB || this.tintAt(x, z, b.tint);
   }
 
   // ---- time ---------------------------------------------------------------------------
@@ -993,11 +1074,28 @@ class Game {
     this.ui.message(`玩家取得了进度 [${a[0]}]`, '#55FF55');
   }
 
+  // a barrel looks open while looked into (vanilla BarrelBlockEntity.recheckOpen, every 5 ticks): one this game opened
+  // and no longer looks into shuts, one another player in a local room shut while this one still looks in opens again;
+  // alone in a world, any left open (a crash or a closed tab while it was open) shuts too
+  recheckBarrels() {
+    const w = this.world, set = this.barrelsShown || (this.barrelsShown = new Set());
+    if (!this.p2pHost && !this.p2pGuest && this.tickCount % 100 === 0) for (const be of this.blockEntities.values()) if (be.type === 'chest' && be.pos) set.add(be.pos.join(','));
+    for (const k of set) {
+      const [x, y, z] = k.split(',').map(Number), id = w.getBlock(x, y, z);
+      if (!BLOCKS[id] || BLOCKS[id].key !== 'barrel') { set.delete(k); continue; }
+      const m = w.getMeta(x, y, z), open = this.openChests.has(k);
+      if ((Features.propOf(id, m, 'open') === 'true') !== open) { w.setMeta(x, y, z, Features.withProp(id, m, 'open', open)); this.flushMesh(); }
+      if (!open) set.delete(k);
+    }
+  }
+
   // ---- hooks from world/entities ------------------------------------------------------------
   onBlockChanged(x, y, z, old, id, oldMeta) {
     if (old === id) return;
-    // (beDraw: drawn by blockents.js besides its block model - bells)
-    const beOld = BLOCKS[old] && (BLOCKS[old].beRender || BLOCKS[old].beDraw), beNew = BLOCKS[id] && (BLOCKS[id].beRender || BLOCKS[id].beDraw);
+    // (beDraw: drawn by blockents.js besides its block model - bells; and the book over an enchanting table or on a lectern,
+    // BOOK_BLOCKS: one placed had no book until its chunk was loaded again)
+    const book = (i) => typeof BOOK_BLOCKS !== 'undefined' && BOOK_BLOCKS.has(i);
+    const beOld = BLOCKS[old] && (BLOCKS[old].beRender || BLOCKS[old].beDraw || book(old)), beNew = BLOCKS[id] && (BLOCKS[id].beRender || BLOCKS[id].beDraw || book(id));
     if (beOld || beNew || old === 127 || id === 127) {
       const ch = this.world.getChunk(x >> 4, z >> 4);
       if (ch) { if (beOld || beNew) ch.chests = null; else ch.spawners = null; }
@@ -1012,16 +1110,34 @@ class Game {
       this.blockEntities.delete(k);
       if (this.ui.screen && (this.ui.screen.be === be || (this.ui.screen.owns && this.ui.screen.owns(be)))) this.ui.close();
     }
+    if (!this.net && SNOWY_DIRT.has(id)) this.snowyUpdate(x, y, z, id);
+  }
+  // grass blocks, podzol and mycelium are snowy while snow (a layer, a snow block, powder snow) is on them, set when placed
+  // and when the block above changes (vanilla SnowyDirtBlock); only world generation set it, so a grass block kept its
+  // snowy sides after the snow on it was dug away
+  snowyUpdate(x, y, z, id) {
+    const w = this.world, a = w.getBlock(x, y + 1, z), snowy = a === BID.snow || a === BID.snow_block || a === BID.powder_snow;
+    const m = w.getMeta(x, y, z), nm = id === 2 ? (snowy ? m | 1 : m & ~1) : Features.withProp(id, m, 'snowy', snowy);
+    if (nm !== m) w.setMeta(x, y, z, nm);
   }
   onNeighborUpdate(x, y, z, id) {
     const w = this.world, b = BLOCKS[id];
+    if (!b) return; // (a block this page doesn't know - a mod's, the world opened without that mod - 11-13: it threw here every tick)
+    // a stem whose melon or pumpkin is gone is a grown stem again (vanilla AttachedStemBlock.updateShape)
+    if (b && !this.net && (b.key === 'attached_melon_stem' || b.key === 'attached_pumpkin_stem')) {
+      const D = { north: [0, -1], south: [0, 1], west: [-1, 0], east: [1, 0] }[Features.propOf(id, w.getMeta(x, y, z), 'facing')], stem = BID[b.key.slice(9)];
+      if (!this.supported(x, y, z, id, w.getMeta(x, y, z))) this.breakBlock(x, y, z, true);
+      else if (D && stem !== undefined && w.getBlock(x + D[0], y, z + D[1]) !== BID[b.key === 'attached_melon_stem' ? 'melon' : 'pumpkin']) w.setBlock(x, y, z, stem, Features.withProp(stem, 0, 'age', '7'));
+      return;
+    }
+    if (!this.net && SNOWY_DIRT.has(id)) { this.snowyUpdate(x, y, z, id); return; }
     if (b && b.chestLike) {
       const m = w.getMeta(x, y, z), s = chestSeam(m);
       if (s) { const nm = w.getMeta(x + s[0], y, z + s[1]); if (w.getBlock(x + s[0], y, z + s[1]) !== id || (nm & 7) !== (m & 7) || chestType(nm) === chestType(m) || !chestType(nm)) w.setMeta(x, y, z, m & ~48); }
       return;
     }
     if (id === 170) { if (!this.portalValid(x, y, z)) w.setBlock(x, y, z, 0, 0); return; }
-    if (id === 171) { if (!this.fireSupported(x, y, z)) w.setBlock(x, y, z, 0, 0); return; }
+    if (id === 171) { if (!this.fireSupported(x, y, z)) w.setBlock(x, y, z, 0, 0); else if (!this.net && this.fireIdAt(x, y, z) !== 171) w.setBlock(x, y, z, this.fireIdAt(x, y, z), 0); return; }
     if (b.gravity) {
       // (the id came with the update: two updates for the cell in one tick spawned a second falling block from a
       // cell already empty - one more sand)
@@ -1035,11 +1151,53 @@ class Game {
       return;
     }
     if (this.blasting && this.blasting.has(x + ',' + y + ',' + z)) return;   // (explode: the blast takes it)
+    if (this.cmdPlaced && this.cmdPlaced === x + ',' + y + ',' + z) return;   // (cmdrun.js cmdSetBlock)
     if (b.needsSupport || b.door) {
-      if (this.cmdPlaced && this.cmdPlaced === x + ',' + y + ',' + z) return;   // (cmdrun.js cmdSetBlock)
       if (this.pairBreak === x + ',' + y + ',' + z) return;   // (breakBlock taking the other half itself)
-      if (!this.supported(x, y, z, id, w.getMeta(x, y, z))) this.breakBlock(x, y, z, true);
-    } else if (!this.net && this.attachLost(x, y, z, id, w.getMeta(x, y, z))) this.breakBlock(x, y, z, true);
+      const meta = w.getMeta(x, y, z);
+      // vines and glow lichen let go of the faces that lost their hold, and go with the last (VineBlock / MultifaceBlock
+      // updateShape: they stayed in the air)
+      const fm = !this.net && typeof Features !== 'undefined' ? Features.faceUpdate(this.survivalR(), id, meta, x, y, z) : undefined;
+      if (fm >= 0) { if (fm !== meta) w.setBlock(x, y, z, id, fm); return; } // (the vine below may hang on this face)
+      if (!this.supported(x, y, z, id, meta)) this.breakBlock(x, y, z, true);
+    } else if (!this.net && b.key === 'pointed_dripstone') this.dripstoneUpdate(x, y, z, id);
+    else if (!this.net && this.attachLost(x, y, z, id, w.getMeta(x, y, z))) this.breakBlock(x, y, z, true);
+  }
+  // a dripstone takes its shape from the dripstones along its axis; one that lost what it grows from breaks, or falls if
+  // it hangs (SpeleothemBlock.updateShape / tick: placed on the ground it broke at once, never thinned to a tip, never fell)
+  dripstoneUpdate(x, y, z, id) {
+    const w = this.world, m = w.getMeta(x, y, z), F = Features, down = F.propOf(id, m, 'vertical_direction') !== 'up';
+    if (!this.supported(x, y, z, id, m)) {
+      if (!down) { this.breakBlock(x, y, z, true); return; }
+      // the whole stalactite from here down falls; its tip hurts what it lands on (spawnFallingStalactite)
+      const col = [];
+      for (let yy = y; yy >= 0 && w.getBlock(x, yy, z) === id && F.propOf(id, w.getMeta(x, yy, z), 'vertical_direction') === 'down'; yy--) {
+        col.push([yy, w.getMeta(x, yy, z)]);
+        if (/^tip/.test(F.propOf(id, col[col.length - 1][1], 'thickness'))) break;
+      }
+      col.forEach(([yy, mm], i) => {
+        const fb = new FallingBlock(this, x, yy, z, id, mm);
+        if (i === col.length - 1 && /^tip/.test(F.propOf(id, mm, 'thickness'))) fb.hurts = [Math.max(1 + y - yy, 6), 40];
+        w.setBlock(x, yy, z, 0, 0, 0); // (all gone before any neighbour looks: each would start its own fall)
+        this.entities.push(fb);
+      });
+      for (const [yy] of col) { w.notify(x, yy, z, id); for (const D of DIRS) w.notify(x + D[0], yy + D[1], z + D[2], -1); }
+      return;
+    }
+    const nm = F.withProp(id, m, 'thickness', this.dripThickness(x, y, z, down, F.propOf(id, m, 'thickness') === 'tip_merge'));
+    if (nm !== m) w.setBlock(x, y, z, id, nm);
+  }
+  // SpeleothemBlock.calculateSpeleothemThickness: a tip at the free end (merged with one pointing back at it), then
+  // frustum, middle ... base at the block it grows from
+  dripThickness(x, y, z, down, merge) {
+    const w = this.world, id = BID.pointed_dripstone, dy = down ? -1 : 1, want = down ? 'down' : 'up';
+    const dir = (yy) => w.getBlock(x, yy, z) === id ? Features.propOf(id, w.getMeta(x, yy, z), 'vertical_direction') : null;
+    const front = dir(y + dy);
+    if (front && front !== want) return !merge && Features.propOf(id, w.getMeta(x, y + dy, z), 'thickness') !== 'tip_merge' ? 'tip' : 'tip_merge';
+    if (front !== want) return 'tip';
+    const ft = Features.propOf(id, w.getMeta(x, y + dy, z), 'thickness');
+    if (ft === 'tip' || ft === 'tip_merge') return 'frustum';
+    return dir(y - dy) !== want ? 'base' : 'middle';
   }
   // the block a wall torch, sign, banner, ladder, lantern, button, lever, rail, dripstone, bamboo ... hangs on or stands
   // on is gone (air, a plant, a fluid): it pops off like in vanilla (players' feedback 2026-10-31: they were left floating)
@@ -1050,7 +1208,9 @@ class Game {
     const w = this.world, P = (n) => Features.propOf(id, meta, n);
     const gone = (dx, dy, dz) => { const n = w.getBlock(x + dx, y + dy, z + dz); return n === 0 || !!REPLACEABLE[n] || !!IS_FLUID[n]; };
     const back = (f) => { const v = { north: [0, 0, 1], south: [0, 0, -1], west: [1, 0, 0], east: [-1, 0, 0], up: [0, -1, 0], down: [0, 1, 0] }[f]; return !!v && gone(...v); };
-    if (k === 'ladder' && !b.states) return !!DIRS[meta] && gone(DIRS[meta][0], 0, DIRS[meta][2]);
+    // torches, levers, buttons, ladders, bamboo: vanilla's own rule (a sturdy face behind or under them) - only "gone"
+    // counted, so they stayed on a torch, a flower, a fence's side ... (feedback 2026-11)
+    if (TORCHLIKE[id] || k === 'lever' || /_button$/.test(k) || k === 'ladder' || k === 'bamboo') return !this.supported(x, y, z, id, meta);
     if (IS_WALL_FORM.has(k)) return !/_wall_(head|skull|hanging_sign)$/.test(k) && back(P('facing'));
     if (k === 'lever' || /_button$/.test(k)) { const f = P('face'); return f === 'floor' ? gone(0, -1, 0) : f === 'ceiling' ? gone(0, 1, 0) : back(P('facing')); }
     if (k === 'lantern' || k === 'soul_lantern' || /copper_lantern$/.test(k)) return P('hanging') === 'true' ? gone(0, 1, 0) : gone(0, -1, 0);
@@ -1061,7 +1221,8 @@ class Game {
     return false;
   }
   // state for a block with a vanilla state list, from how it is placed (facing, axis, hanging, ...)
-  placeState(b, t, hdir) {
+  // (x, y, z: where it goes - for a mod's own rules, which wrap this: 农夫乐事's stove lit, its pot's tray ...)
+  placeState(b, t, hdir, x, y, z) {
     const F = Features, id = b.id, s0 = b.states[0];
     const NAME = ['west', 'east', 'down', 'up', 'north', 'south'];
     let m = 0;
@@ -1088,15 +1249,51 @@ class Game {
     if ('waterlogged' in s0) set('waterlogged', 'false');
     return m;
   }
+  // vanilla BlockPlaceContext.getNearestLookingDirections, as DIRS indices: the way the player looks, nearest axis first
+  // (Direction.orderedByNearest), the clicked block moved to the front unless its own cell is placed into
+  lookingDirs(t, into) {
+    const L = this.lookDir(), ax = [[Math.abs(L[0]), L[0] > 0 ? 1 : 0], [Math.abs(L[1]), L[1] > 0 ? 3 : 2], [Math.abs(L[2]), L[2] > 0 ? 5 : 4]];
+    const a = ax.sort((p, q) => q[0] - p[0]).map(p => p[1]), r = [a[0], a[1], a[2], OPP[a[2]], OPP[a[1]], OPP[a[0]]];
+    if (!into && t) { const c = OPP[t.face]; r.splice(r.indexOf(c), 1); r.unshift(c); }
+    return r;
+  }
+  // a vine or glow lichen: a face on the first block it can hold on to, the way the player looks, in the cell clicked if
+  // it is one with a face free, else the one in front - one more face if that is one (VineBlock / MultifaceBlock
+  // getStateForPlacement). They went down with no face at all, a vine hanging from nothing
+  placeFaces(b, t, held) {
+    const w = this.world, F = Features, id = b.id, R = this.survivalR(), D = DIRS[t.face], NAME = ['west', 'east', 'down', 'up', 'north', 'south'];
+    const sides = b.key === 'vine' ? [3, 0, 1, 4, 5] : [0, 1, 2, 3, 4, 5];
+    const full = (m) => sides.every(d => F.propOf(id, m, NAME[d]) === 'true');
+    const into = !!REPLACEABLE[t.id] && !IS_FLUID[t.id] && !(t.id === id && full(w.getMeta(...t.pos)));
+    const px = t.pos[0] + (into ? 0 : D[0]), py = t.pos[1] + (into ? 0 : D[1]), pz = t.pos[2] + (into ? 0 : D[2]);
+    if (py < 0 || py >= HEIGHT) return;
+    const cur = w.getBlock(px, py, pz), own = cur === id, m0 = own ? w.getMeta(px, py, pz) : 0;
+    if ((cur && !REPLACEABLE[cur]) || (own && full(m0))) return;
+    const up = w.getBlock(px, py + 1, pz) === id ? w.getMeta(px, py + 1, pz) : -1;
+    for (const d of this.lookingDirs(t, into)) {
+      if (!sides.includes(d) || F.propOf(id, m0, NAME[d]) === 'true') continue;
+      // (a vine also hangs on under one with the same face: canSupportAtFace)
+      if (!F.sturdy(R, px + DIRS[d][0], py + DIRS[d][1], pz + DIRS[d][2], OPP[d], 2) && !(b.key === 'vine' && d !== 3 && up >= 0 && F.propOf(id, up, NAME[d]) === 'true')) continue;
+      const wet = cur === WATER ? w.getMeta(px, py, pz) === 0 : cur !== 0 && !own && w.waterAt(px, py, pz);
+      this.placeAt(px, py, pz, id, F.withProp(id, m0, NAME[d], 'true'), held, own);
+      if (wet && w.getBlock(px, py, pz) === id && canWaterlog(id, 0)) w.setWaterlogged(px, py, pz, true);
+      return;
+    }
+  }
+  // the world as Features.canSurvive / sturdy read it
+  survivalR() { return this._survR || (this._survR = { id: (a, c, d) => this.world.getBlock(a, c, d), meta: (a, c, d) => this.world.getMeta(a, c, d), water: (a, c, d) => this.world.waterAt(a, c, d) }); }
   supported(x, y, z, id, meta) {
     const w = this.world, below = w.getBlock(x, y - 1, z);
     const solidBelow = SOLIDCUBE[below] || (BLOCKS[below].slab && (w.getMeta(x, y - 1, z) & 3) !== 0) || BLOCKS[below].stairs && (w.getMeta(x, y - 1, z) & 4) === 0 || below === 63;
-    const b = BLOCKS[id];
+    const b = BLOCKS[id], R = this.survivalR();
+    // a torch: the middle of the top below it (a fence, a wall too), or the whole face behind; a ladder the whole face
+    // behind (vanilla canSupportCenter / isFaceSturdy - before only an opaque cube counted)
+    const holds = (d, mode) => !!DIRS[d] && (typeof Features === 'undefined' ? !!SOLIDCUBE[w.getBlock(x + DIRS[d][0], y + DIRS[d][1], z + DIRS[d][2])]
+      : Features.sturdy(R, x + DIRS[d][0], y + DIRS[d][1], z + DIRS[d][2], OPP[d], mode));
     switch (b.key) {
-      case 'torch': if (!meta || !DIRS[meta]) return solidBelow; return !!SOLIDCUBE[w.getBlock(x + DIRS[meta][0], y, z + DIRS[meta][2])];
-      case 'ladder': return !!SOLIDCUBE[w.getBlock(x + DIRS[meta][0], y, z + DIRS[meta][2])];
+      case 'torch': return !meta || !DIRS[meta] ? holds(2, 1) : holds(meta, 0);
+      case 'ladder': return holds(meta, 0);
       case 'wheat': return below === 63;
-      case 'sugar_cane': return below === 38 || below === 2 || below === 3 || below === 9 || below === 97;
       case 'cactus': return below === 37 || below === 9 || below === 97;
       case 'dead_bush': return below === 9 || below === 97 || below === 3 || below === 2 || below === 83;
       case 'snow': return (!!SOLIDCUBE[below] && below !== 35 && below !== 96) || (below === id && (w.getMeta(x, y - 1, z) & 7) === 7);
@@ -1107,8 +1304,9 @@ class Game {
       case 'red_mushroom': case 'brown_mushroom': return !!SOLIDCUBE[below];
       case 'nether_wart': return below === 120;
     }
-    // vanilla survival rules (supports_* tags) for everything else, incl. the data-driven plants
-    if (typeof Features !== 'undefined' && (b.states || b.id >= 1024 || b.needsSupport)) return Features.canSurvive({ id: (a, c, d) => w.getBlock(a, c, d) }, id, meta, x, y, z);
+    // vanilla survival rules (supports_* tags) for everything else, incl. the data-driven plants and sugar cane (water
+    // next to the block under it - waterlogged blocks count: R.water)
+    if (typeof Features !== 'undefined' && (b.states || b.id >= 1024 || b.needsSupport)) return Features.canSurvive(R, id, meta, x, y, z);
     if (b.needsSupport) return below === 2 || below === 3 || below === 63 || below === 88;
     return true;
   }
@@ -1128,10 +1326,10 @@ class Game {
   randomTickTable() {
     if (this.rtTable) return this.rtTable;
     const t = new Uint8Array(MAX_BLOCKS), extra = typeof BLOCK_RANDOM_TICK !== 'undefined' ? BLOCK_RANDOM_TICK : {};
-    for (const id of [2, 15, 34, 35, 37, 38, 47, 50, 63, 64, 65, 66, 67, 126, 171]) t[id] = 1;
+    for (const id of [2, 15, 34, 35, 37, 38, 47, 50, 63, 64, 65, 66, 67, 126, 171, LAVA]) t[id] = 1;
     for (let i = 0; i < MAX_BLOCKS; i++) {
       const b = BLOCKS[i], k = b && b.key;
-      if (k && (Object.prototype.hasOwnProperty.call(extra, k) || (i >= 1024 && (k.endsWith('_leaves') || k.endsWith('_sapling') || k === 'mangrove_propagule')))) t[i] = 1;
+      if (k && (Object.prototype.hasOwnProperty.call(extra, k) || (i >= 1024 && (k.endsWith('_leaves') || k.endsWith('_sapling') || k === 'mangrove_propagule' || CROP_TICK.test(k))))) t[i] = 1;
     }
     return (this.rtTable = t);
   }
@@ -1147,11 +1345,7 @@ class Game {
         }
         break;
       }
-      case 64: {
-        const m = w.getMeta(x, y, z);
-        if (m < 7 && Math.max(w.skyAt(x, y, z) * this.daylight(), w.blockLightAt(x, y, z)) >= 9 && Math.random() < (w.getMeta(x, y - 1, z) ? 0.5 : 0.25)) w.setMeta(x, y, z, m + 1);
-        break;
-      }
+      case 64: this.cropTick(x, y, z, id); break;
       case 65: case 66: case 67:
         if (Math.random() < 0.15 && (w.skyAt(x, y, z) >= 9 || w.blockLightAt(x, y, z) >= 9)) { if (!(w.gen2 && this.growTreeV(x, y, z, id))) this.growTree(x, y, z, id); }
         break;
@@ -1160,13 +1354,15 @@ class Game {
         for (let dx = -4; dx <= 4 && !wet; dx++) for (let dz = -4; dz <= 4 && !wet; dz++) for (let dy = 0; dy <= 1; dy++) if (w.waterAt(x + dx, y + dy, z + dz)) { wet = true; break; }
         const m = w.getMeta(x, y, z);
         if (wet && !m) w.setMeta(x, y, z, 1);
-        else if (!wet) { if (m) w.setMeta(x, y, z, 0); else if (w.getBlock(x, y + 1, z) !== 64 && Math.random() < 0.3) w.setBlock(x, y, z, 3, 0); }
+        // (dry, it turns back to dirt unless a crop or stem on it keeps it: vanilla's maintains_farmland - only wheat did)
+        else if (!wet) { if (m) w.setMeta(x, y, z, 0); else if (w.getBlock(x, y + 1, z) !== 64 && !(typeof Features !== 'undefined' && Features.tagSet('maintains_farmland').has(w.getBlock(x, y + 1, z))) && Math.random() < 0.3) w.setBlock(x, y, z, 3, 0); }
         break;
       }
       case 38: case 37: {
         if (w.getBlock(x, y + 1, z) === 0 && Math.random() < 0.08) {
           let h = 1; while (w.getBlock(x, y - h, z) === id) h++;
-          if (h < 3) w.setBlock(x, y + 1, z, id, 0);
+          // (sugar cane planted away from water before that was checked: it doesn't grow)
+          if (h < 3 && (id !== 38 || this.supported(x, y - h + 1, z, id, 0))) w.setBlock(x, y + 1, z, id, 0);
         }
         break;
       }
@@ -1180,14 +1376,116 @@ class Game {
         if (!b || id < 1024) break;
         if (b.key.endsWith('_leaves')) { if (!(w.getMeta(x, y, z) & 4) && !this.nearLog(x, y, z)) this.breakBlock(x, y, z, true, true); }
         else if ((b.key.endsWith('_sapling') || b.key === 'mangrove_propagule') && Math.random() < 0.15 && (w.skyAt(x, y, z) >= 9 || w.blockLightAt(x, y, z) >= 9)) this.growTreeV(x, y, z, id);
+        else if (CROP_TICK.test(b.key)) this.cropTick(x, y, z, id);
         break;
       }
       case 171: this.fireTick(x, y, z); break;
+      case LAVA: this.lavaTick(x, y, z); break;
       case 126: { const m = w.getMeta(x, y, z); if (m < 3 && Math.random() < 0.15) w.setMeta(x, y, z, m + 1); break; }
       case 34: case 35:
         if (w.blockLightAt(x, y, z) > 11 || (id === 35 && w.blockLightAt(x, y + 1, z) > 11)) { if (id === 35) w.setBlock(x, y, z, WATER, 0); else w.setBlock(x, y, z, 0, 0); }
         break;
     }
+  }
+  // a crop's random tick (vanilla CropBlock / StemBlock / SweetBerryBushBlock.randomTick): in light 9 or more, a stage
+  // now and then by the farmland around it (cropSpeed); a grown stem puts a melon or pumpkin beside it. Only wheat grew
+  // (up to three times as fast as vanilla's): carrots, potatoes, beetroots, stems and berry bushes never did
+  cropTick(x, y, z, id) {
+    const w = this.world, b = BLOCKS[id], k = b.key, m = w.getMeta(x, y, z);
+    // (getRawBrightness(pos, 0): the sky light as it is, not darkened at night - crops under the sky grow at night too)
+    const light = (yy) => Math.max(w.skyAt(x, yy, z), w.blockLightAt(x, yy, z));
+    const age = id === 64 ? m : +Features.propOf(id, m, 'age'), setAge = (a) => w.setMeta(x, y, z, id === 64 ? a : Features.withProp(id, m, 'age', String(a)));
+    if (isNaN(age)) return;
+    if (k === 'pitcher_crop') { if (Features.propOf(id, m, 'half') === 'lower' && Math.random() * (Math.floor(25 / this.cropSpeed(x, y, z, id)) + 1) < 1) this.growPitcher(x, y, z, id); return; }
+    if (k === 'sweet_berry_bush') { if (age < 3 && Math.random() < 0.2 && light(y + 1) >= 9) setAge(age + 1); return; }
+    if ((k === 'beetroots' || k === 'torchflower_crop') && Math.random() < 1 / 3) return;
+    if (light(y) < 9 || Math.random() * (Math.floor(25 / this.cropSpeed(x, y, z, id)) + 1) >= 1) return;
+    if (k === 'melon_stem' || k === 'pumpkin_stem') {
+      if (age < 7) { setAge(age + 1); return; }
+      const d = [[0, -1, 'north'], [0, 1, 'south'], [-1, 0, 'west'], [1, 0, 'east']][(Math.random() * 4) | 0];
+      const fruit = BID[k === 'melon_stem' ? 'melon' : 'pumpkin'], at = BID['attached_' + k], fx = x + d[0], fz = z + d[1];
+      if (fruit !== undefined && at !== undefined && w.getBlock(fx, y, fz) === 0 && Features.tagSet('supports_' + k + '_fruit').has(w.getBlock(fx, y - 1, fz))) {
+        w.setBlock(fx, y, fz, fruit, 0); w.setBlock(x, y, z, at, Features.withProp(at, 0, 'facing', d[2]));
+      }
+      return;
+    }
+    // (a torchflower crop past its last stage is a torchflower)
+    const max = id === 64 ? 7 : Math.max(...b.states.map((s) => +s.age).filter((n) => !isNaN(n)));
+    if (age < max) setAge(age + 1);
+    else if (k === 'torchflower_crop' && BID.torchflower !== undefined) w.setBlock(x, y, z, BID.torchflower, 0);
+  }
+  // vanilla PitcherCropBlock.grow: the lower half one stage older (0..4) in light 8 or more; from stage 3 it is two
+  // blocks, the upper half where there is air (or its own). False if it cannot grow
+  growPitcher(x, y, z, id) {
+    const w = this.world, m = w.getMeta(x, y, z), age = +Features.propOf(id, m, 'age');
+    if (!(age < 4) || Math.max(w.skyAt(x, y, z), w.blockLightAt(x, y, z)) < 8 || y + 1 >= HEIGHT) return false;
+    const up = w.getBlock(x, y + 1, z);
+    if (age + 1 >= 3 && up !== 0 && up !== id) return false;
+    const nm = Features.withProp(id, m, 'age', String(age + 1));
+    w.setMeta(x, y, z, nm);
+    if (age + 1 >= 3) { if (up === id) w.setMeta(x, y + 1, z, Features.withProp(id, nm, 'half', 'upper')); else w.setBlock(x, y + 1, z, id, Features.withProp(id, nm, 'half', 'upper')); }
+    return true;
+  }
+  // vanilla CropBlock.getGrowthSpeed: 1, + the farmland under it (3 wet, 1 dry) and a quarter of that for the 8 around;
+  // halved when the same crop is beside it both ways or on a diagonal
+  cropSpeed(x, y, z, id) {
+    const w = this.world;
+    let s = 1;
+    for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+      const v = w.getBlock(x + dx, y - 1, z + dz) === 63 ? (w.getMeta(x + dx, y - 1, z + dz) ? 3 : 1) : 0;
+      s += dx || dz ? v / 4 : v;
+    }
+    const at = (a, c) => w.getBlock(x + a, y, z + c) === id;
+    if ((at(-1, 0) || at(1, 0)) && (at(0, -1) || at(0, 1)) || at(-1, -1) || at(1, -1) || at(1, 1) || at(-1, 1)) s /= 2;
+    return s;
+  }
+  // ---- bone meal under water ----
+  tallSeagrass(x, y, z) {
+    const T = BID.tall_seagrass;
+    this.world.setBlock(x, y, z, T, Features.withProp(T, 0, 'half', 'lower'));
+    this.world.setBlock(x, y + 1, z, T, Features.withProp(T, 0, 'half', 'upper'));
+  }
+  // vanilla SeaPickleBlock.performBonemeal: in a diamond 5 wide around it, the water one or two high over a coral block
+  // gets 1-4 pickles one time in 6; it has 4
+  spreadPickles(x, y, z) {
+    const w = this.world, id = BID.sea_pickle, corals = Features.tagSet('coral_blocks');
+    const state = (n) => Math.max(0, BLOCKS[id].states.findIndex((s) => s.pickles === String(n) && s.waterlogged !== 'false'));
+    for (let i = 0, span = 1, off = 0; i < 5; i++) {
+      for (let j = 0; j < span; j++) for (let py = y - 1; py <= y; py++) {
+        const px = x - 2 + i, pz = z - off + j;
+        if ((px !== x || py !== y || pz !== z) && Math.random() < 1 / 6 && w.getBlock(px, py, pz) === WATER && corals.has(w.getBlock(px, py - 1, pz))) { w.setBlock(px, py, pz, id, state(1 + ((Math.random() * 4) | 0))); w.setWaterlogged(px, py, pz, true); }
+      }
+      if (i < 2) { span += 2; off++; } else { span -= 2; off--; }
+    }
+    w.setMeta(x, y, z, Features.withProp(id, w.getMeta(x, y, z), 'pickles', '4'));
+  }
+  // bone meal on a full face with a water source in front (vanilla BoneMealItem.growWaterPlant): 128 tries, try j taking
+  // j/16 random steps from that water (a full block ends it); seagrass where it can stand in a water source - in a warm
+  // ocean a coral or coral fan one time in 4, and on the first try from a side face a wall fan facing out of it -, or
+  // seagrass already there growing tall one time in 10. False if there is no water source
+  growWaterPlant(x, y, z, face) {
+    const w = this.world, rnd = (n) => (Math.random() * n) | 0;
+    if (w.getBlock(x, y, z) !== WATER || w.getMeta(x, y, z) !== 0 || BID.seagrass === undefined) return false;
+    const R = { id: (a, b, c) => w.getBlock(a, b, c) }, any = (t) => { const s = [...Features.tagSet(t)]; return s.length ? s[rnd(s.length)] : BID.seagrass; };
+    const FACE = ['west', 'east', 'down', 'up', 'north', 'south'];
+    next: for (let j = 0; j < 128; j++) {
+      let px = x, py = y, pz = z;
+      for (let i = 0; i < (j >> 4); i++) {
+        px += rnd(3) - 1; py += Math.trunc((rnd(3) - 1) * rnd(3) / 2); pz += rnd(3) - 1;
+        if (SOLIDCUBE[w.getBlock(px, py, pz)]) continue next;
+      }
+      let id = BID.seagrass, meta = 0;
+      if (/warm_ocean/.test(biomeName(this, px, pz))) {
+        if (j === 0 && face !== 2 && face !== 3) { id = any('wall_corals'); meta = Features.withProp(id, 0, 'facing', FACE[face]); }
+        else if (rnd(4) === 0) id = any('underwater_bonemeals');
+        if (/_wall_fan$/.test(BLOCKS[id].key)) for (let d = 0; d < 4 && !Features.canSurvive(R, id, meta, px, py, pz); d++) meta = Features.withProp(id, meta, 'facing', FACE[[0, 1, 4, 5][rnd(4)]]);
+      }
+      if (py < 1 || py >= HEIGHT || !Features.canSurvive(R, id, meta, px, py, pz)) continue;
+      const cur = w.getBlock(px, py, pz);
+      if (cur === WATER && w.getMeta(px, py, pz) === 0) w.setBlock(px, py, pz, id, meta);
+      else if (cur === BID.seagrass && BID.tall_seagrass !== undefined && w.getBlock(px, py + 1, pz) === WATER && rnd(10) === 0) this.tallSeagrass(px, py, pz);
+    }
+    return true;
   }
   nearLog(x, y, z) {
     const w = this.world, seen = new Set([`${x},${y},${z}`]), q = [[x, y, z, 0]];
@@ -1259,7 +1557,7 @@ class Game {
       const wasBurning = be.burn > 0;
       if (be.burn > 0) be.burn--;
       const kind = be.kind || 'smelting', rec = be.input && COOKING[kind][be.input.id];
-      be.cookMax = rec ? rec.time : be.cookMax || 200;
+      be.cookMax = (rec && rec.time) || be.cookMax || 200;
       const canSmelt = rec && (!be.output || (be.output.id === rec.result && be.output.count < maxStack(rec.result)));
       if (be.burn === 0 && canSmelt && be.fuel) {
         const f = Math.floor(fuelValue(be.fuel.id) / (kind === 'smelting' ? 1 : 2));
@@ -1299,17 +1597,28 @@ class Game {
     const p = this.player, w = this.world;
     const meta = w.getMeta(x, y, z);
     let hx = x, hz = z;
-    if (!(meta & 4)) { const D2 = DIRS[[4, 1, 5, 0][meta & 3]]; hx += D2[0]; hz += D2[2]; }
-    p.spawn = [hx, y + 1, hz]; p.bedSpawn = true;
-    const t = this.dayTime();
-    // (vanilla's night: 12542 to 23459 - before, from 23459 to 1000 of the morning counted as night too, and a player
-    // just woken could lie down again at once: "睡醒后点床还能再睡", "白天也能睡觉"; no thunderstorms here, rain doesn't count)
-    if (t < 12542 || t > 23459) { this.ui.actionBar = { text: '你只能在夜间或雷暴中入睡（已设置重生点）', t: performance.now() }; return; }
+    const D2 = DIRS[[4, 1, 5, 0][meta & 3]];
+    if (!(meta & 4)) { hx += D2[0]; hz += D2[2]; }
     if (Math.hypot(p.pos[0] - hx - 0.5, p.pos[2] - hz - 0.5) > 3) { this.ui.actionBar = { text: '你离床太远了', t: performance.now() }; return; }
+    // a block to choke in over the head or the foot: no sleeping, no spawn point (vanilla ServerPlayer.bedBlocked)
+    const choke = (a, b) => { const id = w.getBlock(a, y + 1, b); return !!(SOLIDCUBE[id] && AOCUBE[id]); };
+    if (choke(hx, hz) || choke(hx - D2[0], hz - D2[2])) { this.ui.actionBar = { text: '这张床已被阻挡', t: performance.now() }; return; }
+    p.spawn = [hx, y + 1, hz]; p.bedSpawn = true; p.spawnYaw = p.yaw;
+    // vanilla Level.isDarkOutside: the sky darkened by 4 or more - 12523 to 23477 in clear weather, 12002 to 23998 in
+    // rain, all day in a thunderstorm (/weather thunder: "雷暴不能入睡", feedback 11-03/08). (Once 23459 to 1000 of the
+    // morning counted as night too, and a player just woken could lie down again at once)
+    // 26.2: skyDarken = (int)(15 - sky light level); the level is 15 times the overworld_day timeline's multiplier
+    // (linear: 1 at 11867, 0.2667 from 13670 to 22330, 1 again at 24133), blended toward 4 by rain and thunder
+    const rain = clamp(this.weather || 0, 0, 1), thunder = this.thunder ? rain : 0;
+    const tt = this.dayTime() < 133 ? this.dayTime() + 24000 : this.dayTime(), NM = 0.26666668;
+    let sky = 15 * (tt <= 11867 ? 1 : tt < 13670 ? 1 + (NM - 1) * (tt - 11867) / 1803 : tt <= 22330 ? NM : NM + (1 - NM) * (tt - 22330) / 1803);
+    sky += (rain - thunder) * 0.3125 * (4 - sky); sky += thunder * 0.52734375 * (4 - sky);
+    if (Math.floor(15 - sky) < 4) { this.ui.actionBar = { text: '你只能在夜间或雷暴中入睡（已设置重生点）', t: performance.now() }; return; }
     const danger = this.entities.some(e => e instanceof Mob && e.T.hostile && e.deathTime === 0 && Math.abs(e.pos[0] - hx) < 8 && Math.abs(e.pos[1] - y) < 5 && Math.abs(e.pos[2] - hz) < 8);
     if (danger) { this.ui.actionBar = { text: '你现在不能休息，周围有怪物在游荡', t: performance.now(), color: '#FF5555' }; return; }
-    this.sleeping = { x: hx + 0.5, y: y + 0.5625, z: hz + 0.5, t: 0, rot: meta & 3, bed: [hx, y, hz], foot: [x === hx && z === hz ? hx - DIRS[[4, 1, 5, 0][meta & 3]][0] : x, y, x === hx && z === hz ? hz - DIRS[[4, 1, 5, 0][meta & 3]][2] : z] };
+    this.sleeping = { x: hx + 0.5, y: y + 0.5625, z: hz + 0.5, t: 0, rot: meta & 3, bed: [hx, y, hz] };
     p.vel = [0, 0, 0];
+    p.hurtTime = 0; // (wakes a new hurt only: the last one's count doesn't go down in bed - the player got up at once)
     this.ui.message('正在睡觉…（' + (touchOn(this) ? '点击潜行按钮' : '按 Shift ') + '起床）', '#AAAAAA');
   }
   tickSleep() {
@@ -1325,6 +1634,7 @@ class Game {
     if (s.t >= 100) {
       this.worldTime = (Math.floor(this.worldTime / 24000) + 1) * 24000;
       if (this.rainTarget) { this.rainTarget = 0; this.weather = 0; }
+      this.thunder = false; // (vanilla resetWeatherCycle: the storm ends too)
       this.ui.message('早上好！', '#FFFF55'); this.grant('sleep');
     }
     if (s.t >= 100 || wake) {
@@ -1333,22 +1643,33 @@ class Game {
     }
     return true;
   }
-  // getting out of bed (vanilla BedBlock.findStandUpPosition): a free spot with a floor beside the bed, around the head
-  // then the foot; only without one on top of the bed. It used to go straight up until free - through a low ceiling
-  // onto the roof: "睡醒后在房顶上", feedback 2026-11-01/02
+  // getting out of bed (vanilla LivingEntity.stopSleeping): where bedStandUp finds room, else on the bed. It used to go
+  // straight up until a standing box was free - through a low ceiling onto the roof: "睡醒后在房顶上", "卡到天花板上"
   standUp(s) {
-    const p = this.player, w = this.world;
-    const fits = (x, y, z) => { p.pos = [x + 0.5, y, z + 0.5]; return !p.collides(p.box()); };
-    const floor = (x, y, z) => { const id = w.getBlock(x, y - 1, z); return !!(BLOCKS[id] && BLOCKS[id].solid) && !IS_FLUID[w.getBlock(x, y, z)]; };
-    for (const c of [s.bed, s.foot].filter(Boolean)) {
-      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]) {
-        const x = c[0] + dx, z = c[2] + dz;
-        for (const y of [c[1], c[1] + 1, c[1] - 1]) if (floor(x, y, z) && fits(x, y, z)) { p.prev = [...p.pos]; return; }
-      }
-    }
-    p.pos = [s.x, s.y, s.z];
-    while (p.collides(p.box()) && p.pos[1] < HEIGHT) p.pos[1] += 1;
-    p.prev = [...p.pos];
+    const p = this.player;
+    p.h = PLAYER_H.stand; // (the next tick picks the pose that fits: crouching or crawling under a low ceiling)
+    const bed = s.bed && this.world && BLOCKS[this.world.getBlock(s.bed[0], s.bed[1], s.bed[2])];
+    p.pos = (bed && bed.bed && this.bedStandUp(s.bed, s.rot, p.yaw)) || [s.x, s.y, s.z];
+    p.prev = [...p.pos]; p.vel = [0, 0, 0];
+    if (bed && bed.bed) this.faceBed(s.bed);
+  }
+  // turned to the bed's head block, looking level (vanilla stopSleeping, RespawnPosAngle.of); on the bed: yaw kept
+  faceBed(head) {
+    const p = this.player, dx = head[0] + 0.5 - p.pos[0], dz = head[2] + 0.5 - p.pos[2];
+    if (dx * dx + dz * dz > 1e-6) p.yaw = Math.atan2(-dx, -dz);
+    p.pitch = 0;
+  }
+  // vanilla BedBlock.findStandUpPosition for the bed whose head is at head (rot: its meta & 3): a spot with a floor and
+  // room to stand around it - first on the side the player doesn't face, the foot's end last - or on the bed itself;
+  // away from fire, lava, cacti ... if it can be. null if none
+  bedStandUp(head, rot, yaw) {
+    const p = this.player, f = DIRS[[4, 1, 5, 0][rot & 3]], fx = f[0], fz = f[2];
+    let sx = -fz, sz = fx; // (clockwise of the bed's facing)
+    if (-Math.sin(yaw) * sx - Math.cos(yaw) * sz > 0) { sx = -sx; sz = -sz; }
+    const offs = [[sx, sz], [sx - fx, sz - fz], [sx - 2 * fx, sz - 2 * fz], [-2 * fx, -2 * fz], [-sx - 2 * fx, -sz - 2 * fz], [-sx - fx, -sz - fz],
+      [-sx, -sz], [-sx + fx, -sz + fz], [fx, fz], [sx + fx, sz + fz], [0, 0], [-fx, -fz]];
+    for (const danger of [true, false]) for (const [dx, dz] of offs) { const at = safeStandAt(p, head[0] + dx, head[1], head[2] + dz, danger); if (at) return at; }
+    return null;
   }
   fillLoot(be, x, y, z) {
     const r = RNG(hashStr('loot' + this.world.seed + ':' + x + ':' + y + ':' + z));
@@ -1398,7 +1719,7 @@ class Game {
   onPlayerHurt(src) { this.hurtTilt = 1; }
   onPlayerDeath(src) {
     const p = this.player;
-    const msgs = { in_wall: '在墙里窒息而亡', fall: '从高处摔了下来', lava: '试图在熔岩里游泳', fire: '被烧死了', drown: '淹死了', starve: '饿死了', mob: '被杀死了', arrow: '被射杀', explosion: '爆炸了', cactus: '被戳死了', void: '掉出了这个世界', hotFloor: '发现了地板是熔岩做的', lightning: '被闪电击中', freeze: '被冻死了', berry: '被甜浆果丛戳死了' };
+    const msgs = { in_wall: '在墙里窒息而亡', fall: '从高处摔了下来', lava: '试图在熔岩里游泳', fire: '被烧死了', drown: '淹死了', starve: '饿死了', mob: '被杀死了', arrow: '被射杀', explosion: '爆炸了', cactus: '被戳死了', void: '掉出了这个世界', hotFloor: '发现了地板是熔岩做的', lightning: '被闪电击中', freeze: '被冻死了', berry: '被甜浆果丛戳死了', firework: '随着一声巨响消失了' };
     let msg = msgs[src && src.type] || '死了';
     if (src && src.attacker && src.attacker.T) msg = (src.type === 'arrow' ? '被' + src.attacker.T.cn + '射杀' : '被' + src.attacker.T.cn + '杀死了');
     if (src && src.type === 'explosion' && src.attacker && src.attacker.T) msg = '被' + src.attacker.T.cn + '炸死了';
@@ -1414,28 +1735,20 @@ class Game {
   respawn() {
     const p = this.player, s = p.spawn;
     if (this.net) { this.net.send({ t: 'respawn' }); p.deathTime = 0; this.ui.close(); return; } // the server places us
-    if (this.dim !== 'overworld') {
-      p.health = 20; p.food = 20; p.saturation = 5; p.deathTime = 0; p.fire = 0; p.air = 300; p.dead = false;
-      this.ui.close();
-      this.changeDimension('overworld', [s[0] + 0.5, s[1], s[2] + 0.5], () => { let y = s[1]; while (p.collides(p.box()) && y < HEIGHT) { y++; p.pos[1] = y; } p.prev = [...p.pos]; });
-      return;
-    }
-    // a bed broken or gone (where it can be seen now): the world's spawn instead, as vanilla
-    if (p.bedSpawn && this.world.isLoaded(s[0], s[2]) && !(BLOCKS[this.world.getBlock(s[0], s[1] - 1, s[2])] || {}).bed) {
-      p.bedSpawn = false; p.spawn = (this.worldMeta && this.worldMeta.spawn) || s; this.ui.message('你的床已丢失或被阻挡', '#FFFFFF');
-      return this.respawn();
-    }
-    p.pos = [s[0] + 0.5, s[1], s[2] + 0.5]; p.prev = [...p.pos]; p.vel = [0, 0, 0];
     p.health = 20; p.food = 20; p.saturation = 5; p.deathTime = 0; p.fire = 0; p.air = 300; p.fallDist = 0; p.dead = false;
-    let y = s[1];
-    while (p.collides(p.box()) && y < HEIGHT) { y++; p.pos[1] = y; }
-    p.prev = [...p.pos];
-    p.respawnGround = true;
     this.ui.close();
+    // (the spot is settled by respawnSettle once its chunks are here - the bed checked then, wherever it is)
+    if (this.dim !== 'overworld') { this.changeDimension('overworld', [s[0] + 0.5, s[1], s[2] + 0.5], () => { p.respawnGround = true; this.respawnSettle(); }); return; }
+    p.pos = [s[0] + 0.5, s[1], s[2] + 0.5]; p.prev = [...p.pos]; p.vel = [0, 0, 0];
+    p.respawnGround = true;
+    this.respawnSettle();
   }
-  // after a respawn, once the spot's chunk is there: down onto the ground if it is in the air (the spawn's chunk was
-  // often not loaded at the respawn - nothing to stand on, the player left at the saved height and fell: "复活在高空摔死",
-  // feedback 2026-11-01/02), up out of blocks if in them
+  // after a respawn, once the spot's chunks are here (at once if they are): at a bed, beside it if the bed is still
+  // there with room to get up, else the world's spawn (vanilla findRespawnAndUseSpawnBlock - the bed was checked only
+  // when its chunk happened to be loaded at the respawn, never coming from another dimension: "拆床后重生点不消失");
+  // elsewhere up out of blocks, down onto the ground if in the air. (A chunk not loaded counts as a wall: respawn climbed
+  // up through it to the top of the world, and this put the player on the first block from the top - a roof, a
+  // mountain: "复活到屋顶 / 高空". A bed under a low ceiling climbed through it too)
   // the full opaque block at the player's eyes, or 0
   inWallBlock() {
     const p = this.player, w = this.world; if (!p || !w) return 0; // (no world while joining a room: the HUD asked - "render: reading 'getBlock'")
@@ -1449,6 +1762,17 @@ class Game {
   respawnSettle() {
     const p = this.player, w = this.world, x = Math.floor(p.pos[0]), z = Math.floor(p.pos[2]);
     if (!w.isLoaded(x, z) || !w.isLoaded(x + 16, z) || !w.isLoaded(x - 16, z)) return;
+    if (p.bedSpawn) {
+      if (!w.isLoaded(x, z + 16) || !w.isLoaded(x, z - 16)) return; // (the spots around the bed: unloaded isn't "lost")
+      const s = p.spawn, m = w.getMeta(s[0], s[1] - 1, s[2]), head = [s[0], s[1] - 1, s[2]];
+      if (!(m & 4)) { const D = DIRS[[4, 1, 5, 0][m & 3]]; head[0] += D[0]; head[2] += D[2]; }
+      // (the side to get up on by the way one faced when the spawn was set, as vanilla RespawnData.yaw)
+      const bed = BLOCKS[w.getBlock(s[0], s[1] - 1, s[2])], at = bed && bed.bed && this.bedStandUp(head, m & 3, p.spawnYaw ?? p.yaw);
+      if (at) { p.pos = at; p.prev = [...at]; p.vel = [0, 0, 0]; p.respawnGround = false; this.faceBed(head); return; }
+      p.bedSpawn = false; p.spawn = (this.worldMeta && this.worldMeta.spawn) || s; this.ui.message('你的床已丢失或被阻挡', '#FFFFFF');
+      const t = p.spawn; p.pos = [t[0] + 0.5, t[1], t[2] + 0.5]; p.prev = [...p.pos]; p.vel = [0, 0, 0];
+      return this.respawnSettle();
+    }
     p.respawnGround = false;
     if (p.flying || p.noClip) return;
     let y = Math.floor(p.pos[1]);
@@ -1477,7 +1801,7 @@ class Game {
   dropBlockLoot(x, y, z, id, meta, tool) {
     const b = BLOCKS[id];
     let drops;
-    if (tool && ITEMS[tool.id].key === 'shears' && (b.key.endsWith('leaves') || id === 39 || id === 40 || id === 45 || b.key === 'cobweb')) drops = [[id, 1]];
+    if (tool && ITEMS[tool.id].key === 'shears' && (b.shearsDrop || b.key.endsWith('leaves') || id === 39 || id === 40 || id === 45 || b.key === 'cobweb')) drops = typeof b.shearsDrop === 'function' ? b.shearsDrop(meta, Math.random, tool) : [[b.shearsDrop || id, 1]];
     else if (b.drops && enchLevel(tool, 'silk_touch') && ITEMS[id] && !b.noItem && !NO_SILK.has(b.key)) drops = [[id, 1]];
     else if (b.drops) {
       drops = b.drops(meta, Math.random, tool);
@@ -1490,12 +1814,14 @@ class Game {
   }
 
   // ---- explosions ----------------------------------------------------------------------------
-  explode(x, y, z, power, source, inWater, fire) {
+  // mob: a mob's blast (creeper, ghast fireball, wither) - it breaks no blocks and lights nothing while the mob_griefing
+  // rule is off (vanilla ExplosionInteraction.MOB)
+  explode(x, y, z, power, source, inWater, fire, mob) {
     const w = this.world;
     Sound.explode([x, y, z]);
     if (source instanceof PrimedTNT) this.grant('tnt');
     const destroy = new Set();
-    if (!inWater) {
+    if (!inWater && !(mob && this.rule && this.rule('mob_griefing') === false)) {
       const r = Math.random;
       for (let i = 0; i < 16; i++) for (let j = 0; j < 16; j++) for (let k = 0; k < 16; k++) {
         if (i > 0 && i < 15 && j > 0 && j < 15 && k > 0 && k < 15) continue;
@@ -1507,7 +1833,9 @@ class Game {
           const id = w.getBlock(bx, by, bz);
           if (id) {
             const b = BLOCKS[id];
-            const res = b.hardness < 0 ? 3600000 : IS_FLUID[id] ? 100 : b.hardness >= 50 ? 1200 : (b.tool === 'pickaxe' ? b.hardness * 4 : b.hardness);
+            // (vanilla's explosion resistance: it was the hardness x 4 for pickaxe blocks - redstone, iron, diamond blocks
+            // 20 instead of 6, TNT didn't break them, "tnt炸不掉红石块")
+            const res = IS_FLUID[id] ? 100 : blastRes(b);
             s -= (res + 0.3) * 0.3;
             if (s > 0 && by >= 0) destroy.add(bx + ',' + by + ',' + bz);
           }
@@ -1542,7 +1870,7 @@ class Game {
       if (Math.random() < 1 / power && this.mode !== 'creative') this.dropBlockLoot(lootAt[0], lootAt[1], lootAt[2], id, lootAt[3], null);
       w.setBlock(bx, by, bz, 0, 0);
     } } finally { this.blasting = null; }
-    if (fire) for (const k of destroy) { const [bx, by, bz] = k.split(',').map(Number); if (Math.random() < 0.33 && w.getBlock(bx, by, bz) === 0 && SOLIDCUBE[w.getBlock(bx, by - 1, bz)]) w.setBlock(bx, by, bz, 171, 0); }
+    if (fire) for (const k of destroy) { const [bx, by, bz] = k.split(',').map(Number); if (Math.random() < 0.33 && w.getBlock(bx, by, bz) === 0 && SOLIDCUBE[w.getBlock(bx, by - 1, bz)]) w.setBlock(bx, by, bz, this.fireIdAt(bx, by, bz), 0); }
     // damage entities
     const R = power * 2;
     for (const e of [...this.entities, this.player]) {
@@ -1554,7 +1882,9 @@ class Game {
       const imp = (1 - d / R) * this.blastSeen(x, y, z, e);
       if (imp <= 0) continue;
       const dir = [(e.pos[0] - x) / (d || 1), (e.pos[1] + e.h / 2 - y) / (d || 1), (e.pos[2] - z) / (d || 1)];
-      if (e instanceof Living) e.hurt(Math.floor((imp * imp + imp) / 2 * 7 * R + 1), { type: 'explosion', attacker: source && source.T ? source : null });
+      // (knockFrom: where it went off - a shield faces that way to block it, vanilla getSourcePosition; a TNT blast had
+      // none, so no shield ever stopped it. knock 0: the push is below)
+      if (e instanceof Living) e.hurt(Math.floor((imp * imp + imp) / 2 * 7 * R + 1), { type: 'explosion', attacker: source && source.T ? source : null, knockFrom: [x, y, z], knock: 0 });
       else if (e.hittable && e instanceof EndCrystal && !e.dead) { setTimeout(() => e.hurt(1, { type: 'explosion' }), 50); continue; }
       if (e instanceof EnderDragon || e instanceof EndCrystal) continue;
       e.vel[0] += dir[0] * imp; e.vel[1] += dir[1] * imp + 0.1; e.vel[2] += dir[2] * imp;
@@ -1579,9 +1909,18 @@ class Game {
     return n ? seen / n : 1;
   }
   // ---- raycasting ----------------------------------------------------------------------------
-  lookDir() { const p = this.player, cp = Math.cos(p.pitch); return [-Math.sin(p.yaw) * cp, Math.sin(p.pitch), -Math.cos(p.yaw) * cp]; }
+  lookDir() { const p = this.player, cp = Math.cos(p.pitch), yaw = this.viewYaw(); return [-Math.sin(yaw) * cp, Math.sin(p.pitch), -Math.cos(yaw) * cp]; }
+  // the yaw the view is drawn with: in a boat plus the boat's turn so far between ticks (vehicles.js turns its rider
+  // once a tick), as vanilla's getViewYRot. frameA: the last frame's partial tick, 0 again at each tick
+  viewYaw() {
+    const p = this.player, rv = p.vehicle;
+    return typeof Boat !== 'undefined' && rv instanceof Boat && rv.prevYaw !== undefined ? p.yaw + (rv.yaw - rv.prevYaw) * (this.frameA || 0) : p.yaw;
+  }
   selBoxes(x, y, z, id) {
     const b = BLOCKS[id], m = this.world.getMeta(x, y, z);
+    if (!b) return []; // (a block this page doesn't know - a mod's, the world opened without that mod - 11-13: it threw here every tick)
+    // a light block is a whole block to one holding a light block, else nothing (LightBlock.getShape)
+    if (b.key === 'light') { const h = this.player && this.player.inv.held; return h && ITEMS[h.id] && ITEMS[h.id].key === 'light' ? [[0, 0, 0, 1, 1, 1]] : []; }
     if (b.shape === SH_BOXES || b.shape === SH_MODEL) return b.boxes(m).map(a => a.map(v => v / 16));
     if (b.shape === SH_CROSS || b.shape === SH_CROP) return [[0.15, 0, 0.15, 0.85, b.key === 'wheat' ? 0.25 + (m & 7) / 10 : 0.8, 0.85]];
     if (b.shape === SH_TORCH) {
@@ -1594,7 +1933,9 @@ class Game {
     if (b.shape === SH_CACTUS) return [[1 / 16, 0, 1 / 16, 15 / 16, 1, 15 / 16]];
     return [[0, 0, 0, 1, 1, 1]];
   }
-  raycast(origin, dir, maxD, fluids) {
+  // (vis: the collision shapes instead of the selection boxes, nothing for a block without one - vanilla's VISUAL clip,
+  // for the third-person camera: plants and grass don't pull it in; VIS_NONE / VIS_SEL above)
+  raycast(origin, dir, maxD, fluids, vis) {
     const w = this.world;
     let x = Math.floor(origin[0]), y = Math.floor(origin[1]), z = Math.floor(origin[2]);
     const sx = Math.sign(dir[0]), sy = Math.sign(dir[1]), sz = Math.sign(dir[2]);
@@ -1602,8 +1943,11 @@ class Game {
     let tx = (sx > 0 ? x + 1 - origin[0] : origin[0] - x) * tdx, ty = (sy > 0 ? y + 1 - origin[1] : origin[1] - y) * tdy, tz = (sz > 0 ? z + 1 - origin[2] : origin[2] - z) * tdz;
     for (let i = 0; i < 200; i++) {
       const id = w.getBlock(x, y, z);
-      if (id && (!IS_FLUID[id] || (fluids && w.getMeta(x, y, z) === 0))) {
-        const boxes = IS_FLUID[id] ? [[0, 0, 0, 1, 0.9, 1]] : this.selBoxes(x, y, z, id);
+      const B = BLOCKS[id];
+      if (id && (!IS_FLUID[id] || (fluids && w.getMeta(x, y, z) === 0)) && !(vis && (VIS_NONE[id] || (!B.solid && !B.collide && !VIS_SEL[id])))) {
+        const boxes = IS_FLUID[id] ? [[0, 0, 0, 1, 0.9, 1]] : vis && VIS_SEL[id] && B.fence ? B.boxes(w.fenceMeta(x, y, z, B)).map(a => a.map(v => v / 16))
+          : vis && !VIS_SEL[id] && B.collide && (B.shape === SH_BOXES || B.shape === SH_MODEL)
+          ? B.collide(B.fence ? w.fenceMeta(x, y, z, B) : w.getMeta(x, y, z), null, y).map(a => a.map(v => v / 16)) : this.selBoxes(x, y, z, id);
         let best = null;
         for (const bx of boxes) {
           const hit = rayBox(origin, dir, x + bx[0], y + bx[1], z + bx[2], x + bx[3], y + bx[4], z + bx[5]);
@@ -1645,27 +1989,33 @@ class Game {
   }
   handleInteraction() {
     const p = this.player;
-    if (this.ui.screen || p.deathTime > 0 || this.mode === 'spectator') { this.breaking = null; p.usingItem = null; this.target = null; this.targetEntity = null; return; }
+    if (this.ui.screen || p.deathTime > 0 || this.mode === 'spectator') { this.breaking = null; p.usingItem = null; this.target = null; this.targetEntity = null; this.mouseClicked0 = this.useClicked = false; return; }
     this.updateTarget();
     if (this.net) { this.netInteraction(); return; }
     if (this.useCd > 0) this.useCd--;
     if (this.attackCd > 0) this.attackCd--;
     // continuous using (eating / bow)
     if (p.usingItem) {
-      const held = p.useHand === 'off' ? p.inv.slots[40] : p.inv.held;
-      if (!this.mouseBtn[2] || !held || held.id !== p.usingItem) { if (held && held.id === p.usingItem) this.releaseUsing(held); p.usingItem = null; p.useT = 0; p.useHand = null; }
-      else {
-        p.useT++;
-        this.usingTick(held);
-        const def = ITEMS[held.id], drink = def.key === 'potion' || def.key === 'milk_bucket' || def.key === 'honey_bottle';
-        if (def.food || drink) {
-          if (p.useT % 4 === 0 && p.useT > 6) { if (drink) Sound.ev('entity.generic.drink', p.pos, 0.5, 1); else { Sound.eat(p.pos); this.foodParticles(held.id); } }
-          if (p.useT >= this.useTicks(def)) this.finishEating(held);
+      const step = () => {
+        const held = p.useHand === 'off' ? p.inv.slots[40] : p.inv.held;
+        if (!this.mouseBtn[2] || !held || held.id !== p.usingItem) { if (held && held.id === p.usingItem) this.releaseUsing(held); p.usingItem = null; p.useT = 0; p.useHand = null; }
+        else {
+          p.useT++;
+          this.usingTick(held);
+          const def = ITEMS[held.id], drink = def.key === 'potion' || def.key === 'milk_bucket' || def.key === 'honey_bottle';
+          if (def.food || drink) {
+            if (p.useT % 4 === 0 && p.useT > 6) { if (drink) Sound.ev('entity.generic.drink', p.pos, 0.5, 1); else { Sound.eat(p.pos); this.foodParticles(held.id); } }
+            if (p.useT >= this.useTicks(def)) this.finishEating(held);
+          }
         }
-      }
+      };
+      // (the other hand's use: with its stack in the selected slot, like its start - equip.js withOffhand)
+      if (p.useHand === 'off' && this.withOffhand) this.withOffhand(step); else step();
     }
-    // breaking
-    if (this.mouseBtn[0]) {
+    // breaking (a click pressed and let go within one tick still counts - mouseClicked0, as vanilla's KeyMapping
+    // clickCount: a touchpad tap went by unseen between two ticks; not while an item is in use - a raised shield, a
+    // couched spear, a drawn bow: vanilla drops the attack clicks then, "举盾/举矛冲锋时还能攻击")
+    if ((this.mouseBtn[0] || this.mouseClicked0) && !p.usingItem) {
       if (this.targetEntity) {
         // like vanilla, each click attacks once (holding the button only keeps mining)
         if (this.mouseClicked0 && this.attackCd <= 0) this.attack(this.targetEntity);
@@ -1674,9 +2024,10 @@ class Game {
         const t = this.target;
         // (a spear's jab goes off at a block or the air too - its lunge with it: "没对准生物就不能突进", feedback
         // 2026-11-01/02)
+        // A spear never breaks blocks (vanilla PIERCING_WEAPON: the click is the jab, holding mines nothing)
         const hk = p.inv.held && ITEMS[p.inv.held.id].key, spear = typeof isSpear === 'function' && isSpear(hk);
-        if (spear && this.mouseClicked0 && this.attackCd <= 0 && this.spearJab) { this.spearJab(); p.swing(); }
-        if (this.mode === 'creative') {
+        if (spear) { if (this.mouseClicked0 && this.attackCd <= 0 && this.spearJab) this.spearJab(); this.breaking = null; }
+        else if (this.mode === 'creative') {
           if (this.attackCd <= 0) {
             const held = p.inv.held;
             // (vanilla: swords, spears, maces and tridents break nothing in creative)
@@ -1687,7 +2038,7 @@ class Game {
           const key = t.pos.join(',');
           if (!this.breaking || this.breaking.key !== key) this.breaking = { key, pos: t.pos, progress: 0, id: t.id };
           const b = BLOCKS[t.id];
-          if (t.id === 171 || t.id === 176) { if (t.id === 171) { this.world.setBlock(...t.pos, 0, 0); Sound.ev('block.fire.extinguish', t.pos, 0.5, 2); } else this.teleportEgg(...t.pos); this.breaking = null; this.attackCd = 5; p.swing(); this.mouseBtn[0] = false; return; }
+          if (t.id === 171 || t.id === 176 || (t.id && t.id === BID.soul_fire)) { if (t.id !== 176) { this.world.setBlock(...t.pos, 0, 0); Sound.ev('block.fire.extinguish', t.pos, 0.5, 2); } else this.teleportEgg(...t.pos); this.breaking = null; this.attackCd = 5; p.swing(); this.mouseBtn[0] = this.mouseClicked0 = this.useClicked = false; return; }
           if (b.hardness < 0 || this.attackCd > 0) { if (b.hardness < 0) this.breaking.progress = 0; }
           else {
             this.breaking.progress += this.breakSpeed(t.id);
@@ -1700,16 +2051,17 @@ class Game {
         this.breaking = null;
         if (this.mouseClicked0) {
           const hk = p.inv.held && ITEMS[p.inv.held.id].key;
-          if (typeof isSpear === 'function' && isSpear(hk) && this.attackCd <= 0 && this.spearJab) { this.spearJab(); p.swing(); this.attackCd = 2; }
+          if (typeof isSpear === 'function' && isSpear(hk)) { if (this.attackCd <= 0 && this.spearJab && this.spearJab()) this.attackCd = 2; }
           else { p.swing(); p.attackT = 0; }
         }
       }
     } else this.breaking = null;
     this.mouseClicked0 = false;
-    // using / placing (hold to repeat)
-    if (this.mouseBtn[2] && this.useCd <= 0 && !p.usingItem) {
-      this.use();
+    // using / placing (hold to repeat; a click let go within the tick too - useClicked)
+    if ((this.mouseBtn[2] || this.useClicked) && this.useCd <= 0 && !p.usingItem) {
+      if (this.useHands) this.useHands(); else this.use();
     }
+    this.useClicked = false;
   }
   breakSpeed(id) {
     const p = this.player, b = BLOCKS[id];
@@ -1763,8 +2115,9 @@ class Game {
       if (!natural) {
         p.exhaust(0.005);
         if (held && ITEMS[held.id].durability && b.hardness > 0) this.damageHeld(1);
-        const xp = { coal_ore: [0, 2], deepslate_coal_ore: [0, 2], diamond_ore: [3, 7], deepslate_diamond_ore: [3, 7], redstone_ore: [1, 5], lapis_ore: [2, 5], emerald_ore: [3, 7] }[b.key] || (b.id >= 1024 && b.xp);
-        if (xp && this.canHarvest(id, held)) this.dropXp(x + 0.5, y + 0.5, z + 0.5, xp[0] + Math.floor(Math.random() * (xp[1] - xp[0] + 1)));
+        const xp = { coal_ore: [0, 2], deepslate_coal_ore: [0, 2], diamond_ore: [3, 7], deepslate_diamond_ore: [3, 7], redstone_ore: [1, 5], lapis_ore: [2, 5], emerald_ore: [3, 7] }[b.key] || (Array.isArray(b.xp) && b.xp);
+        // (the first blocks' xp is a range too: nether quartz / gold ore, the spawner; silk touch gives none, as vanilla)
+        if (xp && this.canHarvest(id, held) && !enchLevel(held, 'silk_touch')) this.dropXp(x + 0.5, y + 0.5, z + 0.5, xp[0] + Math.floor(Math.random() * (xp[1] - xp[0] + 1)));
         this.stats.mined++;
       }
     }
@@ -1791,7 +2144,7 @@ class Game {
     for (let i = n; i > 0; i--) if (unbreakingSkips(h, false)) n--;
     if (n <= 0) return;
     h.dmg = (h.dmg || 0) + n;
-    if (h.dmg >= ITEMS[h.id].durability) { p.inv.slots[p.inv.sel] = null; Sound.block('break', 'wood', p.pos); this.ui.actionBar = { text: ITEMS[h.id].cn + ' 损坏了', t: performance.now(), color: '#FF5555' }; }
+    if (h.dmg >= ITEMS[h.id].durability) { p.inv.slots[p.inv.sel] = null; Sound.ev('entity.item.break', p.pos, 0.8, 0.8 + Math.random() * 0.4); this.ui.actionBar = { text: ITEMS[h.id].cn + ' 损坏了', t: performance.now(), color: '#FF5555' }; }
   }
   flushMesh() {
     // remesh dirty sections near the player immediately for responsive edits
@@ -1825,7 +2178,15 @@ class Game {
     const p = this.player, held = p.inv.held, def = held && ITEMS[held.id];
     const str = this.attackStrength();
     let dmg = Math.max(0, (def && def.attack ? def.attack : 1) + effectAttackBonus(p)) * (0.2 + str * str * 0.8);
-    const crit = str > 0.9 && p.vel[1] < -0.05 && !p.onGround && !p.inWater;
+    // the mace's smash (equip.js): vanilla getAttackDamageBonus comes after the cool-down's scaling, before a crit - so a
+    // mace switched to mid-fall still smashes in full
+    dmg += p.maceBonus || 0;
+    // (not while sprinting: a sprinting hit is the knockback one - vanilla canCriticalAttack)
+    const crit = str > 0.9 && p.vel[1] < -0.05 && !p.onGround && !p.inWater && !p.sprinting;
+    // the swing's sounds (vanilla Player.attack): knockback for a sprinting full-strength hit, then crit, or strong /
+    // weak unless it sweeps (enchant.js plays that), nodamage when it did nothing - the swing made no sound at all
+    const snd = (k) => Sound.ev('entity.player.attack.' + k, p.pos, 1, 1);
+    if (p.sprinting && str > 0.9) snd('knockback');
     if (crit) { dmg *= 1.5; for (let i = 0; i < 12; i++) this.particles.spawn('crit', e.pos[0] + (Math.random() - 0.5) * e.w, e.pos[1] + Math.random() * e.h, e.pos[2] + (Math.random() - 0.5) * e.w, (Math.random() - 0.5) * 0.3, Math.random() * 0.3, (Math.random() - 0.5) * 0.3); }
     dmg += enchantAttackBonus(held, e) * str;
     const knock = (p.sprinting && str > 0.9 ? 0.8 : 0.4) + heldEnch(p, 'knockback') * 0.5;
@@ -1833,13 +2194,16 @@ class Game {
     p.attackT = 0;
     const fa = heldEnch(p, 'fire_aspect');
     if (fa && !e.fireproof && e instanceof Living) e.fire = Math.max(e.fire || 0, 80 * fa);
-    if (e.parts && this.targetPart ? e.hurtPart(this.targetPart, dmg, src) : e.hurt(dmg, src)) {
+    const hit = e.parts && this.targetPart ? e.hurtPart(this.targetPart, dmg, src) : e.hurt(dmg, src);
+    if (hit) {
       if (def && def.durability) this.damageHeld(def.tool && def.tool.type === 'sword' ? 1 : 2);
       p.exhaust(0.1);
       if (p.sprinting) p.sprinting = false;
-    }
+      if (crit) snd('crit'); else if (!this.sweepHit) snd(str > 0.9 ? 'strong' : 'weak');
+    } else snd('nodamage');
     p.swing();
     this.attackCd = 2; // 1.9 combat: no hard limit, the cool-down only scales damage
+    return hit;
   }
   foodParticles(id) {
     const p = this.player, d = this.lookDir();
@@ -1897,7 +2261,7 @@ class Game {
       }
       if (def.key === 'shears' && e.type === 'sheep' && !e.sheared) {
         e.sheared = true;
-        for (let i = 0, n = 1 + ((Math.random() * 3) | 0); i < n; i++) this.dropItem(e.pos[0], e.pos[1] + 1, e.pos[2], makeStack(128 + e.woolColor, 1));
+        for (let i = 0, n = 1 + ((Math.random() * 3) | 0); i < n; i++) this.dropItem(e.pos[0], e.pos[1] + 1, e.pos[2], makeStack(woolKey(e.woolColor), 1));
         Sound.ev('entity.sheep.shear', e.pos, 1, 1) || Sound.noise(e.pos, { freq: 3000, q: 3, dur: 0.15, vol: 0.4 });
         this.damageHeld(1); p.swing(); return;
       }
@@ -1909,7 +2273,10 @@ class Game {
         const mate = this.entities.find(o => o !== e && o instanceof Mob && o.type === e.type && o.loveT > 0 && o.distTo(e) < 8);
         if (mate) {
           e.loveT = 0; mate.loveT = 0;
-          const baby = new Mob(this, e.type, (e.pos[0] + mate.pos[0]) / 2, e.pos[1], (e.pos[2] + mate.pos[2]) / 2).makeBaby();
+          // (createMob: the mob's own class - a plain Mob for a kitten had no Cat skin and was drawn black. A kitten takes
+          // one parent's coat, as vanilla Cat.getBreedOffspring)
+          const baby = createMob(this, e.type, (e.pos[0] + mate.pos[0]) / 2, e.pos[1], (e.pos[2] + mate.pos[2]) / 2).makeBaby();
+          if (typeof Cat !== 'undefined' && baby instanceof Cat && e.variant && mate.variant) baby.variant = Math.random() < 0.5 ? e.variant : mate.variant;
           this.entities.push(baby);
           for (let i = 0; i < 8; i++) this.particles.spawn('heart', baby.pos[0] + (Math.random() - 0.5), baby.pos[1] + 1 + Math.random() * 0.5, baby.pos[2] + (Math.random() - 0.5), 0, 0.02, 0);
           this.dropXp(baby.pos[0], baby.pos[1] + 0.5, baby.pos[2], 1 + ((Math.random() * 7) | 0));
@@ -1921,6 +2288,11 @@ class Game {
     if (t && !p.sneaking) {
       const b = BLOCKS[t.id];
       const [x, y, z] = t.pos;
+      // a light block, with one in hand in creative: one level brighter, past 15 back to 0 (LightBlock.useWithoutItem)
+      if (b.key === 'light' && def && def.key === 'light' && this.mode === 'creative' && typeof Features !== 'undefined') {
+        const m = w.getMeta(x, y, z), lv = +Features.propOf(t.id, m, 'level') || 0;
+        w.setBlock(x, y, z, t.id, Features.withProp(t.id, m, 'level', String((lv + 1) % 16))); p.swing(); return;
+      }
       // components with a use of their own (redstone.js: levers, buttons, repeaters, hoppers ...)
       if (typeof b.onUse === 'function' && b.onUse(this, x, y, z, t)) { p.swing(); return; }
       if (b.onUse === 'crafting') { this.ui.open(new CraftingScreen(this, 3)); return; }
@@ -1947,18 +2319,24 @@ class Game {
         const be = this.getBlockEntity(x, y, z, 'chest');
         if (be.loot) this.fillLoot(be, x, y, z);
         this.ui.open(new ChestScreen(this, [be], b.cn));
-        Sound.chest([x + 0.5, y + 0.5, z + 0.5], true); return;
+        // (it shows open while looked into, which observers see: vanilla BarrelBlockEntity.updateBlockState; ChestScreen
+        // closes it, recheckBarrels keeps it right. And its own sound: it had the chest's)
+        const m = w.getMeta(x, y, z);
+        (this.barrelsShown || (this.barrelsShown = new Set())).add(x + ',' + y + ',' + z);
+        if (typeof Features !== 'undefined' && Features.propOf(t.id, m, 'open') === 'false') { w.setMeta(x, y, z, Features.withProp(t.id, m, 'open', true)); this.flushMesh(); }
+        Sound.ev('block.barrel.open', [x + 0.5, y + 0.5, z + 0.5], 0.5, Math.random() * 0.1 + 0.9); return;
       }
       if (b.onUse === 'note') { const m = (w.getMeta(x, y, z) + 1) % 25; w.setMeta(x, y, z, m); Sound.note([x, y, z], m); this.particles.spawn('note', x + 0.5, y + 1.2, z + 0.5, 0, 0.02, 0, { col: [255, Math.round(m * 10), Math.round(255 - m * 10)] }); p.swing(); return; }
-      if (b.door) {
+      // (iron doors and trapdoors open by redstone only, as vanilla: the hand opened them)
+      if (b.door && !b.key.startsWith('iron_')) {
         const m = w.getMeta(x, y, z), base = (m & 8) ? y - 1 : y;
         const bm = w.getMeta(x, base, z) ^ 4;
         w.setMeta(x, base, z, bm); w.setMeta(x, base + 1, z, bm | 8);
-        Sound.door([x, y, z], !!(bm & 4)); p.swing(); this.flushMesh(); return;
+        Sound.door([x, y, z], !!(bm & 4), b.key); p.swing(); this.flushMesh(); return;
       }
       if (b.bed) { if (this.dim !== 'overworld') this.bedExplode(x, y, z); else this.trySleep(x, y, z); p.swing(); return; }
       if (t.id === 176) { this.teleportEgg(x, y, z); p.swing(); return; }
-      if (b.trapdoor) { w.setMeta(x, y, z, w.getMeta(x, y, z) ^ 4); Sound.door([x, y, z], true); p.swing(); this.flushMesh(); return; }
+      if (b.trapdoor && !b.key.startsWith('iron_')) { const tm = w.getMeta(x, y, z) ^ 4; w.setMeta(x, y, z, tm); Sound.door([x, y, z], !!(tm & 4), b.key); p.swing(); this.flushMesh(); return; }
       if (b.gate && typeof Features !== 'undefined') {
         // fence gates swing open away from the player
         const id = t.id, m = w.getMeta(x, y, z), open = Features.propOf(id, m, 'open') === 'true';
@@ -1968,7 +2346,7 @@ class Game {
           const want = Math.abs(look[0]) > Math.abs(look[2]) ? (look[0] > 0 ? 'east' : 'west') : (look[2] > 0 ? 'south' : 'north');
           if (want === OPPOSITE[f]) nm = Features.withProp(id, nm, 'facing', want);
         }
-        w.setMeta(x, y, z, nm); Sound.door([x, y, z], !open); p.swing(); this.flushMesh(); return;
+        w.setMeta(x, y, z, nm); Sound.door([x, y, z], !open, b.key); p.swing(); this.flushMesh(); return;
       }
       if (t.id === 26 && def && def.key === 'flint_and_steel') { w.setBlock(x, y, z, 0, 0); this.entities.push(new PrimedTNT(this, x, y, z)); this.damageHeld(1); p.swing(); return; }
     }
@@ -2016,7 +2394,7 @@ class Game {
       const a = new Arrow(this, p.pos[0], p.pos[1] + p.eye() - 0.1, p.pos[2], [d[0] * 1.5, d[1] * 1.5, d[2] * 1.5], p);
       a.snowball = held.id; this.entities.push(a);
       if (this.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; }
-      Sound.bow(p.pos); p.swing(); return;
+      Sound.ev(def.key === 'egg' ? 'entity.egg.throw' : 'entity.snowball.throw', p.pos, 0.5, 0.4 / (Math.random() * 0.4 + 0.8)); p.swing(); return;
     }
     // buckets
     if (def.key === 'bucket') {
@@ -2025,7 +2403,8 @@ class Game {
       const wl = ft && !IS_FLUID[ft.id] && w.isWaterlogged(...ft.pos);
       if (ft && (wl || (IS_FLUID[ft.id] && w.getMeta(...ft.pos) === 0))) {
         if (wl) w.setWaterlogged(...ft.pos, false); else w.setBlock(...ft.pos, 0, 0);
-        const filled = makeStack(wl || ft.id === WATER ? 'water_bucket' : 'lava_bucket');
+        // (a mod's fluid: the bucket it names - mods.js)
+        const filled = makeStack(wl || ft.id === WATER ? 'water_bucket' : ft.id === LAVA ? 'lava_bucket' : BLOCKS[ft.id].bucket || 'lava_bucket');
         if (this.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = filled; else if (p.inv.add(filled)) this.dropFromPlayer(filled); }
         Sound.ev(!wl && ft.id === LAVA ? 'item.bucket.fill_lava' : 'item.bucket.fill', ft.pos, 1, 1) || Sound.splash(ft.pos); p.swing(); this.flushMesh();
       }
@@ -2050,17 +2429,41 @@ class Game {
           w.setMeta(x, y, z, Features.withProp(t.id, w.getMeta(x, y, z), 'age', String(Math.min(max, age + add)))); ok = true;
         }
       }
-      else if (t.id >= 65 && t.id <= 67 || (BLOCKS[t.id] && (BLOCKS[t.id].key.endsWith('_sapling') || BLOCKS[t.id].key === 'mangrove_propagule'))) {
+      // (azaleas too: an azalea tree, vanilla AzaleaBlock - not under water)
+      else if (t.id >= 65 && t.id <= 67 || (BLOCKS[t.id] && (BLOCKS[t.id].key.endsWith('_sapling') || BLOCKS[t.id].key === 'mangrove_propagule' || (/^(flowering_)?azalea$/.test(BLOCKS[t.id].key) && !w.waterAt(x, y + 1, z))))) {
         if (Math.random() < 0.45 && !(w.gen2 && this.growTreeV(x, y, z, t.id)) && t.id <= 67) this.growTree(x, y, z, t.id);
         ok = true;
       }
-      else if (t.id === 2) {
+      // a pitcher crop (either half): one stage (PitcherCropBlock.performBonemeal)
+      else if (tb && tb.key === 'pitcher_crop' && tst) { const ly = tst.half === 'upper' ? y - 1 : y; if (w.getBlock(x, ly, z) === t.id && Features.propOf(t.id, w.getMeta(x, ly, z), 'half') === 'lower' && this.growPitcher(x, ly, z, t.id)) ok = true; }
+      // glow berries on cave vines (vanilla CaveVines: every time)
+      else if (tb && (tb.key === 'cave_vines' || tb.key === 'cave_vines_plant') && tst && tst.berries === 'false') { w.setMeta(x, y, z, Features.withProp(t.id, w.getMeta(x, y, z), 'berries', 'true')); ok = true; }
+      // moss (pale moss) spreads over the ground around with plants on it (BonemealableFeaturePlacerBlock: the
+      // moss_patch_bonemeal feature placed on the block above)
+      else if (tb && (tb.key === 'moss_block' || tb.key === 'pale_moss_block') && w.getBlock(x, y + 1, z) === 0 && typeof LiveRegion !== 'undefined') {
+        const R = new LiveRegion(w), r = new Features.WRand();
+        r.setSeed(BigInt(Math.floor(Math.random() * 2 ** 52)));
+        Features.placeCF({ R, top: null, seed: w.seedStr || '0', biomeAt: () => 'plains', biomeHas: () => true }, tb.key === 'moss_block' ? 'moss_patch_bonemeal' : 'pale_moss_patch_bonemeal', r, [x, y + 1 + R.minY, z]);
+        ok = true;
+      }
+      // seagrass with water above grows tall (SeagrassBlock)
+      else if (tb && tb.key === 'seagrass' && w.getBlock(x, y + 1, z) === WATER && BID.tall_seagrass !== undefined) { this.tallSeagrass(x, y, z); ok = true; }
+      // kelp one block longer at its top, into water (GrowingPlantHeadBlock / BodyBlock)
+      else if (tb && (tb.key === 'kelp' || tb.key === 'kelp_plant') && BID.kelp_plant !== undefined) {
+        let hy = y; while (w.getBlock(x, hy, z) === BID.kelp_plant) hy++;
+        if (w.getBlock(x, hy, z) === BID.kelp && hy + 1 < HEIGHT && w.getBlock(x, hy + 1, z) === WATER) { w.setBlock(x, hy, z, BID.kelp_plant, 0); w.setBlock(x, hy + 1, z, BID.kelp, 0); ok = true; }
+      }
+      // a sea pickle on a coral block: 4 pickles, and new ones over the coral blocks around (SeaPickleBlock; not a dry one)
+      else if (tb && tb.key === 'sea_pickle' && w.isWaterlogged(x, y, z) && Features.tagSet('coral_blocks').has(w.getBlock(x, y - 1, z))) { this.spreadPickles(x, y, z); ok = true; }
+      else if (t.id === 2 && w.getBlock(x, y + 1, z) === 0) {
         for (let i = 0; i < 40; i++) {
           const nx = x + ((Math.random() * 7) | 0) - 3, nz = z + ((Math.random() * 7) | 0) - 3;
           if (w.getBlock(nx, y, nz) === 2 && w.getBlock(nx, y + 1, nz) === 0) w.setBlock(nx, y + 1, nz, Math.random() < 0.85 ? 39 : FLOWER_IDS[(Math.random() * 4) | 0], 0);
         }
         ok = true;
       }
+      // nothing to grow: on a full face with a water source in front of it, plants under water (BoneMealItem.useOn)
+      else if (SOLIDCUBE[t.id] && this.growWaterPlant(x + D[0], y + D[1], z + D[2], t.face)) ok = true;
       if (ok) {
         for (let i = 0; i < 12; i++) this.particles.spawn('bone_meal', x + Math.random(), y + 1 + Math.random() * 0.5, z + Math.random(), 0, 0.02, 0);
         Sound.ev('item.bone_meal.use', [x + 0.5, y + 0.5, z + 0.5], 1, 1);
@@ -2078,7 +2481,10 @@ class Game {
       return;
     }
     if (def.key === 'end_crystal') {
-      if ((t.id === 28 || t.id === 6) && t.face === 3 && w.getBlock(x, y + 1, z) === 0) {
+      // (vanilla EndCrystalItem: the two blocks above must be free of entities - another crystal too; they piled up in
+      // one place and blew up all together)
+      const inSpace = (e) => { if (!e || e.dead || !e.pos || !e.w) return false; const b = e.box(); return b[0] < x + 1 && b[3] > x && b[1] < y + 3 && b[4] > y + 1 && b[2] < z + 1 && b[5] > z; };
+      if ((t.id === 28 || t.id === 6) && t.face === 3 && w.getBlock(x, y + 1, z) === 0 && !(!p.spectator && inSpace(p)) && !this.entities.some(inSpace)) {
         const c = new EndCrystal(this, x + 0.5, y + 1, z + 0.5); c.showBase = false; this.entities.push(c);
         if (this.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; }
         p.swing();
@@ -2098,13 +2504,19 @@ class Game {
       if (w.getBlock(fx, fy, fz) !== 0) return;
       if (!this.tryLightPortal(fx, fy, fz)) {
         if (!this.fireSupported(fx, fy, fz)) return;
-        w.setBlock(fx, fy, fz, 171, 0);
+        w.setBlock(fx, fy, fz, this.fireIdAt(fx, fy, fz), 0);
       }
       if (def.key === 'fire_charge') { Sound.ev('item.firecharge.use', [fx, fy, fz], 1, 1) || Sound.fizz([fx, fy, fz]); if (this.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; } }
       else { Sound.ev('item.flintandsteel.use', [fx, fy, fz], 1, Math.random() * 0.4 + 0.8); this.damageHeld(1); }
       p.swing(); this.flushMesh(); return;
     }
     if (def.spawnEgg) {
+      // on a spawner: it spawns that mob from now on (vanilla SpawnEggItem.useOn - the egg was only ever spawning a mob)
+      if (t.id === 127 && MOB_TYPES[def.spawnEgg]) {
+        this.blockEntities.set(x + ',' + y + ',' + z, { type: 'spawner', pos: [x, y, z], mob: def.spawnEgg });
+        if (this.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; }
+        p.swing(); return;
+      }
       const m = createMob(this, def.spawnEgg, x + D[0] + 0.5, y + Math.max(0, D[1]) + (D[1] < 0 ? -2 : 0), z + D[2] + 0.5);
       m.persistent = true; m.yaw = m.bodyYaw = p.yaw + Math.PI;
       this.entities.push(m);
@@ -2119,28 +2531,41 @@ class Game {
     if (placeId == null) return;
     // standing and wall forms (signs, banners, heads, torches, coral fans): a block's side takes the wall form,
     // hanging signs hang from a block's underside; standing banners and signs can't go under a block
-    const wallForm = WALL_FORM[BLOCKS[placeId].key];
-    if (wallForm && BID[wallForm] !== undefined && t.face !== 2 && t.face !== 3) placeId = BID[wallForm];
+    // (torches: below, as vanilla's StandingAndWallBlockItem)
+    const wallForm = WALL_FORM[BLOCKS[placeId].key], torch = !!wallForm && /(^|_)torch$/.test(BLOCKS[placeId].key) && BID[wallForm] !== undefined && typeof Features !== 'undefined';
+    if (wallForm && !torch && BID[wallForm] !== undefined && t.face !== 2 && t.face !== 3) placeId = BID[wallForm];
     else if (wallForm && t.face === 2 && !BLOCKS[placeId].key.endsWith('hanging_sign') && /_(sign|banner)$/.test(BLOCKS[placeId].key)) return;
-    const pb = BLOCKS[placeId];
+    let pb = BLOCKS[placeId];
     // a water bucket fills a block that can hold water: the one clicked, else the one in front of it
     // (BucketItem.emptyContents with a LiquidBlockContainer)
     if (placeId === WATER && this.dim !== 'nether') {
       for (const [qx, qy, qz] of [[x, y, z], [x + D[0], y + D[1], z + D[2]]]) {
         if (!canWaterlog(w.getBlock(qx, qy, qz), w.getMeta(qx, qy, qz)) || w.isWaterlogged(qx, qy, qz)) continue;
         w.setWaterlogged(qx, qy, qz, true);
+        if (this.dowseCampfire) this.dowseCampfire(qx, qy, qz, 'entity.generic.extinguish_fire'); // (CampfireBlock.placeLiquid)
         if (this.mode !== 'creative') p.inv.slots[p.inv.sel] = makeStack('bucket');
         Sound.ev('item.bucket.empty', [qx, qy, qz], 1, 1) || Sound.splash([qx, qy, qz]); p.swing(); this.flushMesh();
         return;
       }
     }
     // snow on snow: one layer more, up to 8 (SnowLayerBlock.canBeReplaced)
-    if (pb.key === 'snow' && t.id === placeId && (w.getMeta(x, y, z) & 7) < 7) { this.placeAt(x, y, z, placeId, (w.getMeta(x, y, z) & 7) + 1, held, true); return; }
+    if (pb.key === 'snow' && t.id === placeId && (w.getMeta(x, y, z) & 7) < 7) { if (!this.entityInWay(x, y, z, placeId, (w.getMeta(x, y, z) & 7) + 1)) this.placeAt(x, y, z, placeId, (w.getMeta(x, y, z) & 7) + 1, held, true); return; }
     // slab merging
     if (pb.slab && t.id === placeId) {
       const m = w.getMeta(x, y, z) & 3;
-      if ((m === 0 && t.face === 3) || (m === 1 && t.face === 2)) { this.placeAt(x, y, z, placeId, 2, held, true); return; }
+      if ((m === 0 && t.face === 3) || (m === 1 && t.face === 2)) { if (!this.entityInWay(x, y, z, placeId, 2)) this.placeAt(x, y, z, placeId, 2, held, true); return; }
     }
+    // leaf litter, pink petals, wildflowers: one more on the same spot, up to 4, not while sneaking (SegmentableBlock
+    // canBeReplaced) - a new one of 1 took the place of what was there, and the item went
+    const seg = pb.states && typeof Features !== 'undefined' ? ['segment_amount', 'flower_amount'].find(k => k in pb.states[0]) : null;
+    if (seg) {
+      const n = (q) => +Features.propOf(placeId, w.getMeta(...q), seg) || 1, front = [x + D[0], y + D[1], z + D[2]];
+      const more = (q) => w.getBlock(...q) === placeId && n(q) < 4 && !p.sneaking;
+      // (one clicked that takes no more: the new one goes in front of it, as any block)
+      const q = more([x, y, z]) ? [x, y, z] : w.getBlock(...front) === placeId ? front : null;
+      if (q) { if (more(q)) this.placeAt(...q, placeId, Features.withProp(placeId, w.getMeta(...q), seg, String(n(q) + 1)), held, true); return; }
+    }
+    if ((pb.key === 'vine' || pb.key === 'glow_lichen') && pb.states && typeof Features !== 'undefined') { this.placeFaces(pb, t, held); return; }
     let px = x, py = y, pz = z;
     const tb = BLOCKS[t.id];
     if (!(tb.replaceable && !IS_FLUID[t.id] && t.id !== placeId)) { px += D[0]; py += D[1]; pz += D[2]; }
@@ -2148,12 +2573,23 @@ class Game {
     const cur = w.getBlock(px, py, pz);
     if (pb.slab && cur === placeId) {
       const m = w.getMeta(px, py, pz) & 3;
-      if (m !== 2) { this.placeAt(px, py, pz, placeId, 2, held, true); return; }
+      if (m !== 2) { if (!this.entityInWay(px, py, pz, placeId, 2)) this.placeAt(px, py, pz, placeId, 2, held, true); return; }
     }
     if (cur && !REPLACEABLE[cur]) return;
     if (IS_FLUID[placeId] && cur && IS_FLUID[cur] && w.getMeta(px, py, pz) === 0 && cur === placeId) return;
-    // placed into a water source, a block that can hold water is waterlogged (getStateForPlacement)
-    const intoSource = cur === WATER && w.getMeta(px, py, pz) === 0;
+    // a replaceable block is not replaced by its own item (BlockBehaviour.canBeReplaced): seagrass into seagrass; snow
+    // in front takes one layer more (SnowLayerBlock)
+    if (cur && cur === placeId && !IS_FLUID[cur]) {
+      if (pb.key === 'snow' && (w.getMeta(px, py, pz) & 7) < 7 && !this.entityInWay(px, py, pz, placeId, (w.getMeta(px, py, pz) & 7) + 1)) this.placeAt(px, py, pz, placeId, (w.getMeta(px, py, pz) & 7) + 1, held, true);
+      return;
+    }
+    // placed into a water source, a block that can hold water is waterlogged (getStateForPlacement); seagrass and other
+    // replaced blocks holding water count as one (their fluid state is a source)
+    const intoSource = cur === WATER ? w.getMeta(px, py, pz) === 0 : cur !== 0 && w.waterAt(px, py, pz);
+    // kelp and seagrass go only into a water source (KelpBlock / SeagrassBlock.getStateForPlacement): on land they
+    // came with water of their own; bamboo not into water, and only on what it grows on (BambooStalkBlock)
+    if ((pb.key === 'kelp' || pb.key === 'seagrass') && !intoSource) return;
+    if (pb.key === 'bamboo' && ((cur && IS_FLUID[cur]) || !this.supported(px, py, pz, placeId, 0))) return;
     // meta from placement context
     let meta = 0;
     const look = this.lookDir();
@@ -2172,16 +2608,62 @@ class Game {
       const fdir = t.face === 2 || t.face === 3 ? OPP[hdir] : t.face;
       meta |= { 4: 0, 5: 1, 0: 2, 1: 3 }[fdir] || 0;
     }
-    if (placeId === 21) { if (t.face === 2) return; meta = t.face === 3 ? 0 : OPP[t.face]; }
-    if (pb.ladder) { if (t.face < 2 && false) return; if (t.face === 2 || t.face === 3) return; meta = OPP[t.face]; }
     if (pb.key.endsWith('leaves')) meta = 4;
-    if (pb.states && typeof Features !== 'undefined') meta = this.placeState(pb, t, hdir);
+    if (pb.states && typeof Features !== 'undefined') meta = this.placeState(pb, t, hdir, px, py, pz);
+    // torches, ladders, levers, buttons hold on the first way they can - the block clicked, then the way the player
+    // looks (getNearestLookingDirections) - or aren't placed: a torch went on a torch, a flower, a fence's side, a ladder
+    // on a ladder, a lever on a button (StandingAndWallBlockItem, LadderBlock, FaceAttachedHorizontalDirectionalBlock)
+    const NAME = ['west', 'east', 'down', 'up', 'north', 'south'];
+    const dirs = this.lookingDirs(t, px === x && py === y && pz === z);
+    if (torch) {
+      const wid = BID[wallForm], W = BLOCKS[wid];
+      let wall, pick = null; // (wall: the wall torch's state, on the first side that holds it - WallTorchBlock)
+      for (const d of dirs) {
+        if (d === 3) continue;
+        if (d === 2) { const m = pb.states ? meta : 0; if (this.supported(px, py, pz, placeId, m)) { pick = [placeId, m]; break; } continue; }
+        if (wall === undefined) {
+          wall = null;
+          const m0 = W.states ? this.placeState(W, t, hdir, px, py, pz) : 0;
+          for (const h of dirs) if (h !== 2 && h !== 3) { const m = Features.withProp(wid, m0, 'facing', NAME[OPP[h]]); if (this.supported(px, py, pz, wid, m)) { wall = m; break; } }
+        }
+        if (wall !== null) { pick = [wid, wall]; break; }
+      }
+      if (!pick) return;
+      [placeId, meta] = pick; pb = BLOCKS[placeId];
+    }
+    if (pb.ladder && !pb.states) {
+      // (not onto a ladder's front: LadderBlock)
+      if (t.id === placeId && t.face === OPP[w.getMeta(x, y, z)]) return;
+      const d = dirs.find(d => d !== 2 && d !== 3 && this.supported(px, py, pz, placeId, d));
+      if (d === undefined) return;
+      meta = d;
+    }
+    if (pb.states && (pb.key === 'lever' || /_button$/.test(pb.key))) {
+      let pick = -1;
+      for (const d of dirs) {
+        const m = Features.withProp(placeId, Features.withProp(placeId, meta, 'face', d === 2 ? 'floor' : d === 3 ? 'ceiling' : 'wall'), 'facing', d === 2 || d === 3 ? NAME[hdir] : NAME[OPP[d]]);
+        if (this.supported(px, py, pz, placeId, m)) { pick = m; break; }
+      }
+      if (pick < 0) return;
+      meta = pick;
+    }
+    // a dripstone points away from the way the player looks (up or down), else the other way; its shape from the
+    // dripstones it joins (SpeleothemBlock.getStateForPlacement: it was a base pointing down, broken at once on the ground)
+    if (pb.key === 'pointed_dripstone' && pb.states) {
+      const st = (dn) => Features.withProp(placeId, meta, 'vertical_direction', dn ? 'down' : 'up');
+      let down = look[1] > 0;
+      if (!this.supported(px, py, pz, placeId, st(down))) { down = !down; if (!this.supported(px, py, pz, placeId, st(down))) return; }
+      meta = Features.withProp(placeId, st(down), 'thickness', this.dripThickness(px, py, pz, down, !p.sneaking));
+    }
+    // a light block's item gives light 15 (it was 0: no light at all)
+    if (pb.key === 'light' && pb.states) meta = Features.withProp(placeId, meta, 'level', '15');
     if (pb.bed) {
       const rot = { 4: 0, 1: 1, 5: 2, 0: 3 }[hdir];
       const D2 = DIRS[hdir], hx = px + D2[0], hz = pz + D2[2];
       const hcur = w.getBlock(hx, py, hz);
+      // (no support needed under either half, as vanilla's BedBlock: it wanted two opaque cubes)
       if (hcur && !REPLACEABLE[hcur]) return;
-      if (!SOLIDCUBE[w.getBlock(px, py - 1, pz)] || !SOLIDCUBE[w.getBlock(hx, py - 1, hz)]) return;
+      if (this.entityInWay(px, py, pz, placeId, rot)) return; // (the foot only: vanilla puts the head down unchecked)
       w.setBlock(hx, py, hz, placeId, rot | 4, 0);
       this.placeAt(px, py, pz, placeId, rot, held, false);
       return;
@@ -2197,19 +2679,11 @@ class Game {
     if (pb.needsSupport || pb.door) { if (!this.supportedForPlace(px, py, pz, placeId, meta)) return; }
     // a double plant (sunflower, lilac, peony, rose bush, tall grass, large fern ...): its upper half too, if there is
     // room (only the lower half was placed: players' feedback 2026-10-31)
-    const tall = pb.states && pb.states[meta] && pb.states[meta].half === 'lower' && !pb.door && typeof Features !== 'undefined';
+    // (not a pitcher crop: one block until it grows - PitcherCropBlock.setPlacedBy)
+    const tall = pb.states && pb.states[meta] && pb.states[meta].half === 'lower' && !pb.door && pb.key !== 'pitcher_crop' && typeof Features !== 'undefined';
     if (tall && (py + 1 >= HEIGHT || (w.getBlock(px, py + 1, pz) && !REPLACEABLE[w.getBlock(px, py + 1, pz)]))) return;
-    // collision with entities
-    if (pb.solid) {
-      const boxes = pb.shape === SH_BOXES ? pb.boxes(meta) : [[0, 0, 0, 16, 16, 16]];
-      for (const e of [p, ...this.entities]) {
-        if (!(e instanceof Living) || e.deathTime > 0) continue;
-        const eb = e.box();
-        for (const bx of boxes) {
-          if (eb[0] < px + bx[3] / 16 && eb[3] > px + bx[0] / 16 && eb[1] < py + bx[4] / 16 && eb[4] > py + bx[1] / 16 && eb[2] < pz + bx[5] / 16 && eb[5] > pz + bx[2] / 16) return;
-        }
-      }
-    }
+    // (entityInWay also covers lit TNT, falling blocks, end crystals, boats and minecarts: "TNT爆炸时可以无限堆叠")
+    if (this.entityInWay(px, py, pz, placeId, meta)) return;
     if (IS_FLUID[placeId]) {
       if (placeId === WATER && this.dim === 'nether') {
         if (this.mode !== 'creative') p.inv.slots[p.inv.sel] = makeStack('bucket');
@@ -2236,16 +2710,43 @@ class Game {
     }
     this.placeAt(px, py, pz, placeId, meta, held, false);
     if (tall && w.getBlock(px, py, pz) === placeId) { this.pairBreak = px + ',' + py + ',' + pz; try { w.setBlock(px, py + 1, pz, placeId, Features.withProp(placeId, meta, 'half', 'upper'), 1); } finally { this.pairBreak = null; } }
-    if (intoSource && w.getBlock(px, py, pz) === placeId && canWaterlog(placeId, meta)) w.setWaterlogged(px, py, pz, true);
+    if (intoSource && w.getBlock(px, py, pz) === placeId && canWaterlog(placeId, meta)) { w.setWaterlogged(px, py, pz, true); if (this.dowseCampfire) this.dowseCampfire(px, py, pz); } // (a campfire placed in water is unlit)
+  }
+  // an entity in the way of block id placed at x,y,z (vanilla BlockItem.canPlace: the new block's collision shape).
+  // The outline boxes were tested, and slabs made double and beds not at all: a fence, wall or bed
+  // placed into the player, a slab on the one stood on, pushed it down to crawling - "放床/半砖/墙被挤得趴下"
+  entityInWay(x, y, z, id, meta) {
+    const b = BLOCKS[id], w = this.world;
+    if (!b) return false;
+    // (bamboo not on bamboo, and none above: vanilla places a bamboo_sapling there, which has no collision)
+    if (b.key === 'bamboo') { const below = w.getBlock(x, y - 1, z); if (below !== BID.bamboo && below !== BID.bamboo_sapling && w.getBlock(x, y + 1, z) !== BID.bamboo) return false; }
+    // (not solid but stood on - entity.js blockBoxes: snow layers, bamboo, end rods ...)
+    if (!b.solid && !b.collide) return false;
+    // (a fence or wall by the neighbours it will join, as entity.js blockBoxes collides with it)
+    const m = b.fence ? w.fenceMeta(x, y, z, b) : meta;
+    const boxes = b.shape === SH_BOXES || b.shape === SH_MODEL ? (b.collide ? b.collide(m, null, y) : b.boxes(m)) : b.shape === SH_CACTUS ? [[1, 0, 1, 15, 16, 15]] : b.solid ? [[0, 0, 0, 16, 16, 16]] : null;
+    if (!boxes || !boxes.length) return false;
+    // (vanilla Entity.blocksBuilding: living things and armor stands, boats, minecarts, primed TNT, falling blocks, end crystals)
+    const blocks = e => e instanceof Living || e instanceof FallingBlock || e instanceof PrimedTNT || (typeof Vehicle !== 'undefined' && e instanceof Vehicle) || (typeof ArmorStand !== 'undefined' && e instanceof ArmorStand) || (typeof EndCrystal !== 'undefined' && e instanceof EndCrystal);
+    for (const e of [this.player, ...this.entities]) {
+      if (!blocks(e) || e.dead || e.deathTime > 0) continue;
+      const eb = e.box();
+      for (const bx of boxes) if (eb[0] < x + bx[3] / 16 && eb[3] > x + bx[0] / 16 && eb[1] < y + bx[4] / 16 && eb[4] > y + bx[1] / 16 && eb[2] < z + bx[5] / 16 && eb[5] > z + bx[2] / 16) return true;
+    }
+    return false;
   }
   supportedForPlace(x, y, z, id, meta) {
     const w = this.world, old = w.getBlock(x, y, z);
     if (BLOCKS[id].door) return !!SOLIDCUBE[w.getBlock(x, y - 1, z)];
     return this.supported(x, y, z, id, meta);
   }
+  // a living thing (the player too) in the way of the block about to be placed: its boxes, or the collision boxes of
+  // one that isn't solid but collides (bamboo, azalea, snow layers ... - vanilla BlockItem.canPlace)
   placeAt(x, y, z, id, meta, held, merge) {
     const p = this.player, w = this.world;
     w.setBlock(x, y, z, id, meta);
+    // a placed spawner is empty until a spawn egg is used on it (dims.js spawnerMob)
+    if (id === 127) this.blockEntities.set(x + ',' + y + ',' + z, { type: 'spawner', pos: [x, y, z], mob: null });
     // (crops and nether wart have their own planting sound: SoundType.CROP / NETHER_WART, placed at pitch 0.8)
     const plant = /^(wheat|carrots|potatoes|beetroots|melon_stem|pumpkin_stem|torchflower_crop|pitcher_crop)$/.test(BLOCKS[id].key) ? 'item.crop.plant' : BLOCKS[id].key === 'nether_wart' ? 'item.nether_wart.plant' : null;
     if (!(plant && Sound.ev(plant, [x + 0.5, y + 0.5, z + 0.5], 1, 0.8))) Sound.block('place', BLOCKS[id].sound, [x + 0.5, y + 0.5, z + 0.5]);
@@ -2341,6 +2842,7 @@ class Game {
     let sd = 1 - clamp(1 - (c * 2 + 0.2), 0, 1); sd *= 1 - rain * 5 / 16; const day = sd * 0.8 + 0.2;
     return this.dimEnv({
       tick: this.worldTime + a, day, fogColor: fog, skyColor: sky, sunDir, sunset, voidColor: [sky[0] * 0.2 + 0.04, sky[1] * 0.2 + 0.04, sky[2] * 0.6 + 0.1],
+      horizon: this.world && this.world.flat ? 0 : 63, // (vanilla: a superflat world's horizon is its bottom)
       celestial: cel, starBright: stars * 2, sunAlpha: 1 - rain, rain, moonPhase, temp,
       fogNear, fogFar, nightTint, cloudColor: cloud,
     });
@@ -2359,7 +2861,11 @@ class Game {
     // sections' count in the key - so a menu opened at once, the agreement on a first visit, doesn't keep an empty sky.
     // The picture stays on screen because nothing at all is drawn into the canvas that frame: an untouched WebGL canvas
     // keeps showing its last frame (preserveDrawingBuffer is off). A new size clears it (canvasGen, sizeCanvas): drawn then
-    const frozen = (this.state === 'play' && sc && sc.pauses) || (this.state === 'title' && sc && sc.blurBg && this.ui.blurOn && !this.panoCam);
+    // Not the title on an iPhone / iPad: iOS takes back a WebGL canvas left undrawn, and a new player reading the
+    // agreement lost it ~5 s after the title came - after the reload the same again, a white screen (telemetry 11-06:
+    // iOS onboarding sessions losing it 0% -> 6.1% with the title freeze). Nor the pause menu in a world on any Apple
+    // device (WEBKIT_GL, 11-07): the same taking back - the context lost 5x as often as before the freeze, a reload each
+    const frozen = !WEBKIT_GL && ((this.state === 'play' && sc && sc.pauses) || (this.state === 'title' && sc && sc.blurBg && this.ui.blurOn && !this.panoCam));
     if (frozen) {
       const key = innerWidth + 'x' + innerHeight + ':' + devicePixelRatio + ':' + r.resScale + ':' + (this.state === 'title' ? r.sections.size : '') + ':' + JSON.stringify(this.settings);
       if (this.frozenKey === key && this.frozenFrames >= 2 && this.drawnGen === this.canvasGen) { this.titleFrozen = this.state === 'title'; this.halfWorld = false; this.ui.draw(); return; }
@@ -2396,7 +2902,11 @@ class Game {
       const eyeH = this.sleeping ? 0.2 : p.eye();
       this.smoothEye = this.smoothEye == null ? eyeH : lerp(this.smoothEye, eyeH, 0.4);
       eye = [ip[0], ip[1] + this.smoothEye, ip[2]];
-      yaw = p.yaw; pitch = p.pitch;
+      // (in a boat with the boat's turn between ticks - viewYaw; the view stepped 20 times a second while turning:
+      // "坐船转弯视角一卡一卡", feedback 11-01..10 - and what is aimed at picked again with it, as vanilla picks every
+      // frame: the outline lagged the crosshair by up to 9 degrees)
+      this.frameA = a; yaw = this.viewYaw(); pitch = p.pitch;
+      if (yaw !== p.yaw && !this.ui.screen && p.deathTime === 0 && this.mode !== 'spectator') this.updateTarget();
       if (this.sleeping) { yaw = [0, -Math.PI / 2, Math.PI, Math.PI / 2][this.sleeping.rot] + Math.PI; pitch = 0.5; }
       if (p.deathTime > 0) eye[1] -= Math.min(1.2, p.deathTime / 20);
       // vanilla FOV modifier (flying, sprinting, bow zoom: fovModTarget), eased per tick, scaled by the FOV effects
@@ -2415,8 +2925,15 @@ class Game {
       const look = [-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch)];
       const back = [-look[0] * d, -look[1] * d, -look[2] * d];
       let dist = Math.abs(d);
-      const hit = this.raycast(eye, [Math.sign(d) * -look[0], Math.sign(d) * -look[1], Math.sign(d) * -look[2]], dist, false);
-      if (hit) dist = Math.max(0.5, hit.t - 0.3);
+      // vanilla Camera.getMaxZoom: eight rays from the corners of a 0.2 cube about the eyes, the camera no further than
+      // the nearest hit. (One ray from the eyes and at least 0.5 back put the camera behind a wall the player stood
+      // close to - "第三人称贴墙透视")
+      const dir = [Math.sign(d) * -look[0], Math.sign(d) * -look[1], Math.sign(d) * -look[2]];
+      for (let i = 0; i < 8; i++) {
+        const o = [eye[0] + ((i & 1) * 2 - 1) * 0.1, eye[1] + (((i >> 1) & 1) * 2 - 1) * 0.1, eye[2] + (((i >> 2) & 1) * 2 - 1) * 0.1];
+        const hit = this.raycast(o, dir, dist, false, true);
+        if (hit) { const q = hit.point, h = Math.hypot(q[0] - eye[0], q[1] - eye[1], q[2] - eye[2]); if (h < dist) dist = h; }
+      }
       camPos = [eye[0] - look[0] * dist * Math.sign(d), eye[1] - look[1] * dist * Math.sign(d), eye[2] - look[2] * dist * Math.sign(d)];
       if (this.perspective === 2) { yaw += Math.PI; pitch = -pitch; }
     }
@@ -2532,7 +3049,15 @@ class Game {
     // the shader pack's entity shadows: what is drawn here is kept and drawn into the shadow map next frame
     const rec = r.fxOn && r.fx.shadowOn ? (r.fx.entRec = []) : null;
     r.shRec = rec;
+    this.boatPatches = [];
     try { this.drawEntityList(list, a, env, cam); } finally { r.shRec = null; }
+    // boats' water patches, depth only (vehicles.js Boat.drawSelf)
+    if (this.boatPatches.length) {
+      gl.disable(gl.CULL_FACE); gl.colorMask(false, false, false, false);
+      try { for (const [m, tex, l] of this.boatPatches) r.drawModel('vh_boat_patch', tex, m, null, l, env); }
+      catch (err) { this.reportError('boat patch', err, true); }
+      finally { gl.colorMask(true, true, true, true); gl.enable(gl.CULL_FACE); this.boatPatches = []; }
+    }
     // the AI companion floating by the player (companion.js)
     if (typeof Jing !== 'undefined') try { Jing.draw(this, a, env); } catch (err) { this.reportError('companion', err, true); }
     if (this.net && !this.ui.hideHud) try { this.net.drawNames(a); } catch (err) { this.reportError('name tags', err, true); }
@@ -2698,7 +3223,10 @@ class Game {
     else if (e.type === 'zombified_piglin') heldId = item('golden_sword');
     else if (e.type === 'piglin') heldId = e.holding || item('golden_sword');
     // held items: vanilla's ItemInHandLayer with each item model's third-person transform (equip.js)
-    const attach = this.heldAttach(e, model, heldId != null ? (isPlayer ? e.inv.held : { id: heldId, count: 1, dmg: 0 }) : null, isPlayer ? e.inv.slots[40] : null, lt, env);
+    // (a server's entity: the whole stack it sent, so enchantment glint and banner patterns show)
+    const hst = heldId == null ? null : isPlayer ? e.inv.held : e.hand && e.hand.id === heldId ? e.hand : { id: heldId, count: 1, dmg: 0 };
+    const off = isPlayer ? e.inv.slots[40] : e.offhand && !e.offhand.unk ? e.offhand : null; // (others: what the server / host sent)
+    const attach = this.heldAttach(e, model, hst, off, lt, env);
     let tex = pl0 && typeof Skins !== 'undefined' ? Skins.texOf(this, e) : model === 'steve' ? 'steve' : e.type === 'sheep' ? 'sheep' : (e.T && e.T.tex) || model;
     if (e.type === 'strider' && !e.warm) tex = 'strider_cold';
     if (e.skin) tex = e.skin(r);
@@ -2713,7 +3241,7 @@ class Game {
     r.gl.enable(r.gl.CULL_FACE);
     if (hidden) {
       const armour = isPlayer ? e.inv.slots.slice(36, 40) : (e.armorItems || []);
-      if (pl0 || e.T.model === 'zombie' || e.T.model === 'skeleton' || e.T.model === 'zombified_piglin') this.drawArmor(armour, m, poses, lt, env, { overlay });
+      if (pl0 || e.T.model === 'zombie' || e.T.model === 'skeleton' || e.T.model === 'zombified_piglin') this.drawArmor(armour, m, poses, lt, env, { overlay, baby: !!e.baby });
       if (pl0 && this.drawWings) this.drawWings(e, m, lt, env, overlay);
       return;
     }
@@ -2721,7 +3249,7 @@ class Game {
     // worn armour (vanilla humanoid armour layers; leather is dyed #A06540 with an undyed overlay)
     const armour = isPlayer ? e.inv.slots.slice(36, 40) : (e.armorItems || []);
     // (other players too: a server's player, a guest in a room on this browser - armorItems [head, chest, legs, feet])
-    if (pl0 || e.T.model === 'zombie' || e.T.model === 'skeleton' || e.T.model === 'zombified_piglin') this.drawArmor(armour, m, poses, lt, env, { overlay });
+    if (pl0 || e.T.model === 'zombie' || e.T.model === 'skeleton' || e.T.model === 'zombified_piglin') this.drawArmor(armour, m, poses, lt, env, { overlay, baby: !!e.baby });
     if (pl0 && this.drawWings) this.drawWings(e, m, lt, env, overlay);
     if (e.type === 'sheep' && !e.sheared) {
       const col = WOOL_RGB[e.woolColor] || [1, 1, 1];
@@ -2732,7 +3260,7 @@ class Game {
     if (e.deathTime === 0 && !e.displayMatrix) {
       const fx = Math.floor(ip[0]), fz = Math.floor(ip[2]);
       let gy = Math.floor(ip[1] + 0.01);
-      for (let k = 0; k < 4 && gy > 0 && !SOLIDCUBE[this.world.getBlock(fx, gy - 1, fz)] && !BLOCKS[this.world.getBlock(fx, gy - 1, fz)].solid; k++) gy--;
+      for (let k = 0; k < 4 && gy > 0 && !SOLIDCUBE[this.world.getBlock(fx, gy - 1, fz)] && !BLOCKS[this.world.getBlock(fx, gy - 1, fz)]?.solid; k++) gy--;
       const h = ip[1] - gy;
       if (h < 3) r.drawShadow(ip[0], gy, ip[2], e.w * 0.75 * (1 - h / 6), 0.55 * (1 - h / 3));
     }
@@ -2751,7 +3279,13 @@ class Game {
       if (!tex) return;
       const ap = {}; for (const k of ['head', 'body', 'rarm', 'larm', 'rleg', 'lleg']) ap[k] = parts[slot].includes(k) ? ((poses && poses[k]) || {}) : { hidden: true };
       r.drawModel(model, tex, m, ap, lt, env, { ...opts, tint: mat === 'leather' ? (typeof dyeTintOf === 'function' ? dyeTintOf(st, [160 / 255, 101 / 255, 64 / 255]) : [160 / 255, 101 / 255, 64 / 255]) : null });
+      // enchanted: the armour glint over that first layer only (render.js drawGlint; vanilla EquipmentLayerRenderer:
+      // the leather overlay and the trim come after it and cover it)
+      if (typeof stackGlint === 'function' && stackGlint(st)) r.drawModel(model, tex, m, ap, lt, env, { ...opts, glint: 'armor', glintOnly: true });
       if (mat === 'leather') r.drawModel(model, tex + '_overlay', m, ap, lt, env, opts);
+      // its trim (from the smithing table) over it, on the same faces: equip.js trimTex
+      const tt = st.trim && r.trimTex && !opts.baby ? r.trimTex(st.trim, mat, legs) : null; // (none on babies, like vanilla)
+      if (tt) { const gl = r.gl; gl.depthFunc(gl.LEQUAL); r.drawModel(model, tt, m, ap, lt, env, opts); gl.depthFunc(gl.LESS); }
     });
   }
   // the body's facing, like vanilla LivingEntity.tickHeadTurn: it turns towards where the player walks (walking
@@ -2795,8 +3329,10 @@ class Game {
     // sweeps in across the body and comes down slowly, higher when looking up
     // (a spear's stab: the twist and shoulders only, its arm is equip.js's)
     const dur = p.swingDur || 6, t = p.swingT > 0 ? clamp((dur - p.swingT + a) / dur, 0, 1) : 0;
+    // (vanilla getAttackArm: the other hand's swing - placing from it - turns the body the other way and lifts that arm)
+    const offSw = p.swingHand === 'off', A = offSw ? P.larm : P.rarm;
     if (t > 0) {
-      const by = -Math.sin(Math.sqrt(t) * Math.PI * 2) * 0.2, c = Math.cos(by), s = Math.sin(by);
+      const by = -Math.sin(Math.sqrt(t) * Math.PI * 2) * 0.2 * (offSw ? -1 : 1), c = Math.cos(by), s = Math.sin(by);
       P.body.ry = by;
       P.rarm.t = [6 * c - 6, 0, -6 * s]; P.larm.t = [-6 * c + 6, 0, 6 * s];
     }
@@ -2805,9 +3341,9 @@ class Game {
       P.rarm.ry = by; P.larm.ry = by; P.larm.rx += by;
       let f = 1 - t; f *= f; f *= f; f = 1 - f;
       const f1 = Math.sin(f * Math.PI), f2 = Math.sin(t * Math.PI) * (p.pitch + 0.7) * 0.75;
-      P.rarm.rx += f1 * 1.2 + f2;
-      P.rarm.ry += by * 2;
-      P.rarm.rz = -0.4 * Math.sin(t * Math.PI);
+      A.rx += f1 * 1.2 + f2;
+      A.ry += by * 2;
+      A.rz = -0.4 * Math.sin(t * Math.PI);
     }
     // swimming / crawling
     if (p.pose === 'swim') return swimLimbs(P, lerp(p.limbSwing - p.limbAmt, p.limbSwing, a), p.swimming);
@@ -2841,32 +3377,37 @@ class Game {
     return vim.model.layers.map((l, k) => [T(l), stackTint(this.renderer, info, k, st)]);
   }
   // draws them over each other: each later layer a little thicker, so it covers the one before instead of flickering
-  drawLayers(layers, m, env, light) {
+  // (glint: the enchantment glint over them, render.js drawGlint)
+  drawLayers(layers, m, env, light, glint) {
     layers.forEach(([layer, c], k) => {
       let mm = m;
       if (k) { mm = new Float32Array(m); M4.scale(mm, 1, 1, 1 + 0.08 * k); }
-      this.renderer.drawMesh(this.spriteMesh(layer), mm, env, light, c ? { color: [c[0] / 255, c[1] / 255, c[2] / 255, 1] } : undefined);
+      const o = c ? { color: [c[0] / 255, c[1] / 255, c[2] / 255, 1] } : {};
+      if (glint) o.glint = 'item';
+      this.renderer.drawMesh(this.spriteMesh(layer), mm, env, light, o);
     });
   }
   drawItemModel(id, m, l, env, ctx, st) {
     const def = ITEMS[id], r = this.renderer;
     if (!def) return; // (an item this game doesn't have - a room's, another version's: nothing to draw instead of an error a frame)
+    if (def.key === 'shield' && this.drawShieldItem && (ctx === 'ground' || ctx === 'fixed')) { this.drawShieldItem(st || { id, count: 1 }, m, l, env, ctx); return; }
     const b = def.block !== undefined ? BLOCKS[def.block] : null;
     const vim = r.itemModel(id);
     const flat = vim ? (vim.gen || (!b && !vim.mesh)) : (!b || def.flat || b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door);
+    const glint = typeof stackGlint === 'function' && stackGlint(st || { id }); // (enchanted: the glint, like vanilla's dropped items)
     if (flat) {
       const mm = new Float32Array(m);
       if (ctx === 'ground') { M4.scale(mm, 0.5, 0.5, 0.5); M4.translate(mm, -0.5, 0, 0); }
-      this.drawLayers(this.itemLayers(st, def, vim, b), mm, env, l);
+      this.drawLayers(this.itemLayers(st, def, vim, b), mm, env, l, glint);
     } else {
       const mm = new Float32Array(m);
       // (a bed: its own two halves, renderer.itemModel, centred at z 1 - one mesh cached for every bed made all the
       // beds on the ground the colour of the first one drawn)
       if (ctx === 'ground') { M4.scale(mm, 0.25, 0.25, 0.25); M4.translate(mm, -0.5, 0, b && b.bed ? -1 : -0.5); }
-      if (vim && vim.mesh) { r.drawMesh(vim.mesh, mm, env, l); return; }
+      if (vim && vim.mesh) { r.drawMesh(vim.mesh, mm, env, l, { glint: glint && 'item' }); return; }
       if (this.isBEItem({ id })) { this.drawBEItem(b, mm, l, env); return; } // (banners, chests, heads ...)
       let meta = b.facing ? 4 : 0; if (b.stairs) meta = 0;
-      r.drawMesh(this.blockMesh(def.block, meta), mm, env, l);
+      r.drawMesh(this.blockMesh(def.block, meta), mm, env, l, { glint: glint && 'item' });
     }
   }
   drawHand(a, env) {
@@ -2881,7 +3422,7 @@ class Game {
     const hid = p.handItem === undefined ? curId : p.handItem;
     const held = hid === curId ? cur : hid >= 0 ? { id: hid, count: 1, dmg: 0 } : null;
     const eq = 1 - lerp(p.oHandH ?? 1, p.handH ?? 1, a);
-    const sw = p.swingT > 0 ? clamp((6 - p.swingT + a) / 6, 0, 1) : 0;
+    const sw = p.swingT > 0 && p.swingHand !== 'off' ? clamp((6 - p.swingT + a) / 6, 0, 1) : 0; // (the other hand's swing: equip.js)
     const D = Math.PI / 180, PI = Math.PI;
     const m = M4.create();
     // view bobbing applied to hand as in vanilla (slight)
@@ -2910,8 +3451,9 @@ class Game {
       const flat = vim ? (vim.gen || (!b && !vim.mesh)) : (!b || def.flat || b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door);
       // eating and drinking (potions, milk, honey, ominous bottles) share vanilla's applyEatTransform; the honey
       // bottle takes 40 ticks, the rest 32
-      const eating = p.usingItem && (def.food || /^(potion|milk_bucket|honey_bottle|ominous_bottle)$/.test(def.key));
-      const bowing = p.usingItem && def.key === 'bow';
+      const mine = p.usingItem === held.id && p.useHand !== 'off'; // (not while the other hand is the one in use)
+      const eating = mine && (def.food || /^(potion|milk_bucket|honey_bottle|ominous_bottle)$/.test(def.key));
+      const bowing = mine && def.key === 'bow';
       if (eating) {
         const dur = def.key === 'honey_bottle' ? 40 : 32, left = dur - p.useT - a + 1, f1 = left / dur;
         if (f1 < 0.8) M4.translate(m, 0, Math.abs(Math.cos(left / 4 * PI) * 0.1), 0);
@@ -2938,23 +3480,27 @@ class Game {
         M4.rotX(m, Math.sin(f1 * PI) * -80 * D);
         M4.rotY(m, -45 * D);
       }
+      // the item model's own first-person transform (vanilla ItemTransform.apply), like the other hand's (equip.js): one
+      // transform for every flat item held the fishing rod backwards, and the beds were one cached mesh - the first bed
+      // held, whatever colour the next one was - drawn small and turned by hand-made offsets
+      const disp = vim && vim.model && vim.model.display;
+      const d = (disp && disp.firstperson_righthand) || (flat ? { r: [0, -90, 25], t: [1.13, 3.2, 1.13], s: [0.68, 0.68, 0.68] } : disp ? { r: [0, 0, 0], t: [0, 0, 0], s: [1, 1, 1] } : { r: [0, 45, 0], t: [0, 0, 0], s: [0.4, 0.4, 0.4] });
+      M4.translate(m, d.t[0] / 16, d.t[1] / 16, d.t[2] / 16);
+      M4.rotX(m, d.r[0] * D); M4.rotY(m, d.r[1] * D); M4.rotZ(m, d.r[2] * D);
+      M4.scale(m, d.s[0], d.s[1], d.s[2]);
       if (flat) {
-        M4.translate(m, 1.13 / 16, 3.2 / 16, 1.13 / 16);
-        M4.rotX(m, 0); M4.rotY(m, -90 * D); M4.rotZ(m, 25 * D);
-        M4.scale(m, 0.68, 0.68, 0.68);
         M4.translate(m, -0.5, -0.5, 0);
         let layers = this.itemLayers(held, def, vim, b);
-        if (bowing) { const f = p.useT; layers = [[T(f >= 18 ? 'i_bow_pulling_2' : f >= 13 ? 'i_bow_pulling_1' : 'i_bow_pulling_0'), null]]; }
-        this.drawLayers(layers, m, env2, lt);
+        // (a mod's bow - 匠魂's longbow, borrowing the bow's key while drawn - keeps its own pulled frames: itemLayers)
+        if (bowing && !def.tcTool) { const f = p.useT; layers = [[T(f >= 18 ? 'i_bow_pulling_2' : f >= 13 ? 'i_bow_pulling_1' : 'i_bow_pulling_0'), null]]; }
+        this.drawLayers(layers, m, env2, lt, typeof stackGlint === 'function' && stackGlint(held));
       } else {
-        M4.rotY(m, 45 * D);
-        M4.scale(m, 0.4, 0.4, 0.4);
+        // (a bed: renderer.itemModel's head and foot, like vanilla's composite bed item)
         M4.translate(m, -0.5, -0.5, -0.5);
-        const im = r.itemModel(held.id);
-        if (im && im.mesh && !(b && b.bed)) { r.drawMesh(im.mesh, m, env2, lt); r.vp = savedVP; r.camPos = savedCam; return; }
+        const go = { glint: typeof stackGlint === 'function' && stackGlint(held) && 'item' };
+        if (vim && vim.mesh) { r.drawMesh(vim.mesh, m, env2, lt, go); r.vp = savedVP; r.camPos = savedCam; return; }
         let meta = b.facing ? 4 : 0; if (b.stairs) meta = 0;
-        if (b.bed) { M4.translate(m, 0.25, 0.2, 0.5); M4.scale(m, 0.6, 0.6, 0.6); r.drawMesh(this.bedMesh || (this.bedMesh = Mesher.multi([[def.block, 0, 0, 0, 0], [def.block, 4, 0, 0, -1]])), m, env2, lt); }
-        else r.drawMesh(this.blockMesh(def.block, meta), m, env2, lt);
+        r.drawMesh(this.blockMesh(def.block, meta), m, env2, lt, go);
       }
     }
     r.vp = savedVP; r.camPos = savedCam;
@@ -3113,12 +3659,21 @@ void main(){ vec4 t = texture(u_tex, v_uv); if (t.a * v_col.a < 0.01) discard; o
     }
     const ask = (raw) => {
       const now = performance.now(), soft = (ua && !ua.isActive) || now - (this.lockLostAt || -1e9) < 2000;
-      this.lockAsked = now; this.lockSoftAt = soft ? now : 0;
+      this.lockAsked = now; this.lockSoftAt = soft ? now : 0; this.lockRaw = false;
       let r;
       try { r = raw ? c.requestPointerLock({ unadjustedMovement: true }) : c.requestPointerLock(); }
-      catch (e) { this.lockAsked = 0; if (raw) { this.rawLockOff = true; ask(false); } return; }
+      catch (e) {
+        this.lockAsked = 0;
+        if (raw) { this.rawLockOff = true; ask(false); }
+        // (no pointer lock here at all - iOS web views, TV browsers: the call is missing or throws, and no pointerlockerror
+        // comes): a refusal all the same. Not counted, the pause menu came back every 250 ms for good (ui.js)
+        else if (!soft || typeof c.requestPointerLock !== 'function') this.lockFails = (this.lockFails || 0) + 1;
+        return;
+      }
+      // (no answer at all - neither the lock nor a refusal - within 1.5 s: a refusal too)
+      setTimeout(() => { if (this.lockAsked === now && document.pointerLockElement !== c) { this.lockAsked = 0; if (!soft) this.lockFails = (this.lockFails || 0) + 1; } }, 1500);
       this.lockNoPromise = !(r && r.then);
-      if (r && r.then) r.then(() => { this.lockAsked = 0; }, (e) => {
+      if (r && r.then) r.then(() => { this.lockAsked = 0; this.lockRaw = raw; }, (e) => {
         this.lockAsked = 0;
         // raw input (unadjustedMovement) isn't on every system: asked again without it at once, still inside the click,
         // and not asked for again this session (each refusal was a pointerlockerror too)
@@ -3130,6 +3685,87 @@ void main(){ vec4 t = texture(u_tex, v_uv); if (t.a * v_col.a < 0.01) discard; o
   releasePointer() { if (document.pointerLockElement) document.exitPointerLock(); }
 }
 
+// explosion resistance where vanilla's differs from the hardness (Blocks.java strength(hardness, resistance)); every
+// other block resists by its hardness. Weathered and waxed copper as its plain form ('copper': the copper block)
+const BLAST_RES = new Map();
+for (const [v, keys] of [
+  [1200, 'obsidian enchanting_table anvil chipped_anvil damaged_anvil netherite_block ancient_debris ' +
+    'crying_obsidian respawn_anchor reinforced_deepslate heavy_core'],
+  [600, 'ender_chest'],
+  [9, 'end_stone dragon_egg end_stone_bricks end_stone_brick_stairs end_stone_brick_slab ' +
+    'end_stone_brick_wall'],
+  [6, 'stone granite polished_granite diorite polished_diorite andesite polished_andesite cobblestone ' +
+    'gold_block iron_block bricks mossy_cobblestone diamond_block cobblestone_stairs jukebox stone_bricks ' +
+    'mossy_stone_bricks cracked_stone_bricks chiseled_stone_bricks iron_bars copper_bars iron_chain ' +
+    'copper_chain brick_stairs stone_brick_stairs resin_bricks resin_brick_stairs resin_brick_slab ' +
+    'resin_brick_wall chiseled_resin_bricks nether_bricks nether_brick_fence nether_brick_stairs ' +
+    'emerald_block cobblestone_wall mossy_cobblestone_wall redstone_block prismarine prismarine_bricks ' +
+    'dark_prismarine prismarine_stairs prismarine_brick_stairs dark_prismarine_stairs prismarine_slab ' +
+    'prismarine_brick_slab dark_prismarine_slab coal_block stone_slab smooth_stone_slab sandstone_slab ' +
+    'cut_sandstone_slab petrified_oak_slab cobblestone_slab brick_slab stone_brick_slab nether_brick_slab ' +
+    'quartz_slab red_sandstone_slab cut_red_sandstone_slab purpur_slab smooth_stone smooth_sandstone ' +
+    'smooth_quartz smooth_red_sandstone purpur_block purpur_pillar purpur_stairs red_nether_bricks ' +
+    'dead_tube_coral_block dead_brain_coral_block dead_bubble_coral_block dead_fire_coral_block ' +
+    'dead_horn_coral_block tube_coral_block brain_coral_block bubble_coral_block fire_coral_block ' +
+    'horn_coral_block polished_granite_stairs smooth_red_sandstone_stairs mossy_stone_brick_stairs ' +
+    'polished_diorite_stairs mossy_cobblestone_stairs stone_stairs smooth_sandstone_stairs ' +
+    'smooth_quartz_stairs granite_stairs andesite_stairs red_nether_brick_stairs polished_andesite_stairs ' +
+    'diorite_stairs polished_granite_slab smooth_red_sandstone_slab mossy_stone_brick_slab ' +
+    'polished_diorite_slab mossy_cobblestone_slab smooth_sandstone_slab smooth_quartz_slab granite_slab ' +
+    'andesite_slab red_nether_brick_slab polished_andesite_slab diorite_slab brick_wall prismarine_wall ' +
+    'mossy_stone_brick_wall granite_wall stone_brick_wall nether_brick_wall andesite_wall ' +
+    'red_nether_brick_wall diorite_wall grindstone blackstone blackstone_stairs blackstone_wall ' +
+    'blackstone_slab polished_blackstone polished_blackstone_bricks cracked_polished_blackstone_bricks ' +
+    'chiseled_polished_blackstone polished_blackstone_brick_slab polished_blackstone_brick_stairs ' +
+    'polished_blackstone_brick_wall gilded_blackstone polished_blackstone_stairs polished_blackstone_slab ' +
+    'polished_blackstone_wall chiseled_nether_bricks cracked_nether_bricks tuff tuff_slab tuff_stairs ' +
+    'tuff_wall polished_tuff polished_tuff_slab polished_tuff_stairs polished_tuff_wall chiseled_tuff ' +
+    'tuff_bricks tuff_brick_slab tuff_brick_stairs tuff_brick_wall chiseled_tuff_bricks copper_block ' +
+    'copper_door copper_trapdoor copper_grate copper_bulb copper_chest copper_golem_statue lightning_rod ' +
+    'deepslate cobbled_deepslate cobbled_deepslate_stairs cobbled_deepslate_slab cobbled_deepslate_wall ' +
+    'polished_deepslate polished_deepslate_stairs polished_deepslate_slab polished_deepslate_wall ' +
+    'deepslate_tiles deepslate_tile_stairs deepslate_tile_slab deepslate_tile_wall deepslate_bricks ' +
+    'deepslate_brick_stairs deepslate_brick_slab deepslate_brick_wall chiseled_deepslate ' +
+    'cracked_deepslate_bricks cracked_deepslate_tiles raw_iron_block raw_copper_block raw_gold_block ' +
+    'copper cut_copper chiseled_copper cut_copper_stairs cut_copper_slab sulfur potent_sulfur sulfur_slab ' +
+    'sulfur_stairs sulfur_wall polished_sulfur polished_sulfur_slab polished_sulfur_stairs ' +
+    'polished_sulfur_wall sulfur_bricks sulfur_brick_slab sulfur_brick_stairs sulfur_brick_wall ' +
+    'chiseled_sulfur cinnabar cinnabar_slab cinnabar_stairs cinnabar_wall polished_cinnabar ' +
+    'polished_cinnabar_slab polished_cinnabar_stairs polished_cinnabar_wall cinnabar_bricks ' +
+    'cinnabar_brick_slab cinnabar_brick_stairs cinnabar_brick_wall chiseled_cinnabar'],
+  [4.8, 'hopper'],
+  [4.2, 'basalt polished_basalt terracotta smooth_basalt white_terracotta orange_terracotta ' +
+    'magenta_terracotta light_blue_terracotta yellow_terracotta lime_terracotta pink_terracotta ' +
+    'gray_terracotta light_gray_terracotta cyan_terracotta purple_terracotta blue_terracotta ' +
+    'brown_terracotta green_terracotta red_terracotta black_terracotta'],
+  [3.5, 'crafter'],
+  [3, 'oak_planks spruce_planks birch_planks jungle_planks acacia_planks cherry_planks dark_oak_planks ' +
+    'pale_oak_planks mangrove_planks bamboo_planks bamboo_mosaic deepslate_gold_ore deepslate_iron_ore ' +
+    'deepslate_coal_ore deepslate_lapis_ore acacia_shelf bamboo_shelf birch_shelf cherry_shelf ' +
+    'crimson_shelf dark_oak_shelf jungle_shelf mangrove_shelf oak_shelf pale_oak_shelf spruce_shelf ' +
+    'warped_shelf oak_stairs deepslate_diamond_ore deepslate_redstone_ore oak_fence packed_mud mud_bricks ' +
+    'oak_fence_gate mud_brick_stairs cocoa deepslate_emerald_ore spruce_stairs birch_stairs jungle_stairs ' +
+    'acacia_stairs cherry_stairs dark_oak_stairs pale_oak_stairs mangrove_stairs bamboo_stairs ' +
+    'bamboo_mosaic_stairs oak_slab spruce_slab birch_slab jungle_slab acacia_slab cherry_slab ' +
+    'dark_oak_slab pale_oak_slab mangrove_slab bamboo_slab bamboo_mosaic_slab mud_brick_slab ' +
+    'spruce_fence_gate birch_fence_gate jungle_fence_gate acacia_fence_gate cherry_fence_gate ' +
+    'dark_oak_fence_gate pale_oak_fence_gate mangrove_fence_gate bamboo_fence_gate spruce_fence ' +
+    'birch_fence jungle_fence acacia_fence cherry_fence dark_oak_fence pale_oak_fence mangrove_fence ' +
+    'bamboo_fence mud_brick_wall crimson_planks warped_planks crimson_slab warped_slab crimson_fence ' +
+    'warped_fence crimson_fence_gate warped_fence_gate crimson_stairs warped_stairs deepslate_copper_ore ' +
+    'pointed_dripstone sulfur_spike'],
+  [2.5, 'dried_kelp_block'],
+  [1, 'dripstone_block'],
+  // InfestedBlock: explosionResistance(0.75F) whatever the host block
+  [0.75, 'infested_stone infested_cobblestone infested_stone_bricks infested_mossy_stone_bricks ' +
+    'infested_cracked_stone_bricks infested_chiseled_stone_bricks infested_deepslate'],
+  [0.1, 'firefly_bush'],
+  [0, 'nether_portal'],
+]) for (const k of keys.split(' ')) BLAST_RES.set(k, v);
+function blastRes(b) {
+  const r = BLAST_RES.get(b.key.replace(/^waxed_/, '').replace(/^(exposed|weathered|oxidized)_/, ''));
+  return r !== undefined ? r : b.hardness < 0 ? 3600000 : b.hardness;
+}
 const WOOL_RGB = [[1, 1, 1], [0.95, 0.55, 0.2], [0.75, 0.3, 0.75], [0.4, 0.6, 0.85], [0.9, 0.85, 0.2], [0.5, 0.8, 0.2], [0.95, 0.6, 0.7], [0.3, 0.3, 0.3], [0.6, 0.6, 0.6], [0.2, 0.55, 0.6], [0.5, 0.25, 0.7], [0.2, 0.3, 0.65], [0.45, 0.3, 0.2], [0.35, 0.45, 0.2], [0.65, 0.2, 0.2], [0.1, 0.1, 0.1]];
 
 Player.prototype.loadedHere = function () {

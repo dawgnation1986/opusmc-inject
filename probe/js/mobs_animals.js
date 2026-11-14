@@ -121,21 +121,33 @@ function horseAnim(md, e, a) {
   const P = md.parts, [pos, spd] = emLimbs(e, a), t = e.age + a;
   const eat = e.eatT > 0 ? Math.min(1, (40 - e.eatT + a) / 6, e.eatT / 6) : 0;
   const rear = e.rearT > 0 ? Math.sin(Math.min(1, (20 - e.rearT + a) / 20) * Math.PI) : 0;
+  // vanilla AbstractEquineModel.setupAnim with the baby horse / baby donkey models' own numbers, from the layer's own
+  // pivots: the adult's pivots were set outright (a foal's head and legs came off) and rearing barely moved the head
+  const baby = md.key.includes('_baby'), donkey = /^(donkey|mule)/.test(md.key), ageScale = baby ? 0.5 : 1;
+  const C = baby && donkey ? { stand: Math.PI / 3, legY: 1, legZ: 0.5, legX: 0, tail: -Math.PI / 4 }
+    : baby ? { stand: Math.PI / 12, legY: 4, legZ: 0, legX: -Math.PI / 3, tail: -Math.PI / 2 } : { stand: Math.PI / 12, legY: 12, legZ: 4, legX: -Math.PI / 3, tail: 0 };
+  const standing = rear, iStanding = 1 - standing, feeding = e.mouthT > 0 ? 1 : 0, still = 1 - Math.max(standing, eat);
+  const yRot = clamp(-(e.headYaw || 0), -Math.PI / 9, Math.PI / 9);
+  let hx = -(e.pitch || 0);
+  if (spd > 0.2) hx += Math.cos(pos * 0.8) * 0.15 * spd;
   const hp = P.head_parts;
   if (hp) {
-    hp.xRot = 0.5235988 + (-(e.pitch || 0)) * (1 - eat) + eat * 2.18 - rear * 0.4;
-    hp.yRot = -(e.headYaw || 0) * (1 - eat);
-    hp.y = 4 + eat * 7 - rear * 4; hp.z = -12 + eat * 0 - rear * 2;
+    if (baby && donkey) { const bx = -Math.PI / 6; hp.xRot = standing * (Math.PI / 12 + bx) + eat * (Math.PI / 2 + Math.sin(t) * 0.05) + still * (Math.PI / 6 + bx + feeding * Math.sin(t) * 0.05); }
+    else hp.xRot = standing * (Math.PI / 12 + hx) + eat * (2.1816616 + Math.sin(t) * 0.05) + still * (Math.PI / 6 + hx + feeding * Math.sin(t) * 0.05);
+    hp.yRot = standing * yRot + still * yRot;
+    if (baby && donkey) { hp.y = lerp(hp.y, -1.2, eat); hp.z = lerp(hp.z, -3.6, standing); }
+    else { hp.y += lerp(lerp(0, baby ? -2 : -8, standing), baby ? 2 : 7, eat); hp.z = lerp(hp.z, -4, standing); }
   }
-  if (P.body) { P.body.xRot = -rear * 0.785; }
-  const ph = pos * 0.6662, amp = spd * 1.0;
-  const back = rear > 0 ? -rear * 0.785 : 0;
-  if (P.left_hind_leg) { P.left_hind_leg.xRot = Math.cos(ph) * amp * (1 - rear) - back * 0.6; }
-  if (P.right_hind_leg) { P.right_hind_leg.xRot = Math.cos(ph + Math.PI) * amp * (1 - rear) - back * 0.6; }
-  if (P.left_front_leg) { P.left_front_leg.xRot = Math.cos(ph + Math.PI) * amp * (1 - rear) - rear * (1.6 + Math.cos(t * 0.6) * 0.4); P.left_front_leg.y = 14 - rear * 6; P.left_front_leg.z = -10 + rear * 8; }
-  if (P.right_front_leg) { P.right_front_leg.xRot = Math.cos(ph) * amp * (1 - rear) - rear * (1.6 + Math.sin(t * 0.6) * 0.4); P.right_front_leg.y = 14 - rear * 6; P.right_front_leg.z = -10 + rear * 8; }
-  if (rear > 0) { for (const n of ['left_hind_leg', 'right_hind_leg']) if (P[n]) P[n].y = 14 + rear * 0.5; }
-  if (P.tail) { P.tail.xRot = 0.5235988 + spd * 0.75 + (rear * 0.4); P.tail.yRot = e.tailT > 0 ? Math.cos(t * 0.7) : 0; }
+  if (P.body) P.body.xRot = standing * (-Math.PI / 4) + iStanding * P.body.xRot;
+  const LF = P.left_front_leg, RF = P.right_front_leg, LH = P.left_hind_leg, RH = P.right_hind_leg;
+  if (LF) { LF.y -= C.legY * standing; LF.z += C.legZ * standing; if (RF) { RF.y = LF.y; RF.z = LF.z; } }
+  const legAnim1 = Math.cos((e.inWater ? 0.2 : 1) * pos * 0.6662 + Math.PI), legX = legAnim1 * 0.8 * spd, bob = Math.cos(t * 0.6 + Math.PI);
+  if (LH) LH.xRot = C.stand * standing - legAnim1 * 0.5 * spd * iStanding;
+  if (RH) RH.xRot = C.stand * standing + legAnim1 * 0.5 * spd * iStanding;
+  if (LF) LF.xRot = (C.legX + bob) * standing + legX * iStanding;
+  if (RF) RF.xRot = (C.legX - bob) * standing - legX * iStanding;
+  if (baby && donkey && LH && RH) { LH.y = lerp(LH.y, -0.3, standing); RH.y = lerp(LH.y, -0.3, standing); }
+  if (P.tail) { P.tail.xRot = C.tail + Math.PI / 6 + spd * 0.75; P.tail.y += spd * ageScale; P.tail.z += spd * 2 * ageScale; P.tail.yRot = e.tailT > 0 ? Math.cos(t * 0.7) : 0; }
   if (P.upper_mouth && e.mouthT > 0) P.upper_mouth.xRot = -0.2;
   if (P.left_chest) P.left_chest.visible = !!e.chest;
   if (P.right_chest) P.right_chest.visible = !!e.chest;
@@ -187,13 +199,17 @@ class Camel extends Horse {
   }
   sitDown() { if (this.sit) return; this.sit = true; this.anims = { 'CAMEL_SIT': this.age }; this.sitT = 40; this.sound('sit'); }
   standUp() { if (!this.sit) return; this.sit = false; this.anims = { 'CAMEL_STANDUP': this.age }; this.sitT = 52; this.sound('stand'); }
+  // the dash animation ends once it lands again (vanilla: dashing stops at a cooldown below 50 on the ground); it looped on
+  endDash() { if (this.anims.CAMEL_DASH != null && this.onGround && this.age - this.anims.CAMEL_DASH >= 5) delete this.anims.CAMEL_DASH; }
   think(c) {
+    this.endDash();
     if (this.sitT > 0) { this.sitT--; return; }
     if (this.sit) { if (this.panic > 0 || Math.random() < 1 / 2000) this.standUp(); return; }
     if (!this.target && this.panic <= 0 && !this.loveT && Math.random() < 1 / 3000) { this.sitDown(); return; }
     VMob.prototype.think.call(this, c);
   }
   ridden(c, inp) {
+    this.endDash();
     if (this.sitT > 0) { this.sitT--; return; }
     if (this.sit) { if (inp.fwd || inp.jump) this.standUp(); return; }
     if (!this.saddled) return;
@@ -217,7 +233,12 @@ class Camel extends Horse {
     const P = md.parts, [pos, spd] = emLimbs(this, a), pre = this.baby ? 'CamelBabyAnimation.CAMEL_BABY_' : 'CamelAnimation.CAMEL_';
     if (P.head) { P.head.yRot = clamp(-(this.headYaw || 0), -0.52, 0.52); P.head.xRot = clamp(-(this.pitch || 0), -0.44, 0.44); }
     if (!this.sit && this.sitT <= 0) EM.walk(md, pre + 'WALK', pos, spd, 2, 2.5);
-    for (const k in this.anims) EM.anim(md, pre + k.slice(6), (this.age - this.anims[k] + a) / 20);
+    // (like vanilla's animation states: sitting down only during its 40 ticks, then the sit pose alone; standing up during
+    // its 52. A finished one stayed on at its last frame - under the sit pose that doubled the drop and turned the legs over)
+    for (const k in this.anims) {
+      if (k === 'CAMEL_SIT' ? !(this.sit && this.sitT > 0) : k === 'CAMEL_STANDUP' ? !(!this.sit && this.sitT > 0) : false) continue;
+      EM.anim(md, pre + k.slice(6), (this.age - this.anims[k] + a) / 20);
+    }
     if (this.sit && this.sitT <= 0) EM.anim(md, pre + 'SIT_POSE', 0);
     if (!this.sit && this.sitT <= 0 && spd < 0.05) EM.anim(md, pre + 'IDLE', (this.age + a) / 20);
   }
@@ -418,13 +439,15 @@ class Wolf extends VMob {
     emHead(P.head, this, a);
     if (P.head && this.beg > 0) P.head.zRot = 0.4 * this.beg;
     if (this.sitting) {
-      if (P.upper_body) { P.upper_body.xRot = 2 * Math.PI / 5; P.upper_body.y = 16; P.upper_body.z = -3; }
-      if (P.body) { P.body.xRot = Math.PI / 4; P.body.y = 18; P.body.z = 0; }
-      if (P.tail) { P.tail.y = 21; P.tail.z = 6; }
-      for (const n of ['right_hind_leg', 'left_hind_leg']) if (P[n]) { P[n].xRot = 3 * Math.PI / 2; P[n].y = 22.7; P[n].z = 2; }
-      for (const n of ['right_front_leg', 'left_front_leg']) if (P[n]) { P[n].xRot = 5.811947; P[n].y = 17; P[n].z = -4; }
-      if (P.right_hind_leg) P.right_hind_leg.x = -2.5; if (P.left_hind_leg) P.left_hind_leg.x = 0.5;
-      if (P.right_front_leg) P.right_front_leg.x = -2.49; if (P.left_front_leg) P.left_front_leg.x = 0.51;
+      // vanilla WolfModel.setSittingPose: offsets from the model's own pivots times the age scale (0.5 on the baby model;
+      // the adult's pivots set outright pulled the baby model apart), AdultWolfModel's upper body, BabyWolfModel's body
+      const k = md.key.includes('_baby') ? 0.5 : 1;
+      if (P.body) { P.body.y += 4 * k; P.body.z -= 2 * k; P.body.xRot = Math.PI / 4 - (P.upper_body ? 0 : Math.PI / 2); }
+      if (P.tail) { P.tail.y += 9 * k; P.tail.z -= 2 * k; }
+      for (const n of ['right_hind_leg', 'left_hind_leg']) if (P[n]) { P[n].xRot = 3 * Math.PI / 2; P[n].y += 6.7 * k; P[n].z -= 5 * k; }
+      for (const n of ['right_front_leg', 'left_front_leg']) if (P[n]) { P[n].xRot = 5.811947; P[n].y += 1 * k; }
+      if (P.right_front_leg) P.right_front_leg.x += 0.01 * k; if (P.left_front_leg) P.left_front_leg.x -= 0.01 * k;
+      if (P.upper_body) { P.upper_body.y += 2; P.upper_body.xRot = 2 * Math.PI / 5; P.upper_body.yRot = 0; }
     } else emQuad(md, pos, spd);
     if (P.tail) P.tail.xRot = this.angry ? 1.5393804 : this.owner ? (0.55 - (this.maxHealth - this.health) * 0.02) * Math.PI : 0.62831855;
     if (P.tail && !this.sitting) P.tail.yRot = Math.cos(pos * 0.6662) * 1.4 * spd;
@@ -670,8 +693,8 @@ class Rabbit extends VMob {
     c.goal = [this.pos[0] + dx / d * 6, this.pos[1], this.pos[2] + dz / d * 6]; c.mod = 2.2; return true;
   }
   idle(c) {
-    // nibble ripe carrots
-    if (this.age % 40 === 0 && Math.random() < 0.1) {
+    // nibble ripe carrots (vanilla RaidGardenGoal: only with mob_griefing)
+    if (this.age % 40 === 0 && Math.random() < 0.1 && this.game.rule('mob_griefing') !== false) {
       const x = Math.floor(this.pos[0]), y = Math.floor(this.pos[1]), z = Math.floor(this.pos[2]), id = this.world.getBlock(x, y, z);
       if (BLOCKS[id] && BLOCKS[id].key === 'carrots') { const ag = +(Features.propOf(id, this.world.getMeta(x, y, z), 'age') || 0); if (ag > 0) bsetProp(this.world, x, y, z, 'age', ag - 1); else this.world.setBlock(x, y, z, 0, 0); }
     }
@@ -931,7 +954,8 @@ class Turtle extends VMob {
   texKey(r) { return r.etex('entity/turtle/turtle' + (this.baby ? '_baby' : '')); }
 }
 // on land vanilla turtles plod at a quarter of their speed (TurtleMoveControl): landSpeedMul
-defVMob('turtle', { cls: Turtle, food: 'turtle_food', xp: 2, shadowR: 0.6, speed3: 1.2, landSpeedMul: 0.12, waterOk: true, sinks: true, walkUnderwater: false, stepSound: false });
+defVMob('turtle', { cls: Turtle, food: 'turtle_food', xp: 2, shadowR: 0.6, speed3: 1.2, landSpeedMul: 0.12, waterOk: true, sinks: true, walkUnderwater: false, stepSound: false,
+  cull: (t) => t.layerKey() === 'turtle_baby#main' }); // (BabyTurtleModel is entityCutoutCull, the adult isn't)
 BLOCK_RANDOM_TICK.turtle_egg = (g, x, y, z, id, m) => {
   const w = g.world, h = +(Features.propOf(id, m, 'hatch') || 0), n = +(Features.propOf(id, m, 'eggs') || 1);
   if (!/sand$/.test(BLOCKS[w.getBlock(x, y - 1, z)].key)) return;
@@ -1003,7 +1027,9 @@ class Frog extends VMob {
   }
   texKey(r) { return r.etex('entity/frog/frog_' + this.variant); }
 }
-defVMob('frog', { cls: Frog, food: 'frog_food', xp: 2, shadowR: 0.3, waterOk: true, speed3: 1.5, stepSound: false });
+// (in the water vanilla frogs get 0.02 x 0.75 x 0.75 a tick; tadpoles swim like fish, AbstractFish's fixed 0.01 x the
+// input: 0.01 x 0.5 idle, and panicking the input 2 is cut to length 1, so 0.01, twice that)
+defVMob('frog', { cls: Frog, food: 'frog_food', xp: 2, shadowR: 0.3, waterOk: true, swimAcc: 0.011, stepSound: false });
 class Tadpole extends VMob {
   constructor(g, type, x, y, z) { super(g, type, x, y, z); this.grow = 24000; this.waterBreather = true; }
   extraSave() { return { grow: this.grow }; }
@@ -1023,7 +1049,7 @@ class Tadpole extends VMob {
   setupAnim(md, a) { const P = md.parts; if (P.tail) P.tail.yRot = -Math.sin((this.age + a) * (this.inWater ? 1.3 : 1.7)) * 0.25 * (this.inWater ? 1 : 2); }
   texKey(r) { return r.etex('entity/tadpole/tadpole'); }
 }
-defVMob('tadpole', { cls: Tadpole, ai: 'swim', xp: 0, shadowR: 0.15, dryOut: 100, stepSound: false });
+defVMob('tadpole', { cls: Tadpole, ai: 'swim', xp: 0, shadowR: 0.15, dryOut: 100, stepSound: false, swimAcc: 0.005, panicMod: 2 });
 BLOCK_RANDOM_TICK.frogspawn = (g, x, y, z) => {
   if (Math.random() > 0.15) return;
   g.world.setBlock(x, y, z, 0, 0); Sound.ev('block.frogspawn.hatch', [x + 0.5, y, z + 0.5], 1, 1);
@@ -1055,7 +1081,7 @@ class Bat extends VMob {
   texKey(r) { return r.etex('entity/bat/bat'); }
   preDraw(m, a) { if (!this.resting) M4.translate(m, 0, Math.cos((this.age + a) * 0.3) * 0.1, 0); }
 }
-defVMob('bat', { cls: Bat, ai: 'fly', xp: 0, scale: 0.35 / 0.35, shadowR: 0.2, speed3: 1.4, idleT: 80, stepSound: false, vol: 0.1 });
+defVMob('bat', { cls: Bat, ai: 'fly', xp: 0, scale: 0.35 / 0.35, shadowR: 0.2, speed3: 1.4, idleT: 80, stepSound: false, vol: 0.1, cull: true });
 
 // ---- parrots: fly, perch on shoulders, dance to music, imitate mobs ----------------------------------------------
 const PARROT_COLORS = ['red_blue', 'blue', 'green', 'yellow_blue', 'grey'];
@@ -1325,8 +1351,8 @@ class SnowGolem extends VMob {
     const b = biomeName(g, x, z);
     const hot = /desert|badlands|savanna|jungle|nether|crimson|warped|basalt|soul|mangrove|warm/.test(b);
     if ((hot || this.inWater || (g.weather > 0.5 && w.skyAt(x, y + 2, z) >= 15)) && this.age % 20 === 0) this.hurt(1, { type: 'melt' });
-    // snow trail
-    if (!hot && BID.snow !== undefined && w.getBlock(x, y, z) === 0 && SOLIDCUBE[w.getBlock(x, y - 1, z)] && this.age % 4 === 0) w.setBlock(x, y, z, BID.snow, 0);
+    // snow trail (vanilla: only with mob_griefing)
+    if (!hot && g.rule('mob_griefing') !== false && BID.snow !== undefined && w.getBlock(x, y, z) === 0 && SOLIDCUBE[w.getBlock(x, y - 1, z)] && this.age % 4 === 0) w.setBlock(x, y, z, BID.snow, 0);
   }
   postInteract(p, held) {
     if (held && ITEMS[held.id].key === 'shears' && this.pumpkin) { this.pumpkin = false; this.game.dropItem(this.pos[0], this.pos[1] + 1.7, this.pos[2], makeStack('carved_pumpkin', 1)); Sound.ev('entity.snow_golem.shear', this.pos, 1, 1); this.game.damageHeld(1); return true; }
@@ -1501,9 +1527,15 @@ class HappyGhast extends VMob {
   extraLoad(o) { this.harness = o.har || null; }
   wantsPlayer() { return false; }
   seat() { return [this.pos[0], this.pos[1] + this.h + 0.05, this.pos[2]]; }
+  // (vanilla HappyGhast.checkFallDamage does nothing: flown down onto the ground with a rider it died of the fall)
+  onLand() { }
   dropsOnDeath() { return [this.harness]; }
   think(c) {
     const p = this.game.player;
+    // a player on top of it (or just above): it stops in place, so one can stand on it (scanPlayerAboveGhast -> stopInPlace)
+    const r = p.vehicle || p, b = this.box();
+    if (!p.spectator && !(r instanceof HappyGhast) && r.pos[0] >= b[0] - 1 && r.pos[0] < b[3] + 1 && r.pos[2] >= b[2] - 1 && r.pos[2] < b[5] + 1
+      && r.pos[1] >= b[4] - 1e-5 && r.pos[1] < b[4] + this.h / 2) { this.vel[0] = this.vel[1] = this.vel[2] = 0; this.goal = null; c.look = p; return; }
     // follows a player holding snowballs or a harness
     if (p.inv.held && (ITEMS[p.inv.held.id].key === 'snowball' || /_harness$/.test(ITEMS[p.inv.held.id].key)) && this.distTo(p) < 16 && this.distTo(p) > 4) { c.goal = [p.pos[0], p.pos[1] + 2, p.pos[2]]; c.look = p; return; }
     if (this.harness && this.distTo(p) < 8) { c.look = p; return; }
@@ -1538,7 +1570,15 @@ class HappyGhast extends VMob {
   drawLayers(g, r, md, m, a, env, lt, overlay) {
     if (!this.harness || this.baby) return;
     const hm = EM.get(r, 'happy_ghast_harness#main'), col = ITEMS[this.harness.id].key.replace(/_harness$/, '');
-    if (hm) { EM.reset(hm); if (hm.parts.goggles) hm.parts.goggles.y = this.rider ? 14 : 14 - 1.5; r.drawEM(hm, r.etex('entity/equipment/happy_ghast_body/' + col + '_harness'), m, lt, env, { overlay }); }
+    // (the harness box is the body's own box: drawn with depth LESS it lost to the body everywhere but the goggles. Vanilla's
+    // equipment layers are pulled toward the camera (VIEW_OFFSET_Z_LAYERING): here a polygon offset and LEQUAL)
+    if (hm) {
+      EM.reset(hm); if (hm.parts.goggles) hm.parts.goggles.y = this.rider ? 14 : 14 - 1.5;
+      const gl = r.gl, po = gl.isEnabled(gl.POLYGON_OFFSET_FILL);
+      gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(-1, -1); gl.depthFunc(gl.LEQUAL);
+      r.drawEM(hm, r.etex('entity/equipment/happy_ghast_body/' + col + '_harness'), m, lt, env, { overlay });
+      gl.depthFunc(gl.LESS); if (!po) gl.disable(gl.POLYGON_OFFSET_FILL);
+    }
     if (this.rider) { const rm = EM.get(r, 'happy_ghast_ropes#main'); if (rm) { EM.reset(rm); EM.copy(md, rm); r.drawEM(rm, r.etex('entity/ghast/happy_ghast_ropes'), m, lt, env, { overlay }); } }
   }
 }

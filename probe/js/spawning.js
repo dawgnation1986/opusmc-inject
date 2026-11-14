@@ -90,12 +90,52 @@ function spawnPickOf(list) {
   for (const s of list) { if (!MOB_TYPES[s.type.replace('minecraft:', '')]) continue; if ((r -= s.weight) < 0) return s; }
   return last;
 }
-Game.prototype.spawnPick = function (cat, x, z) { const v = this.vbiomeAt(x, z); return spawnPickOf(v && v.def && v.def.spawners && v.def.spawners[cat]); };
+// the biome whose spawn lists apply here: a superflat world (the older format, no vanilla biome data) is vanilla's
+// default superflat, all plains - it had the older generator's spawning, five monsters and no slimes
+let SPAWN_FLAT = null;
+function spawnBiome(g, x, z) {
+  if (g.world && g.world.flat) return SPAWN_FLAT || (SPAWN_FLAT = self.WG_DATA && WG_DATA.biome.plains ? { name: 'plains', def: WG_DATA.biome.plains } : null);
+  return g.vbiomeAt ? g.vbiomeAt(x, z) : null;
+}
+// a structure's own spawn list for the category at this spot, or null (vanilla NaturalSpawner.mobsAt: spawn_overrides -
+// pillager outposts their pillagers, swamp huts witches, ancient cities nothing); inside the structure's box. The pieces'
+// own boxes are not kept, so of the "piece" ones only the swamp hut's (one piece) counts - not the trial chambers' whole
+// box of rock. Without `y`, by the column only
+function spawnOverride(g, cat, x, y, z) {
+  const w = g.world, refs = w.structRefs, S = self.STRUCT_DATA && STRUCT_DATA.structure;
+  if (!refs || !refs.size || !S) return null;
+  // (only the refs of structures with overrides, kept while the map does not change: it holds every structure seen)
+  let c = w._spawnOvr;
+  if (!c || c.refs !== refs || c.n !== refs.size) {
+    c = w._spawnOvr = { refs, n: refs.size, list: [] };
+    for (const s of refs.values()) if (S[s.name] && S[s.name].spawn_overrides && Object.keys(S[s.name].spawn_overrides).length) c.list.push(s);
+  }
+  const vy = y == null ? null : y + (w.minY || 0);
+  for (const s of c.list) {
+    const o = S[s.name].spawn_overrides[cat], b = s.box;
+    if (o && (o.bounding_box !== 'piece' || s.name === 'swamp_hut') && x >= b[0] && x <= b[3] && z >= b[2] && z <= b[5] && (vy == null || (vy >= b[1] && vy <= b[4]))) return o.spawns || [];
+  }
+  return null;
+}
+// the block a land animal stands on in this column: below the leaves (vanilla's MOTION_BLOCKING_NO_LEAVES heightmap for
+// animals; surfaceY stops on the canopy, so no animal came under the trees of a forest or taiga), stopping at a fluid
+function spawnGroundY(w, x, z) {
+  let y = w.surfaceY(x, z);
+  for (let id = w.getBlock(x, y, z); y > 1 && (/_leaves$/.test(BLOCKS[id].key) || (!BLOCKS[id].solid && !IS_FLUID[id])); id = w.getBlock(x, --y, z));
+  return y;
+}
+// the block a creature stands on: parrots and ocelots also on the canopy (vanilla SpawnPlacements: MOTION_BLOCKING)
+function spawnStandY(w, type, x, z) { return type === 'parrot' || type === 'ocelot' ? w.surfaceY(x, z) : spawnGroundY(w, x, z); }
+Game.prototype.spawnPick = function (cat, x, z, y) {
+  const o = y != null ? spawnOverride(this, cat, x, y, z) : null;
+  if (o) return spawnPickOf(o);
+  const v = spawnBiome(this, x, z); return spawnPickOf(v && v.def && v.def.spawners && v.def.spawners[cat]);
+};
 const _oldSpawnMobs = Game.prototype.spawnMobs;
 Game.prototype.spawnMobs = function () {
   const p = this.player;
   // worlds from the older generator have no vanilla biome data: their own spawning
-  const v0 = this.vbiomeAt && this.vbiomeAt(Math.floor(p.pos[0]), Math.floor(p.pos[2]));
+  const v0 = spawnBiome(this, Math.floor(p.pos[0]), Math.floor(p.pos[2]));
   if (!v0 || !v0.def || !v0.def.spawners) return _oldSpawnMobs.call(this);
   // occasional ones
   if (this.tickCount % 24000 === 1200 && this.trySpawnTrader) this.trySpawnTrader();
@@ -106,30 +146,63 @@ Game.prototype.spawnMobs = function () {
   for (const e of this.entities) { if (!(e instanceof Mob) || e.dead || spawnMustKeep(e) || !sp.has(e.pos[0], e.pos[2])) continue; const c = spawnCatOf(e); counts[c] = (counts[c] || 0) + 1; }
   const dark = spawnDarken(this);
   for (const cat in SPAWN_CAPS) {
-    if ((counts[cat] || 0) >= Math.max(1, Math.round(SPAWN_CAPS[cat] * sp.scale))) continue;
+    const cap = Math.max(1, Math.round(SPAWN_CAPS[cat] * sp.scale));
+    if ((counts[cat] || 0) >= cap) continue;
     if (cat === 'monster' && this.difficulty === 0) continue;
-    // animals spawn rarely (vanilla: mostly with new chunks, then every 400 ticks)
-    if (cat === 'creature' && Math.random() > 0.05) continue;
-    for (let attempt = 0; attempt < (cat === 'monster' ? 3 : 1); attempt++) {
+    // animals (vanilla: mostly with new chunks - Game.spawnAnimals -, then every 400 ticks a try in each chunk around,
+    // up to the cap; it was one try in 20 seconds for the whole area)
+    if (cat === 'creature' && this.tickCount % 400 !== 0) continue;
+    for (let attempt = 0, tries = cat === 'creature' ? sp.n : cat === 'monster' ? 3 : 1; attempt < tries && (counts[cat] || 0) < cap; attempt++) {
       const at = sp.pick();
       if (!at || !sp.ok(at[0], at[1])) continue;
-      const [x, z] = at, pick = this.spawnPick(cat, x, z);
+      const [x, z] = at;
+      // (a structure's own list where there is one for this column: pillager outposts - checked again at the height; an
+      // empty one, an ancient city's, only decides at the height, so the ground and caves above it keep the biome's)
+      const own = spawnOverride(this, cat, x, null, z), fromOwn = !!(own && own.length);
+      let pick = fromOwn ? spawnPickOf(own) : this.spawnPick(cat, x, z);
       if (!pick) continue;
       const y = this.spawnY(cat, pick.type.replace('minecraft:', ''), x, z, dark);
       if (y == null) continue;
-      spawnAttempt(this, pick, x, y, z, sp, (t, sx, sy, sz) => this.spawnY(cat, t, sx, sz, dark, sy) != null, (sx, sz) => this.spawnPick(cat, sx, sz), (m) => {
+      if (own) {
+        const at = spawnOverride(this, cat, x, y, z);
+        if ((at ? at !== own || !fromOwn : fromOwn) && (!(pick = at ? spawnPickOf(at) : this.spawnPick(cat, x, z)) || this.spawnY(cat, pick.type.replace('minecraft:', ''), x, z, dark, y) == null)) continue;
+      }
+      counts[cat] = (counts[cat] || 0) + spawnAttempt(this, pick, x, y, z, sp, (t, sx, sy, sz) => this.spawnY(cat, t, sx, sz, dark, sy) != null, (sx, sz) => this.spawnPick(cat, sx, sz, y), (m) => {
         if (cat !== 'creature') m.persistent = false;
         else if (Math.random() < 0.1 && m.makeBaby && !m.T.hostile) m.makeBaby();
       });
-      break;
+      if (cat !== 'creature') break;
     }
   }
 };
 // vanilla Slime.checkSlimeSpawnRules: in a swamp at 51..69 by the moon's brightness and the light, or below 40 in a slime
 // chunk (one in 10) one time in 10, at any light. The list has slimes in every biome: before, below -24 (a y counted from
 // the bottom, 40) every pick of them spawned, in every chunk - slimes all through the deep caves; above it only in swamps
+// a new chunk's animals (vanilla NaturalSpawner.spawnMobsForChunkGeneration; Game.spawnAnimals made the first roll under
+// the biome's creature_spawn_probability): a group from the biome's creature list - wolves, horses, rabbits, foxes ... as
+// the biome has them, it was pigs, cows, sheep and chickens everywhere - then another while a roll stays under it; each of
+// the kind's count, on the ground of a column walking from the group's start within the chunk, 4 tries each
+Game.prototype.spawnChunkAnimals = function (ch, v) {
+  const w = this.world, x0 = ch.cx * 16, z0 = ch.cz * 16, prob = v.def.creature_spawn_probability ?? 0.1;
+  do {
+    const pick = spawnPickOf(v.def.spawners.creature);
+    if (!pick) return;
+    const type = pick.type.replace('minecraft:', ''), n = pick.minCount + randInt(0, pick.maxCount - pick.minCount);
+    const sx = x0 + randInt(0, 15), sz = z0 + randInt(0, 15);
+    let x = sx, z = sz;
+    for (let i = 0; i < n; i++) {
+      for (let a = 0, done = false; !done && a < 4; a++) {
+        const y = this.spawnY('creature', type, x, z, 0, spawnStandY(w, type, x, z) + 1), m = y != null && createMob(this, type, x + 0.5, y, z + 0.5);
+        if (m && !m.collides(m.box())) { if (i > 0 && Math.random() < 0.05 && m.makeBaby) m.makeBaby(); this.entities.push(m); done = true; }
+        x += randInt(0, 4) - randInt(0, 4); z += randInt(0, 4) - randInt(0, 4);
+        while (x < x0 || x >= x0 + 16 || z < z0 || z >= z0 + 16) { x = sx + randInt(0, 4) - randInt(0, 4); z = sz + randInt(0, 4) - randInt(0, 4); }
+      }
+    }
+  } while (Math.random() < prob);
+};
+// (a superflat world's ground is vanilla superflat's, from -64: slimes in its slime chunks as there)
 Game.prototype.slimeSpawnOk = function (x, y, z, sky, blk, dark) {
-  const wy = y + (this.world.minY || 0), moon = MOON_BRIGHT[((Math.floor(this.worldTime / 24000) % 8) + 8) % 8];
+  const wy = y + (this.world.flat ? -64 : (this.world.minY || 0)), moon = MOON_BRIGHT[((Math.floor(this.worldTime / 24000) % 8) + 8) % 8];
   if (wy > 50 && wy < 70 && /swamp/.test(biomeName(this, x, z)) && Math.random() < 0.5 && Math.random() < moon && Math.max(sky - dark, blk) <= randInt(0, 7)) return true;
   return wy < 40 && Math.random() < 0.1 && slimeChunk(this, x >> 4, z >> 4);
 };
@@ -176,14 +249,23 @@ Game.prototype.spawnY = function (cat, type, x, z, dark, near) {
     if (sky > randInt(0, 31) || blk > 0 || Math.max(sky - dark, blk) > randInt(0, 7)) return null;
     return Math.random() < (/river/.test(biomeName(this, x, z)) ? 1 / 15 : y <= SEA - 5 ? 1 / 40 : 0) ? y : null;
   }
+  // guardians (an ocean monument's list): vanilla Guardian.checkGuardianSpawnRules, placed in water - water there and
+  // below, no solid block above, then one try in 20 where the sky shows through the water (no light rule). They went down
+  // the land path, which wants air, so none spawned
+  if (type === 'guardian' || type === 'elder_guardian') {
+    let y = near;
+    if (y == null) { const lo = Math.max(1, Math.min(surf, py - 48)), hi = SEA; if (lo > hi) return null; y = randInt(lo, hi); }
+    if (!water(y) || !water(y - 1) || SOLIDCUBE[w.getBlock(x, y + 1, z)]) return null;
+    return surf < y && Math.random() >= 1 / 20 ? null : y;
+  }
   // monsters and creatures: on a solid block with room above
-  const cand = near != null ? [near] : cat === 'creature' || Math.random() < 0.4 ? [surf + 1] : [randInt(Math.max(1, Math.min(surf, py - 48)), surf)];
+  const cand = near != null ? [near] : cat === 'creature' ? [spawnStandY(w, type, x, z) + 1] : Math.random() < 0.4 ? [surf + 1] : [randInt(Math.max(1, Math.min(surf, py - 48)), surf)];
   for (const y0 of cand) {
     let y = y0;
     if (near == null && cat === 'monster' && !air(y)) { for (let k = 0; k < 12 && !air(y); k++) y++; }
-    const below = w.getBlock(x, y - 1, z);
-    if (!SOLIDCUBE[below] || !air(y) || !air(y + 1)) continue;
-    const bk = BLOCKS[below].key;
+    const below = w.getBlock(x, y - 1, z), bk = BLOCKS[below].key;
+    // (leaves are not opaque: parrots and ocelots may still stand on them - vanilla LeavesBlock isValidSpawn)
+    if (!(SOLIDCUBE[below] || (type === 'parrot' || type === 'ocelot') && /_leaves$/.test(bk)) || !air(y) || !air(y + 1)) continue;
     if (bk === 'bedrock' || bk === 'barrier' || bk === 'magma_block' && !MOB_TYPES[type].fireproof) continue;
     const l = w.getLight(x, y, z), sky = l >> 4, blk = l & 15;
     if (cat === 'monster') {
@@ -192,6 +274,8 @@ Game.prototype.spawnY = function (cat, type, x, z, dark, near) {
       // Before, only the last, with the sky scaled to nothing at night: every dark spot took a mob, open ground at night
       // four times as often as vanilla
       if (type === 'slime') { if (!this.slimeSpawnOk(x, y, z, sky, blk, dark)) continue; }
+      // (pillagers at an outpost: any sky light, block light up to 8 - PatrollingMonster.checkPatrollingMonsterSpawnRules)
+      else if (type === 'pillager') { if (blk > 8) continue; }
       else if (sky > randInt(0, 31) || blk > 0 || Math.max(sky - dark, blk) > randInt(0, 7)) continue;
     } else {
       if ((l >> 4) < 9 && blk < 9) continue;

@@ -38,7 +38,7 @@ function villagerTypeAt(game, x, z) {
 }
 // job site blocks (PoiTypes) -> profession
 const JOB_SITES = { composter: 'farmer', smoker: 'butcher', blast_furnace: 'armorer', cartography_table: 'cartographer', brewing_stand: 'cleric',
-  barrel: 'fisherman', fletching_table: 'fletcher', cauldron: 'leatherworker', water_cauldron: 'leatherworker', lectern: 'librarian', stonecutter: 'mason',
+  barrel: 'fisherman', fletching_table: 'fletcher', cauldron: 'leatherworker', water_cauldron: 'leatherworker', lava_cauldron: 'leatherworker', powder_snow_cauldron: 'leatherworker', lectern: 'librarian', stonecutter: 'mason',
   loom: 'shepherd', smithing_table: 'toolsmith', grindstone: 'weaponsmith' };
 // composite skin (base + biome type + profession), built once per combination
 function villagerSkin(r, zombie, type, prof) {
@@ -71,7 +71,6 @@ class Villager extends Mob {
     this.vtype = d.t || this.vtype; this.profession = d.p || 'none'; if (d.h) this.home = d.h;
     if (d.tr) { this.trades = d.tr; this.vlevel = d.lv || 1; this.vxp = d.xp || 0; }
     this.restockDay = d.rd; this.job = d.j;
-    if (d.j) (this.game.jobSites || (this.game.jobSites = new Set())).add(d.j);
   }
   tick() {
     const g = this.game;
@@ -81,19 +80,34 @@ class Villager extends Mob {
       if (!this.panic && !this.wander && Math.hypot(this.pos[0] - this.home[0], this.pos[2] - this.home[2]) > 24 && Math.random() < 0.2) { this.wander = [this.home[0], this.home[1], this.home[2]]; this.wanderT = 200; }
     }
     if (this.shake > 0) this.shake--;
-    // unemployed adults claim a free job site nearby
-    if (this.profession === 'none' && !this.baby && this.age % 100 === 37) this.findJob();
+    if (!this.baby && this.age % 100 === 37) {
+      // its job site gone (broken or swapped): vanilla lets the site go, and one that never traded loses its profession
+      if (this.job && this.profession !== 'none') {
+        const [jx, jy, jz] = this.job.split(',').map(Number), b = BLOCKS[this.world.getBlock(jx, jy, jz)];
+        if (this.world.isLoaded(jx, jz) && !(b && JOB_SITES[b.key] === this.profession)) { this.job = null; if (!this.vxp && (this.vlevel || 1) <= 1) { this.profession = 'none'; this.trades = null; } }
+      }
+      // unemployed adults claim a free job site nearby; one with a profession and no site looks for its own kind
+      if (this.profession === 'none') this.findJob();
+      else if (!this.job && this.profession !== 'nitwit' && this.age % 400 === 37) this.findJob(this.profession);
+    }
     super.tick();
   }
-  findJob() {
-    const g = this.game, w = this.world, claimed = g.jobSites || (g.jobSites = new Set());
+  findJob(prof) {
+    const g = this.game, w = this.world;
+    // (the sites the living villagers hold: one that died or lost its job lets its site go)
+    const claimed = new Set();
+    for (const e of g.entities) if (e instanceof Villager && e !== this && !e.dead && e.job) claimed.add(e.job);
+    // (and those of villagers waiting in unloaded chunks)
+    for (const m of g.pendingMobs || []) if (m.type === 'villager' && m.x && m.x.j && !(m.health != null && m.health <= 0)) claimed.add(m.x.j);
     const bx = Math.floor(this.pos[0]), by = Math.floor(this.pos[1]), bz = Math.floor(this.pos[2]);
     for (let r = 1; r <= 16; r++) for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
       if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
       for (let dy = -3; dy <= 3; dy++) {
         const b = BLOCKS[w.getBlock(bx + dx, by + dy, bz + dz)], job = b && JOB_SITES[b.key], k = (bx + dx) + ',' + (by + dy) + ',' + (bz + dz);
-        if (!job || claimed.has(k)) continue;
-        claimed.add(k); this.job = k; this.profession = job; this.trades = null;
+        if (!job || claimed.has(k) || (prof && job !== prof)) continue;
+        this.job = k;
+        if (prof) return;
+        this.profession = job; this.trades = null;
         for (let i = 0; i < 6; i++) g.particles.spawn('happy_villager', this.pos[0] + (Math.random() - 0.5), this.pos[1] + 1.5 + Math.random() * 0.5, this.pos[2] + (Math.random() - 0.5), 0, 0.05, 0);
         return;
       }
@@ -104,6 +118,26 @@ class Villager extends Mob {
     if (typeof MerchantScreen !== 'undefined' && this.profession !== 'none' && this.profession !== 'nitwit' && !this.baby) { this.game.ui.open(new MerchantScreen(this.game, this)); Sound.ev('entity.villager.trade', this.pos, 1, 1); return true; }
     this.shake = 40; Sound.ev('entity.villager.no', this.pos, 1, 1);
     return true;
+  }
+  // killed by a zombie on Normal (half the time) or Hard, it rises as a zombie villager keeping its type, profession
+  // and trades, and drops nothing (vanilla Zombie.killedEntity / convertVillagerToZombieVillager)
+  die(src) {
+    const z = src && src.attacker, d = this.game.difficulty;
+    if (z && /^(zombie|zombie_villager|husk|drowned|zombified_piglin)$/.test(z.type) && d >= 2 && (d === 3 || Math.random() < 0.5)) {
+      const m = createMob(this.game, 'zombie_villager', this.pos[0], this.pos[1], this.pos[2]);
+      m.vtype = this.vtype; m.profession = this.profession; m.trades = this.trades; m.vlevel = this.vlevel; m.vxp = this.vxp;
+      m.yaw = this.yaw; m.bodyYaw = this.bodyYaw; m.headYaw = this.headYaw;
+      if (this.baby) m.makeBaby();
+      if (this.customName) m.customName = this.customName;
+      // (vanilla: one that was traded with, or named, never despawns)
+      if (this.vxp || this.customName) m.persistent = true;
+      this.dead = true;
+      if (Mob.modDeath) Mob.modDeath(this, src); // (mods' entityDeath still hears of it)
+      this.game.addEntity(m);
+      Sound.ev('entity.zombie.infect', this.pos, 1, 1);
+      return;
+    }
+    super.die(src);
   }
   pose(a) {
     const swing = lerp(this.limbSwing - this.limbAmt, this.limbSwing, a) * 0.6662, amt = this.limbAmt;
@@ -138,7 +172,10 @@ class IronGolem extends Mob {
     this.T = MOB_TYPES.iron_golem;
     if (this.attackCd === 20 && before !== 20) {
       this.attackAnim = 10;
-      if (this.target) this.target.vel[1] += 0.4;
+      // (vanilla: the toss only when the blow did hurt - a target still hurt-immune from another golem's isn't thrown
+      // higher - and less by its knockback resistance)
+      const t = this.target;
+      if (t && this.hitLanded && t.vel) t.vel[1] += 0.4 * Math.max(0, 1 - (t.T && t.T.kbRes || 0));
       Sound.ev('entity.iron_golem.attack', this.pos, 1, 1);
     }
     if (this.attackAnim > 0) this.attackAnim--;
@@ -161,24 +198,60 @@ const GOLEM_HUNT = Object.assign({}, MOB_TYPES.iron_golem, { attack: 10, speed: 
 const CAT_VARIANTS = ['tabby', 'black', 'red', 'siamese', 'british_shorthair', 'calico', 'persian', 'ragdoll', 'white', 'jellie', 'all_black'];
 class Cat extends Mob {
   constructor(g, x, y, z) { super(g, 'cat', x, y, z); this.variant = CAT_VARIANTS[Math.floor(Math.random() * CAT_VARIANTS.length)]; this.persistent = true; }
-  skin(r) { return entityTexOf(r, 'cat_' + this.variant); }
-  saveData() { return { v: this.variant }; }
-  loadData(d) { if (d.v) this.variant = d.v; }
+  // (a tame one wears its collar, dyed - vanilla CatCollarLayer)
+  skin(r) { const mix = this.owner && r.etexMix(['entity/cat/cat_' + this.variant, { p: 'entity/cat/cat_collar', c: dyeRGB(this.collar || 'red') }]); return mix || entityTexOf(r, 'cat_' + this.variant); }
+  saveData() { return { v: this.variant, own: this.owner ? 1 : 0, sit: this.sitting ? 1 : 0, col: this.collar }; }
+  loadData(d) { if (d.v) this.variant = d.v; if (d.own) this.owner = this.game.player; this.sitting = !!d.sit; if (d.col) this.collar = d.col; }
+  // taming as vanilla's Cat.mobInteract: raw cod or salmon, a 1 in 3 chance; tame, it sits or stands when clicked, is
+  // healed or bred with the food, and its collar dyed (feeding a wild one only put it in love, it was never tamed)
+  interact(p, held) {
+    const g = this.game, k = held && ITEMS[held.id] && ITEMS[held.id].key, food = k === 'cod' || k === 'salmon';
+    if (Mob.prototype.interact && Mob.prototype.interact.call(this, p, held)) return true; // (name tags, leads: mobitems.js)
+    if (!this.owner) { if (!food) return false; useOne(g, p); Sound.ev('entity.cat.eat', this.pos, 1, 1); tryTame(this, p, 1 / 3); if (this.owner) this.sitT = undefined; return true; }
+    if (this.owner !== p) return false;
+    if (k && /_dye$/.test(k)) { if (this.collar === k.slice(0, -4)) return false; this.collar = k.slice(0, -4); useOne(g, p); return true; }
+    if (food && this.health < this.maxHealth) { this.health = Math.min(this.maxHealth, this.health + 2); useOne(g, p); Sound.ev('entity.cat.eat', this.pos, 1, 1); return true; }
+    if (food && !this.baby && !this.loveT) {
+      this.loveT = 600; useOne(g, p); Sound.ev('entity.cat.eat', this.pos, 1, 1);
+      const mate = g.entities.find(o => o !== this && o instanceof Cat && o.owner && o.loveT > 0 && !o.baby && !o.dead && o.distTo(this) < 8);
+      if (mate) {
+        this.loveT = mate.loveT = 0;
+        const b = createMob(g, 'cat', (this.pos[0] + mate.pos[0]) / 2, this.pos[1], (this.pos[2] + mate.pos[2]) / 2).makeBaby();
+        b.variant = Math.random() < 0.5 ? this.variant : mate.variant; b.owner = this.owner; g.entities.push(b);
+        g.dropXp(b.pos[0], b.pos[1] + 0.5, b.pos[2], 1 + ((Math.random() * 7) | 0));
+      }
+      return true;
+    }
+    if (food) return false;
+    this.sitting = !this.sitting; this.sitT = undefined; this.wander = null;
+    return true;
+  }
+  // (hurt, a tame one gets up - TamableAnimal)
+  hurt(a, src) { const r = super.hurt(a, src); if (r) this.sitting = false; return r; }
   tick() {
-    // sometimes sits for a while
-    if (!this.panic && this.sitT === undefined && Math.random() < 0.002) this.sitT = 200 + Math.random() * 400;
+    // told to sit: stays down; otherwise sometimes sits for a while
+    if (this.sitting) this.sitT = 2;
+    else if (!this.panic && this.sitT === undefined && !this.owner && Math.random() < 0.002) this.sitT = 200 + Math.random() * 400;
     if (this.sitT !== undefined) { if (--this.sitT <= 0 || this.panic) this.sitT = undefined; else { this.wander = null; } }
+    // a tame one keeps up with its owner (vanilla FollowOwnerGoal: walks after it past 6 blocks, jumps to it past 12)
+    else if (this.owner && this.age % 10 === 0) { const c = {}; if (PetMixin.followOwner.call(this, c) && c.goal) { this.wander = c.goal; this.wanderT = 20; } }
+    // (sitting, it stays put - it still walked after the fish in a player's hand)
+    const T = this.T; if (this.sitT !== undefined) this.T = Cat.SIT_T || (Cat.SIT_T = { ...T, speed: 0 });
     super.tick();
+    this.T = T;
   }
   pose(a) {
     const swing = lerp(this.limbSwing - this.limbAmt, this.limbSwing, a) * 0.6662, amt = this.limbAmt;
     const l = Math.cos(swing) * amt, r = Math.cos(swing + Math.PI) * amt;
     const P = { head: { ry: this.headYaw, rx: this.pitch }, lfleg: { rx: l }, rfleg: { rx: r }, lhleg: { rx: r }, rhleg: { rx: l } };
     if (this.sitT !== undefined) {
-      P.body = { rx: Math.PI / 4, t: [0, -0.15, 0.1] }; P.head.t = [0, -0.1, 0.05];
-      P.lhleg = { rx: Math.PI / 2, t: [0, -0.25, -0.1] }; P.rhleg = { rx: Math.PI / 2, t: [0, -0.25, -0.1] };
-      P.lfleg = { rx: 0.2, t: [0, -0.1, 0.05] }; P.rfleg = { rx: 0.2, t: [0, -0.1, 0.05] };
-      P.tail1 = { t: [0, -0.3, 0] }; P.tail2 = { t: [0, -0.3, 0] };
+      // vanilla AdultFelineModel's sitting pose (pixel offsets y and x / rotations negated for this model's space; the
+      // pose's rx adds to the part's own rotX: body pi/4, tail1 1.7278761, tail2 2.670354 in vanilla)
+      const px = 1 / 16;
+      P.body = { rx: Math.PI / 4, t: [0, 4 * px, 5 * px] }; P.head.t = [0, 3.3 * px, 1 * px];
+      P.lhleg = { rx: Math.PI / 2, t: [0, -3 * px, -4 * px] }; P.rhleg = { rx: Math.PI / 2, t: [0, -3 * px, -4 * px] };
+      P.lfleg = { rx: Math.PI / 20, t: [0, -2 * px, -2 * px] }; P.rfleg = { rx: Math.PI / 20, t: [0, -2 * px, -2 * px] };
+      P.tail1 = { rx: -1.7278761 + 0.9, t: [0, -8 * px, -2 * px] }; P.tail2 = { rx: -2.670354 + 1.7, t: [0, -2 * px, -0.8 * px] };
     }
     return P;
   }
@@ -192,6 +265,13 @@ class Cat extends Mob {
       const m = new Mob(game, 'zombie_villager', x, y, z);
       m.vtype = villagerTypeAt(game, x, z); m.profession = 'none';
       m.skin = (r) => villagerSkin(r, true, m.vtype || 'plains', m.profession || 'none');
+      // (a villager a zombie turned keeps its type, profession and trades in the save)
+      m.saveData = function () { const o = (Mob.prototype.saveData && Mob.prototype.saveData.call(this)) || {}; o.t = this.vtype; o.p = this.profession; if (this.trades) { o.tr = this.trades; o.lv = this.vlevel; o.xp = this.vxp; } if (this.customName) o.name = this.customName; return o; };
+      // (a baby zombie villager never grows up, like baby zombies - Mob.makeBaby's 6000-tick countdown made it an adult;
+      // tick holds it there too, for saves that restore the old countdown)
+      m.makeBaby = function () { Mob.prototype.makeBaby.call(this); this.growT = 1e12; return this; };
+      m.tick = function () { if (this.baby) this.growT = 1e12; return Mob.prototype.tick.call(this); };
+      m.loadData = function (o) { if (Mob.prototype.loadData) Mob.prototype.loadData.call(this, o); if (!o) return; if (o.t) this.vtype = o.t; if (o.p) this.profession = o.p; if (o.tr) { this.trades = o.tr; this.vlevel = o.lv || 1; this.vxp = o.xp || 0; } if (o.name) this.customName = o.name; };
       m.pose = (a) => {
         const swing = lerp(m.limbSwing - m.limbAmt, m.limbSwing, a) * 0.6662, amt = m.limbAmt;
         const raise = Math.PI / 2 + Math.sin(m.age * 0.067) * 0.05;
@@ -225,8 +305,8 @@ class Cat extends Mob {
       { name: 'arms', pivot: [0, 21, -1], rotX: 0.75, boxes: [[44, 22, 4, -6, -2, 4, 8, 4], [44, 22, -8, -6, -2, 4, 8, 4, 0, true], [40, 38, -4, -6, -2, 8, 4, 4]] },
     ]);
     M.zombie_villager = P(64, 64, [...head.map(p => ({ ...p, boxes: p.boxes.map(b => b.slice()) })),
-      { name: 'rarm', pivot: [5, 22, 0], boxes: [[44, 38, -1, -10, -2, 4, 12, 4]] },
-      { name: 'larm', pivot: [-5, 22, 0], boxes: [[44, 38, -3, -10, -2, 4, 12, 4, 0, true]] },
+      { name: 'rarm', pivot: [5, 22, 0], boxes: [[44, 22, -1, -10, -2, 4, 12, 4]] },
+      { name: 'larm', pivot: [-5, 22, 0], boxes: [[44, 22, -3, -10, -2, 4, 12, 4, 0, true]] },
     ]);
     M.iron_golem = P(128, 128, [
       { name: 'head', pivot: [0, 31, -2], boxes: [[0, 0, -4, 2, -5.5, 8, 10, 8], [24, 0, -1, 1, -7.5, 2, 4, 2]] },

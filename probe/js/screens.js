@@ -95,7 +95,7 @@ class TitleScreen extends MenuScreen {
     const u = this.game.ui, cx = u.w / 2, l = Math.floor(u.h / 4 + 48), g = this.game;
     this.widgets = [
       { x: cx - 100, y: l, w: 200, h: 20, label: '单人游戏', onClick: () => singleGate(g, () => g.ui.open(new WorldListScreen(g)), this) },
-      { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', onClick: () => g.ui.open(new MultiplayerScreen(g, this)), tip: ['加入公开房间、用邀请码加入朋友的房间，或者自己开一个（4–10 人）'] },
+      { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', onClick: () => onlineGate(g, () => g.ui.open(new MultiplayerScreen(g, this)), this), tip: ['加入公开房间、用邀请码加入朋友的房间，或者自己开一个（4–10 人）'] },
       { x: cx - 100, y: l + 48, w: 98, h: 20, label: '皮肤和装饰', gold: true, tip: ['换皮肤（也可以用正版玩家的皮肤）、穿上原创披风、帽子和宠物'], onClick: () => g.ui.open(new WardrobeScreen(g, this)) },
       { x: cx + 2, y: l + 48, w: 98, h: 20, label: '反馈问题', tip: ['遇到 bug、卡顿，或者有建议，发给我们'], onClick: () => g.ui.open(new FeedbackScreen(g, this, null)) },
       { x: cx - 124, y: l + 84, w: 20, h: 20, icon: 'icon_language', tip: ['游戏说明'], onClick: () => g.ui.open(new HelpScreen(g, this)) },
@@ -128,13 +128,18 @@ class TitleScreen extends MenuScreen {
     c.restore();
     // 「退出游戏」could not close the page (quitGame)
     if (this.quitTip && performance.now() - this.quitTip < 6000) {
-      const q = '这里不能直接关闭网页，请用返回键或关闭标签页退出', l = Math.floor(ui.h / 4 + 48) + 108;
+      const q = '这里不能直接关闭网页，请用返回键或关闭标签页退出', l = Math.floor(ui.h / 4 + 48) + (typeof Mods !== 'undefined' ? 120 : 108); // (below the options row, moved down for 模组 - mods_ui.js)
       c.globalAlpha = 0.6; c.fillStyle = '#000'; c.fillRect(Math.floor(w / 2 - Font.width(q) / 2 - 4), l - 2, Font.width(q) + 8, 12); c.globalAlpha = 1;
       Font.center(c, q, w / 2, l, '#FFFF55');
     }
-    Font.draw(c, 'OpusMC · 仅在 B站 Toy 平台发布', 2, ui.h - 10, '#FFFFFF');
-    const t = '非官方作品-UP主自制toy';
-    Font.draw(c, t, ui.w - Font.width(t) - 2, ui.h - 10, '#FFFFFF');
+    // (the fan-work line, 11-13: shortened when it would meet the left one on a narrow screen, else a row higher)
+    const left = 'OpusMC · 仅在 B站 Toy 平台发布';
+    Font.draw(c, left, 2, ui.h - 10, '#FFFFFF');
+    let t = 'Minecraft 粉丝二创 · 非官方 · 永久免费 · 请支持正版', ty = ui.h - 10;
+    if (Font.width(left) + Font.width(t) + 10 > ui.w) t = '粉丝二创 · 非官方 · 永久免费 · 请支持正版';
+    if (Font.width(left) + Font.width(t) + 10 > ui.w) t = '粉丝二创 · 永久免费 · 请支持正版';
+    if (Font.width(left) + Font.width(t) + 10 > ui.w) ty = ui.h - 20;
+    Font.draw(c, t, ui.w - Font.width(t) - 2, ty, '#FFFFFF');
   }
 }
 
@@ -290,7 +295,7 @@ class EditWorldScreen extends MenuScreen {
 // vanilla CreateWorldScreen: TabNavigationBar (游戏 / 世界 / 更多) + footer
 class CreateWorldScreen extends MenuScreen {
   constructor(game, parent, from) {
-    super(game, null); this.parent = parent; this.tab = 0;
+    super(game, null); this.parent = parent; this.tab = 0; this.from = from || null;
     this.name = from ? from.name : '新的世界'; this.seed = from ? String(from.seed) : '';
     this.mode = from ? (from.hardcore ? 'hardcore' : from.mode === 'creative' ? 'creative' : 'survival') : 'survival'; this.flat = from ? !!from.flat : false;
     this.difficulty = from ? (from.difficulty ?? 2) : 2; this.cheats = from ? (from.cheats ?? true) : false;
@@ -555,7 +560,9 @@ class DeathScreen extends MenuScreen {
   constructor(game) { super(game, null); this.blurBg = false; this.bgDim = 0; this.pauses = false; this.t = performance.now(); }
   layout() {
     const u = this.game.ui, cx = u.w / 2, y = Math.floor(u.h / 4 + 72), g = this.game;
-    const toTitle = () => { g.player.health = 20; g.player.deathTime = 0; g.respawn(); g.quitToTitle(); };
+    // (hardcore: saved dead, as vanilla leaves - back in, the death screen again, then only to watch. It respawned the
+    // player first, and the world opened again with a live survival player: "极限模式死后点标题屏幕能复活")
+    const toTitle = () => { if (g.hardcore && !g.net && !g.p2pGuest) { g.quitToTitle(); return; } g.player.health = 20; g.player.deathTime = 0; g.respawn(); g.quitToTitle(); };
     this.widgets = g.hardcore ? [
       { x: cx - 100, y, w: 200, h: 20, label: '旁观世界', onClick: () => { g.respawn(); g.setMode('spectator', true); } },
       { x: cx - 100, y: y + 24, w: 200, h: 20, label: '标题屏幕', onClick: toTitle },
@@ -620,7 +627,7 @@ class ChatScreen extends MenuScreen {
   constructor(game, prefill = '') { super(game, null); this.blurBg = false; this.bgDim = 0; this.isChat = true; this.prefill = prefill; this.hist = game.chatHistory || (game.chatHistory = []); this.hi = this.hist.length; game.ui.chatOff = 0; }
   // the wheel (or a finger dragged) goes back through the last 100 messages, 7 lines a notch, 1 with shift - like
   // vanilla's ChatScreen.mouseScrolled; there was no scrolling at all (players' feedback 2026-10-31)
-  wheel(ui, dy) { ui.chatOff = clamp((ui.chatOff || 0) - Math.sign(dy) * (ui.wheelShift ? 1 : 7), 0, Math.max(0, ui.chat.length - 20)); ui.wheelShift = false; }
+  wheel(ui, dy) { ui.chatOff = clamp((ui.chatOff || 0) - Math.sign(dy) * (ui.wheelShift ? 1 : 7), 0, Math.max(0, ui.chatRowCount() - 20)); ui.wheelShift = false; }
   layout() {
     const u = this.game.ui, send = (v) => { u.close(); if (v.trim()) { this.hist.push(v); runCommand(this.game, v.trim()); } };
     // (on a touch screen a 发送 button at the end of the line, and the keyboard's return key reads 发送: iOS players
@@ -788,8 +795,21 @@ Game.prototype.setMode = function (m, quiet) {
   const p = this.player, prev = this.mode;
   if (m !== prev) this.prevMode = prev;
   this.mode = m;
-  if (m === 'spectator') { p.flying = true; p.noClip = true; }
+  // (into spectator: the fall speed of standing on the ground, -0.08, is dropped - it carried the player, now passing
+  // through blocks, about 0.07 into the ground, and back in survival or creative the ground they were in no longer
+  // held them: they fell into it and choked - "旁观/创造切回生存卡进地里", feedback 11-01 to 11-11)
+  if (m === 'spectator') { p.flying = true; p.noClip = true; if (prev !== 'spectator') p.vel[1] = 0; }
   else {
+    // out of spectator a little way into the top of a block (less than half a block): stood on it
+    if (prev === 'spectator' && p.noClip) {
+      const bb = p.box(), bs = blockBoxes(this.world, bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], [], p);
+      let top = bb[1];
+      for (const b of bs) if (bb[0] < b[3] && bb[3] > b[0] && bb[1] < b[4] && bb[4] > b[1] && bb[2] < b[5] && bb[5] > b[2]) top = Math.max(top, b[4]);
+      if (top > bb[1] && top - bb[1] < 0.5) {
+        const y0 = p.pos[1]; p.pos[1] = top;
+        if (p.collides(p.box())) p.pos[1] = y0; else { p.prev[1] = top; p.vel[1] = 0; p.fallDist = 0; }
+      }
+    }
     p.noClip = false;
     if (m === 'survival') p.flying = false;
     if (prev === 'spectator' && m === 'creative') p.flying = true;
@@ -816,8 +836,11 @@ async function quitGame(g) {
 // devices, the iOS Bilibili app and Safari. Where there is none (or the frame may not: fullscreenEnabled false) the
 // 全屏 buttons say so and the key tells the player instead of doing nothing
 const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+// Not on an iPad either (IOS_WEBGL, 11-07): the webkit-prefixed call there since 11-06, and iPad sessions that went full
+// screen died 3x as often (33.7% vs 10.6% - the page killed and opened again); before, the call failed and none did
 function fsSupported() {
   const de = document.documentElement;
+  if (typeof IOS_WEBGL !== 'undefined' && IOS_WEBGL) return false;
   return !!(de.requestFullscreen || de.webkitRequestFullscreen) && (document.fullscreenEnabled ?? document.webkitFullscreenEnabled) !== false;
 }
 function fsExit() {

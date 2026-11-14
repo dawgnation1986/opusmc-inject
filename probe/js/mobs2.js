@@ -274,11 +274,16 @@ class Ghast extends FlyingMob {
     else if (this.charge < 0) this.charge++;
     this.fly(this.goal[0], this.goal[1], this.goal[2], 0.006, 0.92);
     if (this.collidedH) this.goal = null;
+    // without a target it faces where it flies (vanilla Ghast.faceMovementDirection); it kept its last yaw and often
+    // drifted backwards
+    if (!sees && Math.hypot(this.vel[0], this.vel[2]) > 1e-3) { this.yaw = Math.atan2(-this.vel[0], -this.vel[2]); this.bodyYaw = this.yaw; }
     this.animate();
   }
   pose(a) {
+    // vanilla GhastModel.animateTentacles: xRot 0.4 +- 0.2, the tips trailing backwards (negated in this model's space -
+    // positive swung them forward)
     const P = {};
-    for (let i = 0; i < 9; i++) P['t' + i] = { rx: 0.2 * Math.sin((this.age + a) * 0.067 + i) + 0.4 };
+    for (let i = 0; i < 9; i++) P['t' + i] = { rx: -(0.2 * Math.sin((this.age + a) * 0.3 + i) + 0.4) };
     return P;
   }
 }
@@ -371,14 +376,14 @@ class Fireball extends Entity {
       if (e) { if (!e.fireproof) { e.hurt(5, { type: 'fireball', attacker: this.owner, knockFrom: this.pos }); e.fire = Math.max(e.fire || 0, 100); } }
       else if (block) {
         const px = Math.floor(this.pos[0]), py = Math.floor(this.pos[1]), pz = Math.floor(this.pos[2]);
-        if (this.world.getBlock(px, py, pz) === 0 && SOLIDCUBE[this.world.getBlock(px, py - 1, pz)]) this.world.setBlock(px, py, pz, 171, 0);
+        if ((!(this.owner instanceof Mob) || g.rule('mob_griefing') !== false) && this.world.getBlock(px, py, pz) === 0 && SOLIDCUBE[this.world.getBlock(px, py - 1, pz)]) this.world.setBlock(px, py, pz, g.fireIdAt(px, py, pz), 0);
       }
       Sound.ev('block.fire.extinguish', this.pos, 0.3, 1.5);
       return;
     }
     if (e && this.owner && e !== this.owner) e.hurt(6, { type: 'fireball', attacker: this.owner, knockFrom: this.pos });
     if (e instanceof Ghast && this.deflected && this.owner === g.player) { e.hurt(1000, { type: 'fireball', attacker: g.player, player: true }); g.grant('return_sender'); }
-    g.explode(this.pos[0], this.pos[1] + 0.5, this.pos[2], 1, this.owner && this.owner.T ? this.owner : null, false, true);
+    g.explode(this.pos[0], this.pos[1] + 0.5, this.pos[2], 1, this.owner && this.owner.T ? this.owner : null, false, true, true);
   }
 }
 
@@ -501,7 +506,7 @@ class EndCrystal extends Entity {
     this.dead = true;
     const g = this.game;
     const dragon = g.entities.find(e => e instanceof EnderDragon && e.healer === this);
-    g.explode(this.pos[0], this.pos[1] + 0.5, this.pos[2], 6, this, false, false, true);
+    g.explode(this.pos[0], this.pos[1] + 0.5, this.pos[2], 6, this, false, false);
     if (dragon) { dragon.healer = null; dragon.hurtRaw(10, { type: 'explosion', attacker: src && src.attacker }); }
     return true;
   }
@@ -534,6 +539,8 @@ class EnderDragon extends Living {
     if (this.deathTime > 0) return false;
     let a = part.head ? amount : amount * 0.25 + 1;
     if (src && src.type !== 'explosion' && !(src.attacker === this.game.player || src.player)) return false;
+    // (vanilla AbstractDragonSittingPhase.onHurt: perched, it takes nothing from arrows and tridents - they bounce off)
+    if (this.phase === 'perch' && src && (src.type === 'arrow' || src.type === 'trident')) { src.deflected = true; return false; }
     if (this.phase === 'perch') this.perchDamage += a;
     return this.hurtRaw(a, src);
   }
@@ -549,7 +556,7 @@ class EnderDragon extends Living {
     return true;
   }
   setPhase(ph) { this.phase = ph; this.phaseT = 0; if (ph === 'perch') this.perchDamage = 0; }
-  perchPoint() { const w = this.world; return [0.5, (w.endTop0 || 60) + 5.5, 0.5]; }
+  perchPoint() { const w = this.world; return [0.5, (w.podiumY && w.endTop0 !== undefined ? w.podiumY() : (w.endTop0 || 60) + 2) + 3.5, 0.5]; }
   tick() {
     this.savePrev();
     this.age++;
@@ -683,8 +690,8 @@ class EnderDragon extends Living {
         }
       }
     }
-    // destroy soft blocks the body flies through
-    if (this.phase !== 'perch' && this.age % 2 === 0) {
+    // destroy soft blocks the body flies through (vanilla checkWalls: only with mob_griefing)
+    if (this.phase !== 'perch' && this.age % 2 === 0 && g.rule('mob_griefing') !== false) {
       let n = 0;
       const b = this.parts()[1].box;
       for (let x = Math.floor(b[0]); x <= Math.floor(b[3]) && n < 12; x++) for (let y = Math.floor(b[1]); y <= Math.floor(b[4]) && n < 12; y++) for (let z = Math.floor(b[2]); z <= Math.floor(b[5]) && n < 12; z++) {

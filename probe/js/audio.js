@@ -341,7 +341,14 @@ Object.assign(Sound, {
   wrap('burp', function (pos) { return this.ev('entity.player.burp', pos, 0.5, Math.random() * 0.1 + 0.9); });
   wrap('bow', function (pos) { return this.ev('entity.arrow.shoot', pos, 1, 1 / (Math.random() * 0.4 + 1.2) + 0.5); });
   wrap('arrowHit', function (pos) { return this.ev('entity.arrow.hit', pos, 1, 1.2 / (Math.random() * 0.2 + 0.9)); });
-  wrap('door', function (pos, open) { return this.ev(open ? 'block.wooden_door.open' : 'block.wooden_door.close', pos, 1, Math.random() * 0.1 + 0.9); });
+  // doors, trapdoors and fence gates by their block's set (vanilla BlockSetType / WoodType sounds): iron, copper, cherry,
+  // bamboo, nether wood; all played the wooden door's before
+  wrap('door', function (pos, open, key) {
+    const k = key || '', kind = /trapdoor$/.test(k) ? 'trapdoor' : /fence_gate$/.test(k) ? 'fence_gate' : 'door';
+    const set = /^iron_/.test(k) ? 'iron' : /copper/.test(k) ? 'copper' : /^cherry_/.test(k) ? 'cherry_wood' : /^bamboo_/.test(k) ? 'bamboo_wood' : /^(crimson|warped)_/.test(k) ? 'nether_wood' : '';
+    const name = set ? set + '_' + kind : kind === 'fence_gate' ? 'fence_gate' : 'wooden_' + kind;
+    return this.ev('block.' + name + (open ? '.open' : '.close'), pos, 1, Math.random() * 0.1 + 0.9);
+  });
   wrap('levelup', function () { return this.ev('entity.player.levelup', null, 0.75, 1); });
   // a toast sliding in (and ui.toast.out when it leaves: ui.js); vanilla's challenge advancements add challenge_complete
   wrap('toast', function () { return this.ev('ui.toast.in', null, 1, 1); });

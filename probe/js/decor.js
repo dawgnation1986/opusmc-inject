@@ -24,18 +24,21 @@ Renderer.prototype.namedMesh = function (name) {
 // an item shown in a fixed place (item frames, armor stand hands use the hand code): flat items half a block, blocks a quarter
 Game.prototype.drawItemFixed = function (st, m, l, env) {
   const def = ITEMS[st.id], r = this.renderer; if (!def) return;
+  // the shield: its model with its 'fixed' transform (vanilla ItemFrameRenderer: half size; m is turned half round
+  // for the flat items, which the transform's own 180 degrees does in vanilla)
+  if (def.key === 'shield' && this.drawShieldItem) { const sm = r.mat(m); M4.rotY(sm, -Math.PI); M4.scale(sm, 0.5, 0.5, 0.5); this.drawShieldItem(st, sm, l, env, 'fixed'); return; }
   const b = def.block !== undefined ? BLOCKS[def.block] : null, vim = r.itemModel(st.id);
   const flat = vim ? (vim.gen || !b) : (!b || def.flat || b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door);
-  const mm = new Float32Array(m);
+  const mm = new Float32Array(m), go = { glint: typeof stackGlint === 'function' && stackGlint(st) && 'item' }; // (enchanted: the glint)
   if (flat) {
     const stTex = itemStateTex ? itemStateTex(st, null) : null;
     const layer = stTex ? T(stTex) : vim && vim.gen && vim.model.layers && vim.model.layers.length ? T(vim.model.layers[0]) : b ? (def.flat ? T(def.flat) : b.tex[0]) : def.tex;
     M4.scale(mm, 0.5, 0.5, 0.5); M4.translate(mm, -0.5, -0.5, -1 / 32);
-    r.drawMesh(this.spriteMesh(layer), mm, env, l);
+    r.drawMesh(this.spriteMesh(layer), mm, env, l, go);
   } else {
     M4.scale(mm, 0.25, 0.25, 0.25); M4.rotY(mm, Math.PI); M4.translate(mm, -0.5, -0.5, -0.5);
-    if (vim && vim.mesh && !b.bed) r.drawMesh(vim.mesh, mm, env, l);
-    else r.drawMesh(this.blockMesh(def.block, b.facing ? 4 : 0), mm, env, l);
+    if (vim && vim.mesh && !b.bed) r.drawMesh(vim.mesh, mm, env, l, go);
+    else r.drawMesh(this.blockMesh(def.block, b.facing ? 4 : 0), mm, env, l, go);
   }
 };
 // the rotation that turns a -z facing model to face direction d (DIRS index)
@@ -51,7 +54,7 @@ class Hanging extends Entity {
   place() { const D = DIRS[this.face], [x, y, z] = this.block; this.pos = [x + 0.5 - D[0] * 0.46875, y + (D[1] ? 0.5 - D[1] * 0.46875 : 0.5) - this.h / 2, z + 0.5 - D[2] * 0.46875]; this.prev = [...this.pos]; }
   saveData() { return { b: this.block, f: this.face, ...(this.more ? this.more() : {}) }; }
   loadData(o) { if (!o) return; this.block = o.b; this.face = o.f; this.place(); if (this.load) this.load(o); }
-  survives() { const [x, y, z] = this.support; return !!BLOCKS[this.world.getBlock(x, y, z)].solid; }
+  survives() { const [x, y, z] = this.support, b = BLOCKS[this.world.getBlock(x, y, z)]; return !b || !!b.solid; } // (one it doesn't know: kept - 11-13)
   tick() { this.savePrev(); this.age++; if (this.age % 100 === 0 && !this.survives()) this.breakOff(null); }
   breakOff(src) { this.dead = true; if (!(src && src.attacker === this.game.player && this.game.mode === 'creative')) this.game.dropItem(this.pos[0], this.pos[1], this.pos[2], makeStack(this.type, 1)); if (this.onBreak) this.onBreak(src); }
 }
@@ -113,8 +116,9 @@ class Painting extends Hanging {
     const T2 = r.progTex, gl = r.gl, L = Math.max(l[0], l[1] * env.day) * 0.85 + 0.15;
     const quad = (texKey, mm, sh) => { gl.useProgram(T2.p); gl.uniformMatrix4fv(T2.u.u_vp, false, r.vp); gl.uniformMatrix4fv(T2.u.u_model, false, mm); gl.uniform4f(T2.u.u_color, sh, sh, sh, 1); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, r.entityTex[texKey]); gl.bindVertexArray(r.quadVao); gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, 0); };
     gl.disable(gl.CULL_FACE);
-    // the quad helper lies flat (xz); stand it up facing -z
-    const f = M4.copy(m); M4.translate(f, 0, 0, -1 / 32); M4.rotX(f, -Math.PI / 2); M4.rotZ(f, Math.PI); M4.scale(f, -v.w / 2, 1, v.h / 2); quad(tex, f, L);
+    // the quad helper lies flat (xz); stand it up facing -z, the picture's top left (uv 0, 0) at the top left as seen from the
+    // front (it was turned half round: every painting upside down)
+    const f = M4.copy(m); M4.translate(f, 0, 0, -1 / 32); M4.rotX(f, -Math.PI / 2); M4.scale(f, -v.w / 2, 1, -v.h / 2); quad(tex, f, L);
     if (back) { const b2 = M4.copy(m); M4.translate(b2, 0, 0, 1 / 32); M4.rotX(b2, -Math.PI / 2); M4.scale(b2, v.w / 2, 1, v.h / 2); quad(back, b2, L * 0.7); }
     gl.enable(gl.CULL_FACE);
   }

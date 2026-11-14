@@ -63,6 +63,7 @@ const RoomExport = (() => {
     const out = new Set([b.key]);
     for (let m = 0; m < 2; m++) try { out.add(vanillaState(b, m, null).key); } catch (e) { }
     for (const n of aliasTo[b.key] || []) out.add(n);
+    if (b.key === 'lit_furnace') out.add('furnace'); // vanilla: furnace[lit=true]
     return [...out].filter((n) => VSTATES[n] !== undefined);
   }
   const revCache = new Map(); // id -> Map(meta -> {name, props})
@@ -196,6 +197,15 @@ const RoomExport = (() => {
         o.patterns = (be.patterns || []).map(([p, col]) => ({ color: String(col), pattern: ns(p) }));
         if (be.name) o.CustomName = String(be.name);
         return o;
+      // vanilla BaseCommandBlock.save / CommandBlockEntity.saveAdditional (cmdblock.js cmdEntity)
+      case 'command_block':
+        if (!/command_block$/.test(name)) return null;
+        o.id = ns('command_block');
+        o.Command = String(be.command || ''); o.SuccessCount = be.success | 0; o.TrackOutput = NBT.byte(be.track === false ? 0 : 1);
+        if (be.track !== false && be.output) o.LastOutput = String(be.output);
+        o.UpdateLastExecution = NBT.byte(1);
+        o.powered = NBT.byte(be.powered ? 1 : 0); o.conditionMet = NBT.byte(be.met ? 1 : 0); o.auto = NBT.byte(be.auto ? 1 : 0);
+        return o;
       case 'pot':
         o.id = ns('decorated_pot');
         if (be.sherds) o.sherds = be.sherds.map((k) => ns(typeof k === 'number' ? ITEMS[k].key : k));
@@ -251,7 +261,7 @@ const RoomExport = (() => {
     }
     if (!self.VENTITIES.includes(t) || /^(ender_dragon|end_crystal|player)$/.test(t)) return null;
     const o = base(t);
-    o.PersistenceRequired = NBT.byte(1);
+    if (!r.np) o.PersistenceRequired = NBT.byte(1); // (one that may despawn here may there too)
     if (r.health !== undefined) o.Health = NBT.float(r.health);
     if (r.baby) { if (/zombie|piglin|zoglin/.test(t)) o.IsBaby = NBT.byte(1); else o.Age = -Math.max(1, r.baby * 4); }
     if (t === 'sheep') { o.Color = NBT.byte(r.wool | 0); o.Sheared = NBT.byte(r.sheared ? 1 : 0); }

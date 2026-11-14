@@ -71,6 +71,8 @@ Object.assign(Living.prototype, {
     const fx = this.effects || (this.effects = new Map()), cur = fx.get(key);
     // instant ones act once
     if (key === 'instant_health' || key === 'instant_damage') { this.instantEffect(key, amp); return; }
+    // (vanilla canBeAffected: #ignores_poison_and_regen - the undead)
+    if ((key === 'poison' || key === 'regeneration') && this.isUndead()) return;
     if (key === 'saturation' && this === this.game.player && !this.game.net) { this.food = Math.min(20, this.food + amp + 1); this.saturation = Math.min(this.food, this.saturation + 2 * (amp + 1)); }
     // a stronger or longer one replaces it
     if (cur && (cur.amp > amp || (cur.amp === amp && (cur.dur < 0 || (dur >= 0 && cur.dur >= dur))))) return;
@@ -87,16 +89,20 @@ Object.assign(Living.prototype, {
   // the effect's amplifier, or -1 without it
   effectAmp(key) { const e = this.effects && this.effects.get(key); return e ? e.amp : -1; },
   hasEffect(key) { return !!(this.effects && this.effects.has(key)); },
+  // vanilla #undead (#inverted_healing_and_harm): healing hurts it, harming heals it (no mob type had T.undead, so
+  // potions worked on zombies and skeletons as on anything else)
+  isUndead() { return typeof ENTITY_TAGS !== 'undefined' && !!this.type && ENTITY_TAGS.undead.includes(this.type); },
   applyHealthBoost() {
     if (this.baseMaxHealth === undefined) this.baseMaxHealth = this.maxHealth;
     this.maxHealth = this.baseMaxHealth + 4 * (this.effectAmp('health_boost') + 1);
     this.health = Math.min(this.health, this.maxHealth);
   },
-  instantEffect(key, amp) {
+  // (scale: a lingering cloud's are at half strength, vanilla applyInstantaneousEffect's health 0.5)
+  instantEffect(key, amp, scale = 1) {
     if (this.game.net && this === this.game.player) return;
-    const undead = this.T && this.T.undead;
-    if ((key === 'instant_health') !== !!undead) this.health = Math.min(this.maxHealth, this.health + (4 << amp));
-    else this.hurt(6 << amp, { type: 'magic' });
+    const undead = this.isUndead();
+    if ((key === 'instant_health') !== !!undead) this.health = Math.min(this.maxHealth, this.health + Math.floor(scale * (4 << amp) + 0.5));
+    else this.hurt(Math.floor(scale * (6 << amp) + 0.5), { type: 'magic' });
   },
   tickEffects() {
     const fx = this.effects; if (!fx || !fx.size) return;
@@ -229,8 +235,8 @@ Game.prototype.chorusTeleport = function () {
 class ThrownPotion extends Entity {
   constructor(g, x, y, z, vel, owner, stack) {
     super(g, x, y, z, 0.25, 0.25); this.vel = vel; this.owner = owner; this.stack = stack;
-    this.spriteLayer = ITEMS[stack.id].tex;
   }
+  drawSelf(g, ip) { potionSprites(g, ip, ITEMS[this.stack.id].key, this.stack.pot); }
   tick() {
     this.savePrev(); this.age++;
     const g = this.game, v = this.vel, steps = Math.max(1, Math.ceil(Math.hypot(v[0], v[1], v[2]) / 0.3));
@@ -243,29 +249,88 @@ class ThrownPotion extends Entity {
         if (nx > b[0] && nx < b[3] && ny > b[1] && ny < b[4] && nz > b[2] && nz < b[5]) { hit = true; break; }
       }
       const id = this.world.getBlock(Math.floor(nx), Math.floor(ny), Math.floor(nz));
+      if (!hit && id && BLOCKS[id].solid && (!this.stack.pot || this.stack.pot === 'water')) this.dowse([Math.floor(nx), Math.floor(ny), Math.floor(nz)]);
       if (hit || (id && BLOCKS[id].solid) || ny < -60) { this.splash(); return; }
       this.pos[0] = nx; this.pos[1] = ny; this.pos[2] = nz;
     }
     v[0] *= 0.99; v[1] = v[1] * 0.99 - 0.05; v[2] *= 0.99;
   }
-  // splash: everything within 4 blocks, the closer the longer; lingering: a quarter as long, for everyone near
+  // a water bottle breaking on a block (AbstractThrownPotion.onHitBlock / dowseFire): fire put out, lit candles and
+  // campfires too - in the cell it was in, the block it hit and the four cells beside the first
+  dowse(hitAt) {
+    const g = this.game, w = this.world, e = [Math.floor(this.pos[0]), Math.floor(this.pos[1]), Math.floor(this.pos[2])];
+    for (const [x, y, z] of [e, hitAt, [e[0] + 1, e[1], e[2]], [e[0] - 1, e[1], e[2]], [e[0], e[1], e[2] + 1], [e[0], e[1], e[2] - 1]]) {
+      const id = w.getBlock(x, y, z), b = BLOCKS[id];
+      if (id === 171 || (b && b.key === 'soul_fire')) { w.setBlock(x, y, z, 0, 0); Sound.ev('block.fire.extinguish', [x + 0.5, y + 0.5, z + 0.5], 0.5, 2.6); }
+      else if (b && /(^|_)candle(_cake)?$/.test(b.key) && Features.propOf(id, w.getMeta(x, y, z), 'lit') === 'true') { w.setBlock(x, y, z, id, Features.withProp(id, w.getMeta(x, y, z), 'lit', 'false')); Sound.ev('block.candle.extinguish', [x + 0.5, y + 0.5, z + 0.5], 1, 1); }
+      else if (g.dowseCampfire) g.dowseCampfire(x, y, z, 'block.fire.extinguish');
+    }
+  }
+  // splash: everything within 4 blocks, the closer the longer; lingering: a cloud of it left there (EffectCloud)
   splash() {
     this.dead = true;
     const g = this.game, pot = this.stack.pot, fx = POTIONS[pot] || [], lingering = ITEMS[this.stack.id].key === 'lingering_potion';
     const col = potionColor(pot);
     for (let i = 0; i < 40; i++) g.particles.spawn('effect', this.pos[0], this.pos[1], this.pos[2], (Math.random() - 0.5) * 0.5, Math.random() * 0.3, (Math.random() - 0.5) * 0.5, { col });
     Sound.ev('entity.splash_potion.break', this.pos, 1, 1);
+    if (lingering) { g.entities.push(new EffectCloud(g, this.pos[0], this.pos[1], this.pos[2], pot, this.owner)); return; }
     for (const e of g.entities.concat([g.player])) {
       if (!(e instanceof Living) || e.deathTime > 0) continue;
       const d = Math.hypot(e.pos[0] - this.pos[0], e.pos[1] + e.h / 2 - this.pos[1], e.pos[2] - this.pos[2]);
       if (d > 4) continue;
-      const f = lingering ? 0.25 : 1 - d / 4;
+      const f = 1 - d / 4;
       for (const [k, t, a] of fx) {
         if (k === 'instant_health' || k === 'instant_damage') e.addEffect(k, a, 1);
         else if (t * f > 20) e.addEffect(k, a, Math.floor(t * f));
       }
     }
   }
+}
+// a lingering potion's cloud (vanilla AreaEffectCloud as ThrownLingeringPotion makes it): 3 blocks across at first,
+// half a second's wait, then every quarter second whoever stands in it (a second between goes for each) gets the
+// potion's effects at a quarter of their time (instant ones at half strength) and it shrinks by half a block; it also
+// shrinks away over 30 seconds. There was none: the potion acted once, a quarter as long, on everyone within 4 blocks
+class EffectCloud extends Entity {
+  constructor(g, x, y, z, pot, owner) {
+    super(g, x, y, z, 6, 0.5);
+    this.pot = pot; this.owner = owner; this.radius = 3; this.duration = 600; this.waitTime = 10; this.victims = new Map();
+    this.col = potionColor(pot);
+  }
+  tick() {
+    this.savePrev(); this.age++;
+    if (this.age - this.waitTime >= this.duration) { this.dead = true; return; }
+    const g = this.game, wait = this.age < this.waitTime, r = this.radius, [cx, cy, cz] = this.pos;
+    // (vanilla clientTick spawns pi r^2 a tick; half of that here)
+    if (!wait || Math.random() < 0.5) for (let i = 0, n = wait ? 2 : Math.ceil(Math.PI * r * r / 2); i < n; i++) {
+      const a = Math.random() * Math.PI * 2, d = Math.sqrt(Math.random()) * (wait ? 0.2 : r);
+      g.particles.spawn('effect', cx + Math.cos(a) * d, cy, cz + Math.sin(a) * d, wait ? 0 : (0.5 - Math.random()) * 0.15, wait ? 0 : 0.01, wait ? 0 : (0.5 - Math.random()) * 0.15, { col: this.col });
+    }
+    if (wait) return;
+    if ((this.radius -= 3 / this.duration) < 0.5) { this.dead = true; return; }
+    if (this.age % 5 || g.net) return;
+    for (const [e, t] of this.victims) if (this.age >= t) this.victims.delete(e);
+    const fx = POTIONS[this.pot] || [];
+    if (!fx.length) { this.victims.clear(); return; }
+    for (const e of [g.player, ...g.entities]) {
+      if (!(e instanceof Living) || e.dead || e.deathTime > 0 || this.victims.has(e)) continue;
+      if (!fx.some(([k]) => !((k === 'poison' || k === 'regeneration') && e.isUndead()))) continue;
+      const b = e.box();
+      if (b[4] < cy || b[1] > cy + 0.5 || (e.pos[0] - cx) ** 2 + (e.pos[2] - cz) ** 2 > this.radius ** 2) continue;
+      this.victims.set(e, this.age + 20);
+      for (const [k, t, a] of fx) {
+        if (k === 'instant_health' || k === 'instant_damage') e.instantEffect(k, a, 0.5);
+        else e.addEffect(k, a, Math.floor(t * 0.25));
+      }
+      if ((this.radius -= 0.5) < 0.5) { this.dead = true; return; }
+    }
+  }
+  drawSelf() { } // (only its particles show)
+}
+// a thrown potion as vanilla draws it (its item model): the liquid in the potion's colour, the bottle over it - only
+// the liquid layer was drawn, grey and without its bottle
+function potionSprites(g, ip, key, pot) {
+  const pos = [ip[0], ip[1] + 0.125, ip[2]];
+  g.spriteList.push({ pos, size: 0.18, layer: T('i_potion_overlay'), col: potionColor(pot) }, { pos, size: 0.18, layer: T('i_' + key), front: 0.01 });
 }
 Game.prototype.throwPotion = function (held) {
   const p = this.player, d = this.lookDir();

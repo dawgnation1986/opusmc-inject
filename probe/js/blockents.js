@@ -26,8 +26,13 @@ Renderer.prototype.initBEModels = function () {
   M.be_head = P(64, 32, [part([[0, 0, -4, 0, -4, 8, 8, 8]])]);
   M.be_head64 = P(64, 64, [part([[0, 0, -4, 0, -4, 8, 8, 8]])]);
   M.be_player_head = P(64, 64, [part([[0, 0, -4, 0, -4, 8, 8, 8], [32, 0, -4, 0, -4, 8, 8, 8, 0.25]])]);
-  M.be_piglin_head = P(64, 64, [part([[0, 0, -5, 0, -4, 10, 8, 8], [31, 1, -2, 0, -5, 4, 4, 1], [2, 4, 2, 0, -5, 1, 2, 1], [2, 0, -3, 0, -5, 1, 2, 1]])]);
-  M.be_dragon_head = P(256, 256, [part([[112, 30, -8, 0, -8, 16, 16, 16], [176, 44, -6, 4, -22, 12, 5, 16], [176, 65, -6, 0, -22, 12, 4, 16]])]);
+  // (with vanilla PiglinModel.addHead's ears, at PiglinHeadModel.setupAnim's angle for a still head, (cos 0 + 2.5) * 0.2;
+  // the dragon head with DragonHeadModel's scales and nostrils)
+  M.be_piglin_head = P(64, 64, [part([[0, 0, -5, 0, -4, 10, 8, 8], [31, 1, -2, 0, -5, 4, 4, 1], [2, 4, 2, 0, -5, 1, 2, 1], [2, 0, -3, 0, -5, 1, 2, 1]]),
+    { name: 'lear', parent: 'p', pivot: [-4.5, 6, 0], rotZ: -0.7, boxes: [[51, 6, -1, -5, -2, 1, 5, 4]] },
+    { name: 'rear', parent: 'p', pivot: [4.5, 6, 0], rotZ: 0.7, boxes: [[39, 6, 0, -5, -2, 1, 5, 4]] }]);
+  M.be_dragon_head = P(256, 256, [part([[112, 30, -8, 0, -8, 16, 16, 16], [176, 44, -6, 4, -22, 12, 5, 16], [176, 65, -6, 0, -22, 12, 4, 16],
+    [0, 0, 3, 16, -2, 2, 4, 6, 0, true], [0, 0, -5, 16, -2, 2, 4, 6], [112, 0, 3, 9, -20, 2, 2, 4, 0, true], [112, 0, -5, 9, -20, 2, 2, 4]])]);
   // banners: pole and bar (banner_base), the cloth (base pattern, dyed)
   M.be_banner_pole = P(64, 64, [part([[44, 0, -1, 0, -1, 2, 42, 2], [0, 42, -10, 40, -1, 20, 2, 2]])]);
   M.be_banner_bar = P(64, 64, [part([[0, 42, -10, 14, 5, 20, 2, 2]])]);
@@ -126,9 +131,11 @@ Game.prototype.drawChests = function (a, env) {
     if (!ch.chests) { ch.chests = []; ch.findAll(BE_IDS, (i) => ch.chests.push([cx * 16 + (i & 15), i >> 8, cz * 16 + ((i >> 4) & 15)])); }
     for (const [x, y, z] of ch.chests) {
       const id = w.getBlock(x, y, z), b = BLOCKS[id];
-      if (!b || !(b.beRender || BOOK_BLOCKS.has(id) || id === BELL_ID)) continue;
+      if (!b || !(b.beRender || BOOK_BLOCKS.has(id) || id === BELL_ID || typeof b.beDraw === 'function')) continue;
       if (!aabbInFrustum(r.planes, x - 1, y - 2, z - 1, x + 2, y + 3, z + 2)) continue;
       const m = w.getMeta(x, y, z), l = w.getLight(x, y, z), L = [(l >> 4) / 15, (l & 15) / 15];
+      // (a mod's block entity drawing: what its block holds - fluids, items - besides its block model)
+      if (typeof b.beDraw === 'function') { r.gl.enable(r.gl.CULL_FACE); b.beDraw(this, b, x, y, z, L, env); r.gl.disable(r.gl.CULL_FACE); continue; }
       if (BOOK_BLOCKS.has(id)) { this.drawBook(b, m, x, y, z, L, env, a); continue; }
       if (id === BELL_ID) { this.drawBell(x, y, z, L, env, a); continue; }
       if (!b.chestLike) { r.drawBE(b, m, x, y, z, L, env); continue; }
@@ -156,13 +163,32 @@ Game.prototype.drawChests = function (a, env) {
 // vanilla's text colours of the dyes
 const SIGN_TEXT_RGB = { white: '#FFFFFF', orange: '#FF681F', magenta: '#FF00FF', light_blue: '#9AC0CD', yellow: '#FFFF00', lime: '#BFFF00', pink: '#FF69B4',
   gray: '#808080', light_gray: '#D3D3D3', cyan: '#00FFFF', purple: '#A020F0', blue: '#0000FF', brown: '#8B4513', green: '#00FF00', red: '#FF0000', black: '#000000' };
-// a side's text as a texture (96 x 48: the board's 16 x 8 pixels, 4 lines), cached by content
+// the colour text is drawn in without glowing ink, and glowing text's outline: the dye's colour at 0.4 (vanilla
+// SignRenderer.getDarkColor; black glowing text's outline is 0xF0EBCC)
+function signDark(c, glow) {
+  if (c === 'black' && glow) return '#F0EBCC';
+  const h = (SIGN_TEXT_RGB[c] || '#000000').slice(1), ch = (i) => Math.floor(parseInt(h.slice(i, i + 2), 16) * 0.4).toString(16).padStart(2, '0');
+  return '#' + ch(0) + ch(2) + ch(4);
+}
+// a side's text as a texture (the board's 96 x 48 font units, 4 lines of 10), cached by content. Drawn at 2 pixels a
+// unit, unsmoothed: the font's glyphs are 16 pixels for 8 units (unifont: every Chinese character), and at one pixel a
+// unit - as it was - each was squeezed to 8 and smeared, too blurred to read (the user, 11-13). As vanilla's: plain ink
+// the dye's colour darkened (0.4), glowing ink the colour itself with an outline of the dark one all round
+const SIGN_SCALE = 2;
 Renderer.prototype.signTextTex = function (side) {
   const key = 'sign:' + side.c + (side.g ? '*' : '') + side.l.join('|');
   if (this.entityTex[key]) return key;
-  const cv = document.createElement('canvas'); cv.width = 96; cv.height = 48;
+  const S = SIGN_SCALE, cv = document.createElement('canvas'); cv.width = 96 * S; cv.height = 48 * S;
   const c = cv.getContext('2d');
-  side.l.slice(0, 4).forEach((t, i) => { if (t) Font.center(c, t, 48, 4 + i * 10, SIGN_TEXT_RGB[side.c] || '#000000', false); });
+  c.imageSmoothingEnabled = false; c.scale(S, S);
+  const glow = !!side.g, dark = signDark(side.c, glow), ink = glow ? (SIGN_TEXT_RGB[side.c] || '#000000') : dark;
+  side.l.slice(0, 4).forEach((t, i) => {
+    if (!t) return;
+    const x = Math.round(48 - Font.width(t) / 2), y = 4 + i * 10;
+    // (the outline half a unit out - one pixel here: a whole unit, as vanilla, buried the Chinese glyphs' half-unit strokes)
+    if (glow) for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) if (ox || oy) Font.draw(c, t, x + ox / S, y + oy / S, dark, false);
+    Font.draw(c, t, x, y, ink, false);
+  });
   this.entityTex[key] = this.tex2D(cv, false);
   (this.signTexKeys || (this.signTexKeys = [])).push(key);
   // keep the most recent 256
@@ -230,7 +256,7 @@ Game.prototype.drawBell = function (x, y, z, L, env, a) {
   if (swing) { M4.translate(mat, 0.5, 0.75, 0.5); if (s.alongX) M4.rotZ(mat, -swing); else M4.rotX(mat, swing); M4.translate(mat, -0.5, -0.75, -0.5); }
   // drawEM turns entity models over (scale -1, -1, 1 and a 1.501 drop); block-entity models are drawn as they are
   M4.translate(mat, 0, 1.501, 0); M4.scale(mat, -1, -1, 1);
-  r.drawEM(m, tex, mat, L, env);
+  r.drawEM(m, tex, mat, L, env, { cull: true });
   r.gl.disable(r.gl.CULL_FACE);
 };
 
@@ -307,6 +333,6 @@ Game.prototype.drawBook = function (b, meta, x, y, z, L, env, a) {
   }
   // drawEM turns entity models over (scale -1, -1, 1 and a 1.501 drop); these books are drawn as they are
   M4.translate(mat, 0, 1.501, 0); M4.scale(mat, -1, -1, 1);
-  r.drawEM(m, tex, mat, L, env);
+  r.drawEM(m, tex, mat, L, env, { cull: true });
   r.gl.disable(r.gl.CULL_FACE); // (drawChests draws with culling off; drawEM turns it back on)
 };

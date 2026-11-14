@@ -152,15 +152,20 @@ Renderer.prototype.etexMix = function (layers) {
 };
 
 // draw a vanilla model posed as it is now; base: the entity's matrix (feet, body yaw applied).
-// opts: overlay, tint, bright, vp, attach {part: fn(matrix)}, cull (default on, like vanilla's cutout types)
+// opts: overlay, tint, bright, vp, attach {part: fn(matrix)}, cull (default off: vanilla EntityModel's entityCutout
+// draws both sides, so flat parts - warden tendrils, axolotl gills, allay wings, chicken legs - show from behind too;
+// true for the few vanilla culls: bats, bells, books)
 Renderer.prototype.drawEM = function (m, tex, base, light, env, opts = {}) {
   if (!m || !tex || !this.entityTex[tex]) return;
   const gl = this.gl, E = this.entBegin(tex, light, env, opts);
   // (the matrices from the renderer's pool for this frame, render.js mat: a new array per part was ~10 a mob a frame)
   const mat = this.mat(base); M4.scale(mat, -1, -1, 1); M4.translate(mat, 0, -1.501, 0);
-  const cull = opts.cull !== false;
+  const cull = opts.cull === true;
   if (cull) gl.enable(gl.CULL_FACE); else gl.disable(gl.CULL_FACE);
-  const att = [];
+  // (depth LEQUAL like vanilla's pipelines: the two faces of a flat part lie on each other, and the later one shows from
+  // both sides as in vanilla)
+  gl.depthFunc(gl.LEQUAL);
+  const att = [], glint = opts.glint ? [] : null;
   let vao = null;
   const rec = (n, pm) => {
     if (!n.visible) return;
@@ -171,15 +176,20 @@ Renderer.prototype.drawEM = function (m, tex, base, light, env, opts = {}) {
     if (n.xRot) M4.rotX(mm, n.xRot);
     if (n.xScale !== 1 || n.yScale !== 1 || n.zScale !== 1) M4.scale(mm, n.xScale, n.yScale, n.zScale);
     if (n.mesh && !n.skipDraw) {
-      gl.uniformMatrix4fv(E.u.u_model, false, mm);
-      if (n.mesh.vao !== vao) { vao = n.mesh.vao; gl.bindVertexArray(vao); } // (the layer's parts share one: emPack)
-      gl.drawElements(gl.TRIANGLES, n.mesh.n * 1.5, gl.UNSIGNED_INT, n.mesh.off);
+      // (opts.glintOnly: only the enchantment glint over it, render.js drawGlint - armour under its trim)
+      if (!opts.glintOnly) {
+        gl.uniformMatrix4fv(E.u.u_model, false, mm);
+        if (n.mesh.vao !== vao) { vao = n.mesh.vao; gl.bindVertexArray(vao); } // (the layer's parts share one: emPack)
+        gl.drawElements(gl.TRIANGLES, n.mesh.n * 1.5, gl.UNSIGNED_INT, n.mesh.off);
+      }
+      if (glint) glint.push([n.mesh.vao, n.mesh.n, n.mesh.off, mm]);
     }
     if (opts.attach && opts.attach[n.name]) att.push([opts.attach[n.name], this.mat(mm)]);
     for (const k of n.kids) rec(k, mm);
   };
   rec(m.root, mat);
-  gl.enable(gl.CULL_FACE);
+  if (glint) this.drawGlint(glint, opts.glint, env, opts.vp || this.vp, false);
+  gl.enable(gl.CULL_FACE); gl.depthFunc(gl.LESS);
   this.unit0(); // (texture unit 0 again, before what is attached draws: render.js entBegin)
   for (const [fn, mm] of att) fn(mm);
 };
@@ -220,8 +230,7 @@ function emQuad(m, pos, spd, names = ['right_hind_leg', 'left_hind_leg', 'right_
 // humanoid arms and legs (vanilla HumanoidModel's walk; aggressive: arms held forward like zombies)
 function emHumanoid(m, e, a, opts = {}) {
   const P = m.parts, [pos, spd] = emLimbs(e, a);
-  emHead(P.head, e, a);
-  if (P.hat) { P.hat.xRot = P.head.xRot; P.hat.yRot = P.head.yRot; }
+  emHead(P.head, e, a); // (the hat is the head's child in vanilla 26.x's models: it follows the head by itself)
   const ra = P.right_arm, la = P.left_arm, rl = P.right_leg, ll = P.left_leg;
   if (ra) { ra.xRot = Math.cos(pos * 0.6662 + Math.PI) * 2 * spd * 0.5; ra.zRot = 0; ra.yRot = 0; }
   if (la) { la.xRot = Math.cos(pos * 0.6662) * 2 * spd * 0.5; la.zRot = 0; la.yRot = 0; }

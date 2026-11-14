@@ -10,6 +10,21 @@
 const VB_BASE = 32;            // biome ids of gen-2 chunks: VB_BASE + index in WG_DATA.biome_order
 const VBIOME = [];
 function hexRGB(h) { const v = parseInt(h.slice(1), 16); return [(v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+// vanilla's dry foliage colour map (leaf litter) at each biome's temperature and downfall, as GrassColor / FoliageColor
+// below (the map itself is not in the game's pictures)
+const DRY_FOLIAGE = { badlands: '#a38046', bamboo_jungle: '#a36346', basalt_deltas: '#a38046', beach: '#a37546', birch_forest: '#a37246',
+  cherry_grove: '#a17148', cold_ocean: '#a17448', crimson_forest: '#a38046', deep_cold_ocean: '#a17448', deep_dark: '#a37546',
+  deep_frozen_ocean: '#a17448', deep_lukewarm_ocean: '#a17448', deep_ocean: '#a17448', desert: '#a38046', dripstone_caves: '#a37546',
+  end_barrens: '#a17448', end_highlands: '#a17448', end_midlands: '#a17448', eroded_badlands: '#a38046', flower_forest: '#a36d46',
+  forest: '#a36d46', frozen_ocean: '#8f7a5a', frozen_peaks: '#8f7a5a', frozen_river: '#8f7a5a', grove: '#8f7a5a', ice_spikes: '#8f7a5a',
+  jagged_peaks: '#8f7a5a', jungle: '#a36346', lukewarm_ocean: '#a17448', lush_caves: '#a17448', meadow: '#a17148', mushroom_fields: '#a36246',
+  nether_wastes: '#a38046', ocean: '#a17448', old_growth_birch_forest: '#a37246', old_growth_pine_taiga: '#9c754d',
+  old_growth_spruce_taiga: '#9a764f', plains: '#a37546', river: '#a17448', savanna: '#a38046', savanna_plateau: '#a38046',
+  small_end_islands: '#a17448', snowy_beach: '#917958', snowy_plains: '#8f7a5a', snowy_slopes: '#8f7a5a', snowy_taiga: '#8f7a5a',
+  soul_sand_valley: '#a38046', sparse_jungle: '#a36646', stony_peaks: '#a37946', stony_shore: '#967753', sulfur_caves: '#a37546',
+  sunflower_plains: '#a37546', taiga: '#9a764f', the_end: '#a17448', the_void: '#a17448', warm_ocean: '#a17448', warped_forest: '#a38046',
+  windswept_forest: '#967753', windswept_gravelly_hills: '#967753', windswept_hills: '#967753', windswept_savanna: '#a38046',
+  wooded_badlands: '#a38046' };
 function initVanillaBiomes(grassMap, foliageMap) {
   if (VBIOME.length) return;
   const D = self.WG_DATA;
@@ -33,6 +48,7 @@ function initVanillaBiomes(grassMap, foliageMap) {
       name, def: b, cn: D.biome_cn[name] || name, precip: !!b.has_precipitation,
       sky: sky ? hexRGB(sky) : null, fog: fog ? hexRGB(fog) : null,
       grass, foliage: col(foliageMap, e.foliage_color), swamp: e.grass_color_modifier === 'swamp',
+      dry: hexRGB(e.dry_foliage_color || DRY_FOLIAGE[name] || '#5c3c32'),
       water: hexRGB(e.water_color || '#3f76e4'),
       music: music && music.default ? music.default.sound.replace('minecraft:', '') : null,
       amb: at['minecraft:audio/ambient_sounds'] || null, // (loop / mood / additions: audio.js ambientSounds)
@@ -59,7 +75,9 @@ const FACE_META = { west: 0, east: 1, north: 4, south: 5 };
 function mapVanillaState(str) {
   const k = str.indexOf('['), name = k < 0 ? str : str.slice(0, k), props = {};
   if (k >= 0) for (const kv of str.slice(k + 1, -1).split(',')) { const [a, v] = kv.split('='); props[a] = v; }
-  const key = BID[name] !== undefined ? name : STATE_ALIAS[name];
+  let key = BID[name] !== undefined ? name : STATE_ALIAS[name];
+  // a burning furnace is a block of its own here (vanilla: furnace[lit=true]); a server's lit furnace stayed unlit
+  if (key === 'furnace' && props.lit === 'true' && BID.lit_furnace !== undefined) key = 'lit_furnace';
   if (key === 'air' || name === 'air') return [0, 0];
   const id = BID[key];
   if (id === undefined) return null;
@@ -182,7 +200,7 @@ class InlineGenWorker {
 }
 InlineGenWorker.frame = 0;
 const newGenWorker = () => {
-  if (!GenPool.inline) { try { return new Worker('js/gen_worker.js'); } catch (e) { GenPool.inline = true; console.info('worldgen: workers unavailable (' + e.name + '), generating in the page'); } }
+  if (!GenPool.inline) { try { return new Worker('js/gen_worker.js' + Mods.workerQuery()); } catch (e) { GenPool.inline = true; console.info('worldgen: workers unavailable (' + e.name + '), generating in the page'); } }
   return new InlineGenWorker();
 };
 
@@ -322,10 +340,28 @@ class GenPool {
   }
   inflight() { return this.wait.size; }
   terminate() { this.dead = true; for (const w of this.workers) w.terminate(); this.workers = []; }
+  // the same workers for another world's seed: a new init after the jobs they are on, whose answers are dropped (11-10:
+  // a new pool each time - every worker loading its scripts again, 4 MB and with Tinkers' 8, and unpacking the
+  // structures - was a good part of opening a world on a phone)
+  reseed(seed) {
+    this.seed = String(seed);
+    this.init = Object.assign({}, this.init, { seed: this.seed });
+    this.ready = new Promise((res) => { this.readyRes = res; });
+    this.queue = []; this.wait.clear(); this.keys.clear(); this.errRun = 0;
+    for (const w of this.workers) { w.jobs.clear(); w.busy = 0; w.jobT = 0; w.suspect = 0; w.broken = false; w.postMessage(this.init); }
+    this.pump();
+  }
 }
 
 Game.prototype.genSetup = function (seed) {
   if (this.genPool && this.genPool.seed === String(seed)) return this.genPool.ready;
+  // (the workers there are, seeded again: GenPool.reseed - a new pool only when there are none that work)
+  if (this.genPool && !this.genPool.dead && this.genPool.workers.length && !this.genPool.workers.every((x) => x.broken)) {
+    this.genPool.reseed(seed);
+    initVanillaBiomes(this.renderer.grassMap, this.renderer.foliageMap);
+    this.genPending = new Set();
+    return this.genPool.ready;
+  }
   if (this.genPool) this.genPool.terminate();
   if (!this.chunkWorker) this.chunkWorker = new ChunkWorker(this);
   initVanillaBiomes(this.renderer.grassMap, this.renderer.foliageMap);
@@ -351,7 +387,7 @@ class ChunkWorker {
   }
   start() {
     let w;
-    try { w = this.w = new Worker('js/chunk_worker.js'); } catch (e) { return false; }
+    try { w = this.w = new Worker('js/chunk_worker.js' + Mods.workerQuery()); } catch (e) { return false; }
     this.startT = performance.now(); this.ready = false; this.pingT = 0; this.suspect = 0; this.last = null;
     // (last: its last message when that said which chunk it started on - see stuck())
     w.onmessage = (e) => { if (w !== this.w) return; const m = e.data; this.lastMsg = performance.now(); this.last = m && m.type === 'work' ? m : null; this.onMessage(m); };
@@ -461,7 +497,7 @@ class ChunkWorker {
     const id = this.nextId++;
     this.meshCb.set(id, cb);
     snap.type = 'mesh'; snap.id = id;
-    this.post(snap, [snap.ids.buffer, snap.metas.buffer, snap.lights.buffer, snap.tints.buffer, snap.biomes.buffer]);
+    this.post(snap, [snap.ids.buffer, snap.metas.buffer, snap.lights.buffer, snap.tints.buffer, snap.tints2.buffer, snap.biomes.buffer]);
   }
   onMessage(m) {
     const g = this.game, w = this.world;
@@ -580,6 +616,7 @@ Game.prototype.genStep = function (pcx, pcz, R, t0, budget) {
   if (w.useCW && (!cw || cw.failed)) w.useCW = false;
   const useCW = w.useCW;
   if (useCW && cw.world !== w) cw.reset(w);
+  if (!useCW && !w.spills) w.spills = new Map(); // (decoration records: Features.applySpill)
   const has = useCW ? (cx, cz) => { const k = ckey(cx, cz); return w.chunks.has(k) || w.protoKeys.has(k) || cw.asking.has(k) || cw.inQ.has(k); }
     : (cx, cz) => w.chunks.has(ckey(cx, cz)) || proto.has(ckey(cx, cz));
   // 1) request proto chunks: finalising out to R + 1.5 needs decorated neighbours (up to sqrt 2 further on the
@@ -662,6 +699,7 @@ Game.prototype.genStep = function (pcx, pcz, R, t0, budget) {
     const dx = ch.cx - pcx, dz = ch.cz - pcz;
     if (dx * dx + dz * dz > (R + 5.5) * (R + 5.5)) proto.delete(ckey(ch.cx, ch.cz)); // requested out to R + 4.5
   }
+  if (this.tickCount % 40 === 0 && w.spills && typeof Features !== 'undefined') Features.pruneSpill(w, (k) => proto.has(k) || w.chunks.has(k));
 };
 // a gen job's answer: the chunk, or a failure (a worker's error, a job that hung two workers). A failed chunk is asked for
 // again after a pause that doubles each time - it was asked for again at once, and a worker's error went on as a chunk:
@@ -706,13 +744,16 @@ Game.prototype.genReceive = function (m) {
   for (let i = 0; i < 256; i++) ch.biome[i] = VB_BASE + m.sb[i];
   ch.stage = 1;
   w.proto.set(k, ch);
+  // (made again: what decorated neighbours had put into it before - Features.applySpill)
+  if (w.spills && typeof Features !== 'undefined') Features.applySpill(w, ch, false, genDecorated(w));
 };
+const genDecorated = (w) => (k) => { const n = w.proto.get(k); return n ? n.stage === 2 : w.chunks.has(k); };
 // stage 2: vanilla features (placed in worldfeatures.js); writes may reach the 8 neighbours
 Game.prototype.decorateChunk = function (ch) {
   // strongholds (needed to reach the End) still come from the original structure builder
   const w = this.world;
   if (w.structures !== false) for (const sb of w.structuresFor(ch.cx, ch.cz)) sb.apply(ch);
-  if (typeof Features !== 'undefined') Features.decorate(this, w, ch);
+  if (typeof Features !== 'undefined') { Features.decorate(this, w, ch); if (w.spills) Features.applySpill(w, ch, true, genDecorated(w)); }
 };
 Game.prototype.finaliseChunk = function (ch) {
   const w = this.world, k = ckey(ch.cx, ch.cz);
@@ -734,17 +775,23 @@ Game.prototype.chunkTints = function (ch) {
     return c ? c.biome[((z & 15) << 4) | (x & 15)] : ch.biome[((z & 15) << 4) | (x & 15)];
   };
   const swamp = (x, z) => (WG.infoNoise().get(x * 0.0225, z * 0.0225) < -0.1 ? [76, 118, 60] : [106, 112, 57]);
+  // (and the water and leaf litter's dry foliage, as vanilla's BiomeColors: the water was each column's own biome's - a swamp's
+  // edge a hard line - and is read by the chunk worker's meshes too: Mesher.gather)
+  const wa = ch.water || (ch.water = new Uint8Array(256 * 3)), dr = ch.dry || (ch.dry = new Uint8Array(256 * 3));
   for (let lz = 0; lz < 16; lz++) for (let lx = 0; lx < 16; lx++) {
-    let gr = 0, gg = 0, gb = 0, fr = 0, fg = 0, fb = 0;
+    let gr = 0, gg = 0, gb = 0, fr = 0, fg = 0, fb = 0, wr = 0, wg = 0, wb = 0, dR = 0, dG = 0, dB = 0, n = 0;
     for (let dz = -2; dz <= 2; dz++) for (let dx = -2; dx <= 2; dx++) {
       const x = x0 + lx + dx, z = z0 + lz + dz, v = VBIOME[biomeAt(x, z)];
       if (!v) continue;
       const g = v.swamp ? swamp(x, z) : v.grass;
       gr += g[0]; gg += g[1]; gb += g[2]; fr += v.foliage[0]; fg += v.foliage[1]; fb += v.foliage[2];
+      wr += v.water[0]; wg += v.water[1]; wb += v.water[2]; dR += v.dry[0]; dG += v.dry[1]; dB += v.dry[2]; n++;
     }
     const o = (lz * 16 + lx) * 3;
     ch.grass[o] = gr / 25; ch.grass[o + 1] = gg / 25; ch.grass[o + 2] = gb / 25;
     ch.foliage[o] = fr / 25; ch.foliage[o + 1] = fg / 25; ch.foliage[o + 2] = fb / 25;
+    if (n) { wa[o] = wr / n; wa[o + 1] = wg / n; wa[o + 2] = wb / n; dr[o] = dR / n; dr[o + 1] = dG / n; dr[o + 2] = dB / n; }
+    else { wa.set(BIOME_WATER_DEFAULT, o); dr.set(DRY_FOLIAGE_DEFAULT, o); }
   }
 };
 // biome of a column in a gen-2 world, and vanilla precipitation rules
@@ -782,6 +829,7 @@ const TREE_GROWERS = {
   acacia_sapling: { one: [['acacia', 1]] }, cherry_sapling: { one: [['cherry', 1]] },
   dark_oak_sapling: { mega: [['dark_oak', 1]] }, pale_oak_sapling: { mega: [['pale_oak_bonemeal', 1]] },
   mangrove_propagule: { one: [['mangrove', 0.85], ['tall_mangrove', 0.15]] },
+  azalea: { one: [['azalea_tree', 1]] }, flowering_azalea: { one: [['azalea_tree', 1]] }, // (by bone meal only: TreeGrower.AZALEA)
 };
 Game.prototype.growTreeV = function (x, y, z, id) {
   const b = BLOCKS[id], G = TREE_GROWERS[b.key], w = this.world;

@@ -226,6 +226,42 @@ const Capes = (() => {
     const s = rndc(x, y, 21); if (s > 0.86) c = mix(c, hex('#FFE27A'), Math.max(0, Math.sin(t * TAU * 2 + s * 60)) * 0.9);
     return c;
   };
+  // the smeltery (匠魂, 11-13): a frame of seared bricks, molten metal pouring down inside - streams of their own speed,
+  // hot white where they run fastest, a pool at the hem - the metal slowly turning copper, cobalt, manyullyn and back
+  // round (48 frames, 6 s: SMELT the colours), sparks now and then in the bricks
+  const SMELT = [['#8A3A12', '#D8641E', '#FFB060'], ['#123A8A', '#2A6FE0', '#8FC4FF'], ['#4A167A', '#8A3FD0', '#DE9AFF']];
+  const smeltCol = (t, k) => {
+    const s = (t * 3) % 3, i = Math.floor(s), f = s - i, e = f < 0.7 ? 0 : (f - 0.7) / 0.3, sm = e * e * (3 - 2 * e);
+    return mix(hex(SMELT[i][k]), hex(SMELT[(i + 1) % 3][k]), sm);
+  };
+  const seared = (x, y, s) => {
+    // (bricks two wide, every other row shifted; mortar between)
+    const row = y % 2, edge = (x + row) % 2 === 0 && s !== 'h';
+    const r = rndc(x, y, 31);
+    if (edge && r > 0.55) return hex('#2A2624');
+    return r > 0.8 ? hex('#57504B') : r > 0.35 ? hex('#45403C') : hex('#3A3532');
+  };
+  ANIM.smeltery = (u, v, t) => {
+    const [x, y] = px(u, v);
+    if (x === 0 || x === 9 || y === 0 || y === 15) {
+      const c = seared(x, y);
+      const sp = rndc(x, y, 77); // (a spark glinting in the bricks now and then)
+      const k = Math.max(0, Math.sin(t * TAU * 3 + sp * 40)) ** 6 * (sp > 0.7 ? 1 : 0);
+      return k > 0.05 ? mix(c, hex('#FFC060'), k) : c;
+    }
+    if (y <= 2) return y === 2 ? mix(seared(x, y), smeltCol(t, 0), 0.35) : seared(x, y, 'h'); // (the drain at the top)
+    const dark = smeltCol(t, 0), mid = smeltCol(t, 1), lite = smeltCol(t, 2);
+    if (y >= 13) { // the pool: a slow shimmer along it
+      const w = 0.5 + 0.5 * Math.sin(t * TAU * 2 + x * 0.9);
+      return y === 13 ? mix(mid, lite, 0.35 + 0.4 * w) : mix(dark, mid, 0.5 + 0.3 * w);
+    }
+    // the streams: each column's own speed (whole loops in the 6 s) and phase
+    const sp = 2 + Math.floor(rndc(x, 1, 9) * 3), ph = rndc(x, 2, 9) * 8;
+    const f = (((y - t * 8 * sp + ph) % 8) + 8) % 8;
+    let c = f < 1 ? lite : f < 3 ? mix(lite, mid, (f - 1) / 2) : f < 6 ? mid : mix(mid, dark, (f - 6) / 2);
+    if (f < 0.6 && sp >= 4) c = mix(c, hex('#FFF4D8'), 0.6); // (hot white at the head of a fast one)
+    return c;
+  };
   // ---- the elytra: every design has wings of its own, outline and picture, not the cape stretched over them ----
   // On one wing's 10 x 20 face: i across from the spine (0) to the outer edge (9), j down from the shoulder (0) to the
   // bottom (19). top / bot: where each column starts and ends (the rest is cut away, like vanilla's elytra); color:
@@ -330,6 +366,15 @@ const Capes = (() => {
     },
   };
   WINGS.penguinwalk = { ...WINGS.penguin, fall: true };
+  // the smeltery's: seared-brick rims, molten metal running down the feathers in the cape's colours
+  WINGS.smeltery = {
+    top: [2, 1, 0, 0, 0, 0, 0, 0, 1, 2], bot: [19, 19, 19, 18, 18, 17, 16, 15, 13, 10],
+    color(i, j, t, rim) {
+      if (rim || j <= this.top[i] + 1) return seared(i, j);
+      const f = (((j - t * 8 * (2 + (i % 3)) + i * 1.7) % 8) + 8) % 8;
+      return f < 1 ? smeltCol(t, 2) : f < 4 ? smeltCol(t, 1) : mix(smeltCol(t, 1), smeltCol(t, 0), (f - 4) / 4);
+    },
+  };
   // the golden apple's: crimson feathers with a gold rim a light runs along, gold feather lines, sparks
   WINGS.goldapple = {
     top: [2, 1, 0, 0, 0, 0, 0, 0, 1, 2], bot: [19, 19, 19, 18, 18, 17, 16, 15, 13, 10],
@@ -394,10 +439,14 @@ const Capes = (() => {
     { id: 'penguin', name: '企鹅', anim: false, ev: true }, { id: 'penguinwalk', name: '摇摆企鹅', anim: true, ev: true },
     // (the first announcement's gift: news.js, community.js)
     { id: 'goldapple', name: '金苹果', anim: true, ev: true },
+    // (the mods update, 11-13: cosmetics.js says how it is got)
+    { id: 'smeltery', name: '冶炼炉', anim: true, ev: true },
   ];
   // the colours an administrator's wings throw off as sparks (wingFx): the crowns' sparks, border light and jewels
   const fx = (id) => { const c = CROWNS[id]; if (c) { const P = c[1]; return [P.spark, P.rimL, P.j1, P.j2].map(hex); } const r = ADM_RIM[id]; return r ? [hex(r), [255, 255, 255]] : null; };
   const FRAMES = 16, FPS = 8;
+  // (designs with a longer loop: the smeltery's colours turn slowly - 48 frames, 6 s)
+  const NFRAMES = { smeltery: 48 };
   // the texture of one design (one frame): colour at (u, v) painted over the cape's and the elytra's faces
   // inset: the edges (the cape's 1-pixel thickness, the elytra's sides) take the colour a pixel in from the border -
   // an animated design's outer row can be its darkest and read as a black strip along the top
@@ -438,7 +487,7 @@ const Capes = (() => {
     let c = made.get(id);
     if (c) return c;
     if (ART[id]) c = { frames: [paint(artAt(ART[id]), false, WINGS[id], 0)] };
-    else if (ANIM[id]) c = { frames: Array.from({ length: FRAMES }, (_, f) => paint((u, v) => ANIM[id](u, v, f / FRAMES), true, WINGS[id], f / FRAMES)) };
+    else if (ANIM[id]) { const n = NFRAMES[id] || FRAMES; c = { frames: Array.from({ length: n }, (_, f) => paint((u, v) => ANIM[id](u, v, f / n), true, WINGS[id], f / n)) }; }
     else return null;
     made.set(id, c);
     return c;

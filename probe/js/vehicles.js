@@ -34,6 +34,8 @@ Renderer.prototype.initVehicleModels = function () {
   ];
   M.vh_boat = P(128, 64, hull);
   M.vh_chest_boat = P(128, 128, [...hull.map(p => ({ ...p })), ...chest(-5)]);
+  // vanilla BoatModel.createWaterPatch: the bottom's box 6 pixels up, drawn into depth only (Boat.drawSelf)
+  M.vh_boat_patch = P(128, 64, [vanillaPart('water_patch', [0, -3, 1], [PI / 2, 0, 0], [[0, 0, -14, -9, -3, 28, 16, 3]])]);
   const raft = [
     vanillaPart('bottom', [0, -2.1, 1], [1.5708, 0, 0], [[0, 0, -14, -11, -4, 28, 20, 4], [0, 0, -14, -9, -8, 28, 16, 4]]),
     vanillaPart('lp', [3, -4, 9], [0, 0, PI / 16], paddle(0, 24)),
@@ -67,6 +69,7 @@ class Vehicle extends Entity {
   }
   dropSelf() {
     const g = this.game;
+    this.unpackLoot(); // (an unopened mineshaft cart drops its loot, as vanilla)
     g.dropItem(this.pos[0], this.pos[1] + 0.3, this.pos[2], makeStack(this.itemKey));
     for (const s of this.slots || []) if (s) g.dropItem(this.pos[0], this.pos[1] + 0.3, this.pos[2], { ...s });
   }
@@ -135,6 +138,12 @@ class Boat extends Vehicle {
     this.savePrev(); this.age++;
     if (this.hurtT > 0) this.hurtT--;
     if (this.damage > 0) this.damage = Math.max(0, this.damage - 1);
+    // lava burns it up like a minecart (vanilla Entity.lavaHurt; it floated on unharmed: "船不会被岩浆销毁")
+    let lava = false;
+    const lb = this.box();
+    for (let x = Math.floor(lb[0] + 0.001); x <= Math.floor(lb[3] - 0.001) && !lava; x++) for (let z = Math.floor(lb[2] + 0.001); z <= Math.floor(lb[5] - 0.001) && !lava; z++)
+      for (let y = Math.floor(lb[1] + 0.001); y <= Math.floor(lb[4] - 0.001); y++) if (this.world.getBlock(x, y, z) === LAVA) { lava = true; break; }
+    if (lava) { this.hurt(4, { type: 'lava' }); if (this.dead) return; }
     const v = this.vel, ws = this.waterState(), land = this.onGround ? this.landFriction() : 0;
     const old = this.status;
     this.status = ws.under ? 'under' : ws.top !== null ? 'water' : land ? 'land' : 'air';
@@ -191,6 +200,10 @@ class Boat extends Vehicle {
     const model = this.raft ? (this.chest ? 'vh_chest_raft' : 'vh_raft') : (this.chest ? 'vh_chest_boat' : 'vh_boat');
     r.gl.disable(r.gl.CULL_FACE);
     r.drawModel(model, tex, m, { lp: { rx: -Math.sin(this.paddle[0]) * 0.6 }, rp: { rx: Math.sin(this.paddle[1]) * 0.6 } }, l, env);
+    // the water patch (vanilla BoatRenderer, not a raft's, not under water): drawn into depth once all entities are
+    // (Game.drawEntities - a rider's legs in the hull stay), so the water drawn after them stays out of the hull - its
+    // surface showed in the boat: "船里有水"
+    if (!this.raft && this.status !== 'under' && !r.shRecOnly) (g.boatPatches || (g.boatPatches = [])).push([m, tex, l]);
     r.gl.enable(r.gl.CULL_FACE);
   }
   savePrev() { super.savePrev(); this.prevYaw = this.yaw; }
@@ -446,15 +459,70 @@ Player.prototype.mount = function (v) {
 Player.prototype.dismount = function () {
   const v = this.vehicle; if (!v) return;
   this.vehicle = null; v.rider = null; this.rideInput = null;
-  // stand beside it (or on top when there is no room)
-  const w = this.world;
-  for (const [dx, dz] of [[1.2, 0], [-1.2, 0], [0, 1.2], [0, -1.2]]) {
-    const x = v.pos[0] + dx, z = v.pos[2] + dz, y = Math.floor(v.pos[1]) + 0.01;
-    const b = [x - 0.3, y, z - 0.3, x + 0.3, y + 1.8, z + 0.3];
-    if (!this.collides(b) && BLOCKS[w.getBlock(Math.floor(x), Math.floor(y) - 1, Math.floor(z))].solid) { this.pos = [x, y, z]; this.vel = [0, 0, 0]; this.savePrev(); return; }
-  }
-  this.pos = [v.pos[0], v.pos[1] + v.h + 0.01, v.pos[2]]; this.vel = [0, 0, 0]; this.savePrev();
+  this.pos = dismountSpot(this, v) || [v.pos[0], v.pos[1] + v.h, v.pos[2]]; this.vel = [0, 0, 0]; this.savePrev();
 };
+// where a rider gets off (vanilla getDismountLocationForPassenger of each kind; null: on top of it). Before, four spots
+// 1.2 away at the height of its bottom, each wanting a solid block under it: from a boat the shore (a block higher than
+// its bottom) never counted, nor a slab or a path, and in a low tunnel a minecart's or a horse's rider was put on its
+// top, into the ceiling - "下不了船", "上了矿车/马后下不来", feedback 11-01..11. Standing, else crouching, else crawling
+const DISMOUNT_H = () => [PLAYER_H.stand, PLAYER_H.crouch, PLAYER_H.swim];
+// vanilla Entity.getCollisionHorizontalEscapeVector: just clear of both boxes toward (dx, dz)
+function escapeVec(w1, w2, dx, dz) { const d = (w1 + w2 + 1e-5) / 2, s = Math.max(Math.abs(dx), Math.abs(dz)) || 1; return [dx * d / s, dz * d / s]; }
+// DismountHelper.offsetsForDirection: right, left, the back corners, the front corners, back, front of a cardinal facing
+function dismountOffsets(fx, fz) {
+  const rx = -fz, rz = fx;
+  return [[rx, rz], [-rx, -rz], [rx - fx, rz - fz], [-rx - fx, -rz - fz], [rx + fx, rz + fz], [-rx + fx, -rz + fz], [-fx, -fz], [fx, fz]];
+}
+function cardinalOf(dx, dz) { return Math.abs(dx) >= Math.abs(dz) ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dz)]; }
+function dismountSpot(p, v) {
+  const w = p.world, H = DISMOUNT_H(), fl = Math.floor;
+  if (typeof HappyGhast !== 'undefined' && v instanceof HappyGhast) return null;
+  // a boat (AbstractBoat): out where the rider looks, on the floor at its top's height or the block below; not over water
+  if (v instanceof Boat) {
+    const d = escapeVec(v.w * Math.SQRT2, p.w, -Math.sin(p.yaw), -Math.cos(p.yaw)), x = v.pos[0] + d[0], z = v.pos[2] + d[1], ty = fl(v.pos[1] + v.h);
+    if (w.waterAt(fl(x), ty - 1, fl(z))) return null;
+    const ts = [ty, ty - 1].map(y => [y, blockFloor(w, fl(x), y, fl(z), false)]).filter(([, f]) => f < 1);
+    for (const h of H) for (const [y, f] of ts) if (standsFree(p, x, y + f, z, h)) return [x, y + f, z];
+    return null;
+  }
+  // a horse, donkey, llama, camel ... (AbstractHorse): its right side, else its left, from its feet up to 0.75 over its
+  // top; else at its feet
+  if (typeof Horse !== 'undefined' && v instanceof Horse) {
+    const fx = -Math.sin(v.yaw), fz = -Math.cos(v.yaw), top = v.pos[1] + v.h + 0.75;
+    for (const side of [1, -1]) {
+      const d = escapeVec(v.w, p.w, -fz * side, fx * side), x = v.pos[0] + d[0], z = v.pos[2] + d[1];
+      for (const h of H) for (let y = fl(v.pos[1]); y < top; y++) {
+        const f = blockFloor(w, fl(x), y, fl(z), false);
+        if (y + f > top) break;
+        if (f < 1 && standsFree(p, x, y + f, z, h)) return [x, y + f, z];
+      }
+    }
+    return [v.pos[0], v.pos[1], v.pos[2]];
+  }
+  // a strider (Strider): where the rider looks and 22.5, 45 degrees off it, from its top down to under its feet, not in lava
+  if (v.type === 'strider') {
+    const seen = new Set(), cells = [];
+    for (const da of [0, 22.5, -22.5, 45, -45]) { // (vanilla yRot - 22.5 first: this game's yaw turns the other way)
+      const a = p.yaw + da * Math.PI / 180, d = escapeVec(v.w, p.w, -Math.sin(a), -Math.cos(a)), cx = fl(v.pos[0] + d[0]), cz = fl(v.pos[2] + d[1]);
+      for (let y = v.pos[1] + v.h, i = fl(y); y > v.pos[1] - 0.5; y--, i--) { const k = cx + ',' + i + ',' + cz; if (!seen.has(k)) { seen.add(k); cells.push([cx, i, cz]); } }
+    }
+    for (const [x, y, z] of cells) {
+      if (w.getBlock(x, y, z) === LAVA) continue;
+      const f = blockFloor(w, x, y, z, false);
+      if (f < 1) for (const h of H) if (standsFree(p, x + 0.5, y + f, z + 0.5, h)) return [x + 0.5, y + f, z + 0.5];
+    }
+    return null;
+  }
+  // a minecart (AbstractMinecart: a block up or down too) or another animal (Animal: a pig ...): the eight blocks around
+  // it, its sides first
+  const cart = v instanceof Minecart, bx = fl(v.pos[0]), by = fl(v.pos[1]), bz = fl(v.pos[2]);
+  const mv = Math.abs(v.vel[0]) + Math.abs(v.vel[2]) > 1e-3, f0 = cardinalOf(mv ? v.vel[0] : -Math.sin(v.yaw), mv ? v.vel[2] : -Math.cos(v.yaw));
+  for (const h of H) for (const dy of cart ? (h === PLAYER_H.swim ? [0, 1] : [0, 1, -1]) : [0]) for (const [ox, oz] of dismountOffsets(f0[0], f0[1])) {
+    const x = bx + ox, y = by + dy, z = bz + oz, f = blockFloor(w, x, y, z, cart);
+    if (f < 1 && standsFree(p, x + 0.5, y + f, z + 0.5, h)) return [x + 0.5, y + f, z + 0.5];
+  }
+  return null;
+}
 Player.prototype.followVehicle = function (v) { const s = v.seat(); this.pos[0] = s[0]; this.pos[1] = s[1]; this.pos[2] = s[2]; this.vel = [0, 0, 0]; this.fallDist = 0; };
 const _vPlayerTick = Player.prototype.tick;
 Player.prototype.tick = function (input) {
@@ -463,6 +531,7 @@ Player.prototype.tick = function (input) {
   if (v.dead || (input.sneak && !this.rideSneak)) { this.dismount(); this.rideSneak = !!input.sneak; return _vPlayerTick.call(this, { ...input, sneak: false }); }
   this.rideSneak = !!input.sneak;
   this.savePrev(); this.baseTick();
+  if (this.boostT > 0) this.boostT--; // (a rocket's push runs out while riding too - the on-foot tick counts it: equip.js)
   if (this.deathTime > 0) { this.dismount(); this.deathTime++; return; }
   this.rideInput = input; this.onGround = true; this.sprinting = false; this.swimming = false; this.pose = 'stand'; this.h = 1.8;
   // no view bobbing while riding: it settles to nothing. The last tick's values follow along - left as they were on

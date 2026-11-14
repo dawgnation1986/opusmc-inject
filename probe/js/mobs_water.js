@@ -36,7 +36,8 @@ class Cod extends Fish {
   setupAnim(md, a) { if (md.parts.tail_fin) md.parts.tail_fin.yRot = finWag(this, a); }
   texKey(r) { return r.etex('entity/fish/cod'); }
 }
-defVMob('cod', { cls: Cod, ai: 'swim', xp: 1, shadowR: 0.2, stepSound: false, panicMod: 2 });
+// (vanilla fish: 0.01 x their speed of 0.7 a tick, so about 1.3 blocks a second; 1.25 times that when panicking)
+defVMob('cod', { cls: Cod, ai: 'swim', xp: 1, shadowR: 0.2, stepSound: false, swimAcc: 0.007, panicMod: 1.25 });
 const SALMON_SIZE = { small: 0.5, medium: 1, large: 1.5 };
 class Salmon extends Fish {
   constructor(g, type, x, y, z) { super(g, type, x, y, z); this.size = pickW([['small', 30], ['medium', 50], ['large', 20]]); }
@@ -47,7 +48,7 @@ class Salmon extends Fish {
   setupAnim(md, a) { const w = finWag(this, a); if (md.parts.body_back) md.parts.body_back.yRot = w * 0.6; }
   texKey(r) { return r.etex('entity/fish/salmon'); }
 }
-defVMob('salmon', { cls: Salmon, ai: 'swim', xp: 1, shadowR: 0.2, stepSound: false, panicMod: 2 });
+defVMob('salmon', { cls: Salmon, ai: 'swim', xp: 1, shadowR: 0.2, stepSound: false, swimAcc: 0.007, panicMod: 1.25 });
 class Pufferfish extends Fish {
   constructor(g, type, x, y, z) { super(g, type, x, y, z); this.puff = 0; this.puffT = 0; this.deflT = 0; }
   layerKey() { return ['pufferfish_small#main', 'pufferfish_medium#main', 'pufferfish_big#main'][this.puff]; }
@@ -62,7 +63,7 @@ class Pufferfish extends Fish {
   setupAnim(md, a) { const P = md.parts, t = this.age + a; for (const n of ['left_blue_fin', 'right_blue_fin', 'left_fin', 'right_fin']) if (P[n]) P[n].zRot = (n.startsWith('left') ? -1 : 1) * (0.2 + Math.cos(t * 1.3) * Math.PI * 0.05); }
   texKey(r) { return r.etex('entity/fish/pufferfish'); }
 }
-defVMob('pufferfish', { cls: Pufferfish, ai: 'swim', xp: 1, shadowR: 0.2, stepSound: false, panicMod: 2 });
+defVMob('pufferfish', { cls: Pufferfish, ai: 'swim', xp: 1, shadowR: 0.2, stepSound: false, swimAcc: 0.007, panicMod: 1.25 });
 // tropical fish: two shapes, six patterns each, a body and a pattern colour (vanilla's packed variant number)
 class TropicalFish extends Fish {
   constructor(g, type, x, y, z) {
@@ -77,7 +78,7 @@ class TropicalFish extends Fish {
   setupAnim(md, a) { if (md.parts.tail) md.parts.tail.yRot = finWag(this, a); }
   texKey(r) { const s = this.shape ? 'b' : 'a'; return r.etexMix([{ p: 'entity/fish/tropical_' + s, c: dyeRGB(DYES[this.base]) }, { p: 'entity/fish/tropical_' + s + '_pattern_' + (this.pattern + 1), c: dyeRGB(DYES[this.pcol]) }]); }
 }
-defVMob('tropical_fish', { cls: TropicalFish, ai: 'swim', xp: 1, shadowR: 0.15, stepSound: false, panicMod: 2 });
+defVMob('tropical_fish', { cls: TropicalFish, ai: 'swim', xp: 1, shadowR: 0.15, stepSound: false, swimAcc: 0.007, panicMod: 1.25 });
 
 // ---- squid and glow squid: drift with their tentacles, squirt ink when hurt -------------------------------------
 class Squid extends VMob {
@@ -85,7 +86,20 @@ class Squid extends VMob {
   think(c) {
     this.tent += this.tentSpd;
     if (this.tent > Math.PI * 2) { this.tent -= Math.PI * 2; if (Math.random() < 0.1) this.tentSpd = 0.1 + Math.random() * 0.1; }
-    if (this.panic > 0) { this.panic--; c.mod = 3; if (!this.goal || this.age % 10 === 0) this.goal = this.randomGoal(8, 4); c.goal = this.goal; return; }
+    // (fleeing, vanilla's SquidFleeGoal throws it straight away from the attacker within 10 blocks at the raw offset
+    // x 3 / 20 a stroke (its normalize() is thrown away), the 3 lowered past 5 blocks: 0.45 b/t at 3, 1 at 10;
+    // kept flat if that spot is air, the last flee way kept if it is neither water nor air; pushed on the stroke half)
+    if (this.panic > 0) {
+      this.panic--;
+      const a = this.lastAttacker, d = a && !a.dead && a.pos ? [this.pos[0] - a.pos[0], this.pos[1] - a.pos[1], this.pos[2] - a.pos[2]] : null, L = d ? Math.hypot(d[0], d[1], d[2]) : 99;
+      if (this.inWater && L > 0.01 && L < 10) {
+        const w = this.world, fx = Math.floor(this.pos[0] + d[0]), fy = Math.floor(this.pos[1] + d[1]), fz = Math.floor(this.pos[2] + d[2]), air = w.getBlock(fx, fy, fz) === 0;
+        if (air) d[1] = 0;
+        if (air || w.waterAt(fx, fy, fz)) { const l = Math.hypot(d[0], d[1], d[2]); this.fleeV = l > 0.01 ? [d[0] / l, d[1] / l, d[2] / l, Math.max(1, l * (3 - Math.max(0, L - 5) / 5) / 4)] : null; }
+        const f = this.fleeV;
+        if (f) { if (this.tent < Math.PI) { c.mod = f[3]; c.goal = [this.pos[0] + f[0] * 4, this.pos[1] + f[1] * 4, this.pos[2] + f[2] * 4]; } return; }
+      }
+    } else this.fleeV = null;
     // a push each tentacle stroke, then drift
     if (this.tent < Math.PI && this.inWater) { if (!this.goal || this.near(this.goal, 1.5) || Math.random() < 0.01) this.goal = this.randomGoal(10, 4); c.goal = this.goal; }
   }
@@ -106,8 +120,9 @@ class Squid extends VMob {
   }
   texKey(r) { return r.etex('entity/squid/' + this.type + (this.baby ? '_baby' : '')); }
 }
-defVMob('squid', { cls: Squid, ai: 'swim', xp: 2, shadowR: 0.4, stepSound: false, speed3: 1.2 });
-defVMob('glow_squid', { cls: Squid, ai: 'swim', xp: 2, shadowR: 0.4, stepSound: false, speed3: 1.2, bright: true });
+// (a vanilla squid's stroke throws it along at 0.2 blocks a tick, which then dies away)
+defVMob('squid', { cls: Squid, ai: 'swim', xp: 2, shadowR: 0.4, stepSound: false, swimAcc: 0.02 });
+defVMob('glow_squid', { cls: Squid, ai: 'swim', xp: 2, shadowR: 0.4, stepSound: false, swimAcc: 0.02, bright: true });
 Object.defineProperty(VMOB.glow_squid, 'bright', { get() { return true; } });
 
 // ---- dolphins: fast swimmers that need air, leap out of the water, give the player Dolphin's Grace -------------------
@@ -127,9 +142,10 @@ class Dolphin extends VMob {
     }
     if (this.breath <= 0 && this.age % 20 === 0) this.hurt(2, { type: 'drown' });
     // swim alongside a swimming player, grant Dolphin's Grace
-    if (p.inWater && !p.creative && this.distTo(p) < 10) {
-      if (p.addEffect && (p.swimming || p.sprinting) && this.age % 20 === 0) p.addEffect('dolphins_grace', 0, 100);
-      if (this.distTo(p) > 3) { c.goal = [p.pos[0], p.pos[1], p.pos[2]]; c.mod = 1.5; c.look = p; return; }
+    // (vanilla DolphinSwimWithPlayerGoal at speed 4 runs only while the player is swimming, not just in the water)
+    if (p.inWater && p.swimming && !p.creative && this.distTo(p) < 10) {
+      if (p.addEffect && this.age % 20 === 0) p.addEffect('dolphins_grace', 0, 100);
+      if (this.distTo(p) > 3) { c.goal = [p.pos[0], p.pos[1], p.pos[2]]; c.mod = 4; c.look = p; return; }
     }
     // leap out of the water now and then
     if (Math.random() < 1 / 300 && !inWaterAt(w, this.pos[0], this.pos[1] + 2, this.pos[2]) && inWaterAt(w, this.pos[0], this.pos[1], this.pos[2])) {
@@ -153,7 +169,8 @@ class Dolphin extends VMob {
   texKey(r) { return r.etex('entity/dolphin/dolphin' + (this.baby ? '_baby' : '')); }
   ambientKind() { return this.inWater ? 'ambient_water' : 'ambient'; }
 }
-defVMob('dolphin', { cls: Dolphin, ai: 'swim', xp: 2, shadowR: 0.5, stepSound: false, speed3: 2.4, fights: true, T: { attack: 3 } });
+// (vanilla: speed 1.2 x 0.02 in water; swimming with a player at 4 times that)
+defVMob('dolphin', { cls: Dolphin, ai: 'swim', xp: 2, shadowR: 0.5, stepSound: false, swimAcc: 0.024, fights: true, T: { attack: 3 } });
 
 // ---- axolotls: play dead, hunt fish and drowned, help players fight underwater --------------------------------------
 const AXOLOTL_COLORS = ['lucy', 'wild', 'gold', 'cyan', 'blue'];
@@ -223,8 +240,9 @@ class Axolotl extends VMob {
   texKey(r) { return r.etex('entity/axolotl/axolotl_' + AXOLOTL_COLORS[this.variant | 0] + (this.baby ? '_baby' : '')); }
   ambientKind() { return this.inWater ? 'idle_water' : 'idle_air'; }
 }
-// on land vanilla axolotls crawl (their stroll speed there is 0.15 of the 0.5 they swim with): landSpeedMul
-defVMob('axolotl', { cls: Axolotl, food: 'axolotl_food', xp: 2, shadowR: 0.3, stepSound: false, waterOk: true, speed3: 1.6, landSpeedMul: 0.015, fights: true, T: { attack: 2 } });
+// on land vanilla axolotls crawl (their stroll speed there is 0.15 of the 0.5 they swim with): landSpeedMul;
+// in the water they get 0.1 x 0.5 x 0.5 a tick
+defVMob('axolotl', { cls: Axolotl, food: 'axolotl_food', xp: 2, shadowR: 0.3, stepSound: false, waterOk: true, swimAcc: 0.025, landSpeedMul: 0.015, fights: true, T: { attack: 2 } });
 
 // ---- nautiluses: saddled underwater mounts that dash; zombie nautiluses carry drowned ------------------------------------
 const NAUTILUS_ARMOR = { copper_nautilus_armor: 'copper', iron_nautilus_armor: 'iron', golden_nautilus_armor: 'gold', diamond_nautilus_armor: 'diamond', netherite_nautilus_armor: 'netherite' };
@@ -280,8 +298,9 @@ class Nautilus extends VMob {
 }
 // food from a bucket of fish leaves the water bucket behind
 function swapBucketFood(g, p, held) { if (/_bucket$/.test(ITEMS[held.id].key)) swapHeld(g, p, 'water_bucket'); else useOne(g, p); }
-defVMob('nautilus', { cls: Nautilus, food: 'nautilus_food', xp: 2, shadowR: 0.5, stepSound: false, speed3: 1.4 });
-defVMob('zombie_nautilus', { cls: Nautilus, xp: 5, shadowR: 0.5, stepSound: false, speed3: 1.4, T: { hostile: true } });
+// (vanilla: 0.011 x their speed a tick in the water)
+defVMob('nautilus', { cls: Nautilus, food: 'nautilus_food', xp: 2, shadowR: 0.5, stepSound: false, swimAcc: 0.011 });
+defVMob('zombie_nautilus', { cls: Nautilus, xp: 5, shadowR: 0.5, stepSound: false, swimAcc: 0.012, T: { hostile: true } });
 
 // ---- guardians and elder guardians: charge a laser at what they see in the water -----------------------------------------
 class Guardian extends VMob {

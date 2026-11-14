@@ -595,7 +595,7 @@ function cmdExec(g, text, src) {
   const ctx = src ? { g, pos: [...src.pos], rot: src.rot || [0, 0], entity: src.entity || null, src, name: src.name, say: (m, color, always = false) => src.say(m, always) }
     : { g, pos: [...p.pos], rot: [p.yaw, p.pitch], entity: p, say: (m, color = '#AAAAAA', always = false) => { if (always || g.rule('send_command_feedback')) ui.message(m, color); } };
   const err = (m) => { if (src) src.fail(m); else ui.message(m, '#FF5555'); return false; };
-  if (!src && !g.cheats && !['help', 'seed', 'me', 'msg', 'tell', 'w', 'list', 'trigger', 'random'].includes(cmd)) return err('未知或不完整的命令，错误见下\n…/' + cmd + '<--[此处]');
+  if (!src && !g.cheats && !['help', 'seed', 'me', 'msg', 'tell', 'w', 'list', 'trigger', 'random'].includes(cmd) && !(self.CMD_FREE && CMD_FREE.has(cmd))) return err('未知或不完整的命令，错误见下\n…/' + cmd + '<--[此处]');
   const fn = CMD_RUN[cmd];
   if (!fn) return err(`未知或不完整的命令「${cmd}」。输入 /help 查看命令`);
   try { fn.call(g, ctx, a); return true; } catch (e) { if (e instanceof CmdError) return err(e.message); err('执行命令时出现意外错误：' + e.message); console.error(e); return false; }
@@ -726,7 +726,7 @@ Game.prototype.strikeLightning = function (x, y, z) {
   for (let i = 0; i < 12; i++) this.particles.spawn('smoke', x + (Math.random() - 0.5), y + Math.random() * 2, z + (Math.random() - 0.5), 0, 0.05, 0);
   if (this.difficulty > 0 && this.rule('fire_spread_radius_around_player') !== 0) {
     const bx = Math.floor(x), by = Math.floor(y), bz = Math.floor(z);
-    if (!w.getBlock(bx, by, bz) && BLOCKS[w.getBlock(bx, by - 1, bz)].solid) w.setBlock(bx, by, bz, 171, 0);
+    if (!w.getBlock(bx, by, bz) && BLOCKS[w.getBlock(bx, by - 1, bz)].solid) w.setBlock(bx, by, bz, this.fireIdAt(bx, by, bz), 0);
   }
   for (const e of [p, ...this.entities]) {
     if (!(e instanceof Living) || e.dead || e.deathTime) continue;

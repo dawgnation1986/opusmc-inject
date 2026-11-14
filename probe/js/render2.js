@@ -171,12 +171,14 @@ Renderer.prototype.drawSprites = function (list, env, right, up) {
   if (!list.length) return;
   const mb = this.spriteBuf; mb.reset();
   // a sprite may be rectangular (w/h), upright-only (cyl: turns with the camera yaw but stays vertical)
-  // and animated (anim = frame count of an animated tile)
+  // and animated (anim = frame count of an animated tile); front: moved that far toward the camera (a layer over another)
   const hr = Math.hypot(right[0], right[2]) || 1, flatR = [right[0] / hr, 0, right[2] / hr], worldUp = [0, 1, 0];
+  const toCam = [right[1] * up[2] - right[2] * up[1], right[2] * up[0] - right[0] * up[2], right[0] * up[1] - right[1] * up[0]];
   for (const s of list) {
     const R = s.cyl ? flatR : right, U = s.cyl ? worldUp : up, sw = s.w || s.size, sh = s.h || s.size;
     const r = [R[0] * sw, R[1] * sw, R[2] * sw], u = [U[0] * sh, U[1] * sh, U[2] * sh];
-    const [x, y, z] = s.pos, c = s.col || [255, 255, 255], L = s.bright ? 255 : 200, an = s.anim || 0;
+    const f = s.front || 0, x = s.pos[0] + toCam[0] * f, y = s.pos[1] + toCam[1] * f, z = s.pos[2] + toCam[2] * f;
+    const c = s.col || [255, 255, 255], L = s.bright ? 255 : 200, an = s.anim || 0;
     mb.v(x - r[0] - u[0], y - r[1] - u[1], z - r[2] - u[2], 0, 1, s.layer, 0, c[0], c[1], c[2], 255, L, L, an);
     mb.v(x + r[0] - u[0], y + r[1] - u[1], z + r[2] - u[2], 1, 1, s.layer, 0, c[0], c[1], c[2], 255, L, L, an);
     mb.v(x + r[0] + u[0], y + r[1] + u[1], z + r[2] + u[2], 1, 0, s.layer, 0, c[0], c[1], c[2], 255, L, L, an);

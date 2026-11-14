@@ -62,12 +62,59 @@ function bindInput(g) {
     g.lockFails = (g.lockFails || 0) + 1;
   });
   const freeMouse = () => g.lockFails > 0 && !locked() && !touchOn(g);
+  // a button let go where the page never heard it (Edge's mouse gestures take the right button's mouseup): the buttons
+  // the event says are down win - before, use stayed held and blocks went on being placed with nothing pressed
+  const syncButtons = (e) => {
+    if (typeof e.buttons !== 'number' || !g.rawMouse) return;
+    for (let b = 0; b < 3; b++) if (g.rawMouse[b] && !(e.buttons & [1, 4, 2][b])) {
+      g.rawMouse[b] = false;
+      for (const act of bindingsFor(g, 'Mouse' + b)) releaseAction(g, act);
+    }
+    unlockIfUp();
+  };
+  // a screen opened by a held button (right click on a chest, a villager): the lock is let go once the button is up
+  // (ui.open, g.unlockOnUp). Let go at once, the pointer jumped back with the button down - to Edge a right-button
+  // drag, its mouse gestures closed or left the page ("右键箱子 / 村民闪退", feedback 11-01 to 11-08)
+  const unlockIfUp = () => {
+    if (!g.unlockOnUp || (g.rawMouse && (g.rawMouse[0] || g.rawMouse[1] || g.rawMouse[2]))) return; // (side buttons aside)
+    g.unlockOnUp = false;
+    if (ui.screen && !ui.screen.keepPointer) g.releasePointer();
+  };
+  // a spike: one event far off the other way to the last (Chrome's lock without raw input as it puts the hidden pointer
+  // back). A fast flick is no spike - every move past 400 was dropped, the view did not follow (feedback 11-01 to 11-08);
+  // with raw input (g.lockRaw) nothing is dropped, as in vanilla
+  let lastMove = [0, 0], lastMoveT = 0;
+  const spike = (v, last) => Math.abs(v) > 400 && Math.abs(last) >= 8 && last * v < 0 && !(g.lockRaw && locked());
+  // the mouse left free (freeMouse): held against an edge of the page the view keeps turning that way - the pointer
+  // cannot go on and movementX stays 0 there ("鼠标到屏幕边缘就转不动", phones / tablets with a mouse, browsers that
+  // refuse the lock; the pointer itself is hidden while playing, ui.draw)
+  let edge = null, edgeT = 0, edgeRaf = 0;
+  const edgeTurn = (t) => {
+    if (!edge || !freeMouse() || ui.screen || g.state !== 'play') { edge = null; edgeRaf = 0; edgeT = 0; return; }
+    const dt = edgeT ? Math.min(0.1, (t - edgeT) / 1000) : 0; edgeT = t;
+    const p = g.player, st = g.settings, k = (st.sens * 0.006 + 0.0006) * 450 * dt; // (as 450 px a second)
+    p.yaw -= edge[0] * k * (st.invertX ? -1 : 1);
+    p.pitch = clamp(p.pitch - edge[1] * k * (st.invertY ? -1 : 1), -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001);
+    edgeRaf = requestAnimationFrame(edgeTurn);
+  };
+  // (free mouse: the first move back in the window is the whole way it went outside - dropped, the view jumped by it)
+  let reenter = false;
+  document.addEventListener('mouseout', (e) => { if (!e.relatedTarget) { edge = null; reenter = true; } });
+  window.addEventListener('blur', () => { edge = null; reenter = true; });
   window.addEventListener('mousemove', (e) => {
+    syncButtons(e);
     if ((locked() || freeMouse()) && !ui.screen && g.state === 'play') {
-      const p = g.player, st = g.settings, s = st.sens * 0.006 + 0.0006;
-      if (Math.abs(e.movementX) > 400 || Math.abs(e.movementY) > 400) return; // browser glitch spikes
+      const p = g.player, st = g.settings, s = st.sens * 0.006 + 0.0006, now = performance.now(), last = now - lastMoveT < 100 ? lastMove : [0, 0];
+      if (reenter) { reenter = false; if (!locked()) return; }
+      if (spike(e.movementX, last[0]) || spike(e.movementY, last[1])) return;
+      lastMove = [e.movementX, e.movementY]; lastMoveT = now;
       p.yaw -= e.movementX * s * (st.invertX ? -1 : 1);
       p.pitch = clamp(p.pitch - e.movementY * s * (st.invertY ? -1 : 1), -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001);
+      if (!locked()) {
+        const m = 2, ex = e.clientX <= m ? -1 : e.clientX >= innerWidth - 1 - m ? 1 : 0, ey = e.clientY <= m ? -1 : e.clientY >= innerHeight - 1 - m ? 1 : 0;
+        edge = ex || ey ? [ex, ey] : null;
+        if (edge && !edgeRaf) edgeRaf = requestAnimationFrame(edgeTurn);
+      } else edge = null;
     } else ui.mouseMove(e);
   });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -75,20 +122,35 @@ function bindInput(g) {
   // (Edge's mouse gestures start from a right-button drag on the page: the right button and its menu kept from it)
   window.addEventListener('contextmenu', (e) => { if (e.target !== ui.input) e.preventDefault(); }, true);
   window.addEventListener('mousedown', (e) => { if (e.button === 2 && e.target !== ui.input) e.preventDefault(); }, true);
+  // Edge / 360: their mouse gestures (a right-button drag: back, close the tab) are the browser's, past what the page can
+  // stop - the first right click in a world says where they are turned off (the first 3 sessions)
+  const gestureUA = /Edg\/|QIHU|360SE|360EE/i.test(navigator.userAgent || '');
+  let gestureTold = false;
+  const gestureTip = () => {
+    if (!gestureUA || gestureTold) return;
+    gestureTold = true;
+    const n = g.settings.gestureTip || 0;
+    if (n >= 3) return;
+    g.settings.gestureTip = n + 1; g.saveSettings();
+    ui.message('[提示] 浏览器的「鼠标手势」会把按住右键拖动当成后退或关闭网页；用不到的话，可以在浏览器设置里搜索「鼠标手势」关掉', '#FFFF55');
+  };
   window.addEventListener('mousedown', (e) => {
     if (e.target === ui.input) return;
     Sound.init();
+    syncButtons(e);
     if (ui.screen) { ui.mouseDown(e); return; }
     if (g.state !== 'play') return;
     if (!locked()) { g.capturePointer(); if (!freeMouse()) return; }
     if (e.button === 1) e.preventDefault();
     (g.rawMouse || (g.rawMouse = [false, false, false]))[e.button] = true;
     for (const act of bindingsFor(g, 'Mouse' + e.button)) pressAction(g, act, e);
+    if (e.button === 2) gestureTip();
   });
   window.addEventListener('mouseup', (e) => {
     if (ui.screen) { ui.mouseUp(e); }
     if (g.rawMouse) g.rawMouse[e.button] = false;
     for (const act of bindingsFor(g, 'Mouse' + e.button)) releaseAction(g, act);
+    unlockIfUp();
   });
   window.addEventListener('wheel', (e) => {
     if (ui.screen) { ui.wheelShift = e.shiftKey; ui.wheel(e.deltaY); return; }

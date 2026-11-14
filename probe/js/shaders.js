@@ -29,6 +29,17 @@ const FX_CFG = [
 
 // material ids per texture layer (red channel of the material texture)
 const MAT_LEAVES = 1, MAT_PLANT = 2, MAT_WATER = 3, MAT_EMIT = 4, MAT_LAVA = 5;
+// plants too: still (they stack - sugar cane, vines, kelp), a double plant's lower and upper half (they sway together)
+const MAT_PLANT_STILL = 6, MAT_PLANT_LOW = 7, MAT_PLANT_UP = 8;
+// a plant's sway (shaded terrain and shadow vertex shaders): from the vertex's place, so blocks' shared corners move alike;
+// the top of a plant (texture top) by k 1, a double plant's middle by 0.5 and its top by 1
+const PLANT_WAVE = `
+  if (mat == ${MAT_PLANT} || mat == ${MAT_PLANT_LOW} || mat == ${MAT_PLANT_UP}) {
+    float k = a_uv.y < 0.1 ? (mat == ${MAT_PLANT_LOW} ? 0.5 : 1.0) : (mat == ${MAT_PLANT_UP} && a_uv.y > 0.9 ? 0.5 : 0.0);
+    vec3 p0 = wp.xyz;
+    wp.x += (sin(t * 1.9 + p0.x * 0.55 + p0.z * 0.45) * 0.09 + sin(t * 3.7 + p0.x * 1.3) * 0.03) * k;
+    wp.z += cos(t * 1.6 + p0.z * 0.5 + p0.x * 0.35) * 0.06 * k;
+  }`;
 // surface classes (green channel): how smooth / shiny the block is, worked out from its texels
 const PBR_STONE = 1, PBR_ROUGH = 2, PBR_POLISHED = 3, PBR_METAL = 4, PBR_GEM = 5, PBR_ORE = 6, PBR_SAND = 7,
   PBR_DIRT = 8, PBR_GRASS = 9, PBR_SNOW = 10, PBR_ICE = 11, PBR_WOOD = 12, PBR_OBSIDIAN = 13, PBR_CONCRETE = 14,
@@ -251,12 +262,9 @@ void main(){
       wp.x += sin(t * 1.6 + wp.z * 0.7 + wp.y * 0.4) * 0.035;
       wp.z += cos(t * 1.25 + wp.x * 0.6 + wp.y * 0.3) * 0.035;
       wp.y += sin(t * 2.1 + wp.x * 0.9 + wp.z * 0.8) * 0.018;
-    } else if (mat == ${MAT_PLANT} && a_uv.y < 0.1) {
-      float s = sin(t * 1.9 + wp.x * 0.55 + wp.z * 0.45) * 0.09 + sin(t * 3.7 + wp.x * 1.3) * 0.03;
-      wp.x += s; wp.z += cos(t * 1.6 + wp.z * 0.5 + wp.x * 0.35) * 0.06;
     } else if (mat == ${MAT_WATER} && fract(wp.y) > 0.5) {
       wp.y += (sin(t * 1.4 + wp.x * 0.85 + wp.z * 0.3) + cos(t * 1.1 + wp.z * 0.75 - wp.x * 0.2)) * 0.022 - 0.045;
-    }
+    }${PLANT_WAVE}
   }
   gl_Position = u_vp * wp;
   v_uv = a_uv;
@@ -408,7 +416,7 @@ void main(){
       sub = 2;
       float f = min(pow2f(c.g - 0.15 * (c.r + c.b)) * 2.5, 1.0);
       sG = f * 0.4; hl = (f * 4.0 + 2.0) * (1.0 - pow2f(pow2f(clamp(1.0 - dot(n, V), 0.0, 1.0))));
-    } else if (v_mat == ${MAT_PLANT}) sub = 1;
+    } else if (v_mat == ${MAT_PLANT} || (v_mat >= ${MAT_PLANT_STILL} && v_mat <= ${MAT_PLANT_UP})) sub = 1;
     else if (v_mat == ${MAT_LAVA}) { emission = lum(c) * 7.48 + 0.5; lm = vec2(0.0); noDir = true; c *= 0.84; }
     else if (v_mat == ${MAT_EMIT}) emission = 2.6 * smoothstep(0.3, 0.92, max(c.r, max(c.g, c.b)));
     lit = fxShade(c, n, v_wpos, V, lm, ao, sub, sG, hl, emission, noDir);
@@ -478,7 +486,7 @@ void main(){
   int mat = int(texelFetch(u_mat, ivec2(int(a_tex.x) & 1023, int(a_tex.x) >> 10), 0).r * 255.0 + 0.5);
   float t = u_time * 0.001;
   if (mat == ${MAT_LEAVES}) { wp.x += sin(t * 1.6 + wp.z * 0.7 + wp.y * 0.4) * 0.035; wp.z += cos(t * 1.25 + wp.x * 0.6 + wp.y * 0.3) * 0.035; }
-  else if (mat == ${MAT_PLANT} && a_uv.y < 0.1) wp.x += sin(t * 1.9 + wp.x * 0.55 + wp.z * 0.45) * 0.09;
+${PLANT_WAVE}
   gl_Position = u_vp * vec4(wp, 1.0);
   v_uv = a_uv; v_layer = a_tex.x; v_ov = a_tex.y;
 }`;
@@ -629,7 +637,7 @@ void main(){
 // Pass A (full resolution): the sky and sun where nothing was drawn, fog, the clouds, then to linear light with the
 // light shafts added. Alpha: how much more this pixel feeds the bloom (distance haze at night / in rain / caves)
 const COMPOSE_FS = POST_HEAD + `
-uniform sampler2D u_color; uniform highp sampler2D u_depth; uniform sampler2D u_clouds; uniform sampler2D u_vol;
+uniform sampler2D u_color; uniform highp sampler2D u_depth; uniform highp sampler2D u_depthO; uniform sampler2D u_clouds; uniform sampler2D u_vol;
 uniform int u_useClouds, u_useVol, u_skyOn, u_fogOn; uniform vec2 u_cloudSlab;
 uniform vec3 u_sunDisc; uniform float u_renderD; uniform float u_yOff;
 uniform vec4 u_fogK;  // rain, eye sky light (smoothed), cave factor, screen brightness
@@ -659,22 +667,29 @@ vec3 aurora(vec3 dir){
   }
   return acc * 0.06 * smoothstep(0.05, 0.3, dir.y);
 }
+// the sky in direction dir: (not darkened below the horizon: the border fog fades the terrain into this same colour)
+vec3 skyCol(vec3 dir){
+  vec3 s = fxSky(dir, true, false);
+  float mu = dot(dir, u_sunVec);
+  s += u_sunDisc * smoothstep(0.99955, 0.99975, mu);
+  if (u_misc.x > 0.0) s += rainbow(dir) * u_misc.x * 0.12;
+  if (u_misc.z > 0.0) s += aurora(dir) * u_misc.z;
+  return s;
+}
 void main(){
-  vec3 c = texture(u_color, v_uv).rgb;
+  vec4 c4 = texture(u_color, v_uv);
+  vec3 c = c4.rgb;
   float d = texture(u_depth, v_uv).r;
   bool hand = d < 0.01, sky = d >= 0.99999;
   vec3 ray = worldPos(v_uv, sky ? 0.99999 : d) - u_cam; vec3 dir = normalize(ray);
   float dist = length(ray);
   float bf = 1.0;
   if (!hand) {
+    // translucent blocks (stained glass, ice ...) with only sky behind them: the sky by what they let through (alpha:
+    // render.js drawTranslucent), it was black
+    if (!sky && u_skyOn == 1 && texture(u_depthO, v_uv).r >= 0.99999) c += skyCol(dir) * clamp(c4.a, 0.0, 1.0);
     if (sky && u_skyOn == 1) {
-      // (not darkened below the horizon: the border fog fades the terrain into this same colour)
-      vec3 s = fxSky(dir, true, false);
-      float mu = dot(dir, u_sunVec);
-      s += u_sunDisc * smoothstep(0.99955, 0.99975, mu);
-      if (u_misc.x > 0.0) s += rainbow(dir) * u_misc.x * 0.12;
-      if (u_misc.z > 0.0) s += aurora(dir) * u_misc.z;
-      c += s;
+      c += skyCol(dir);
     } else if (!sky && u_fogOn == 1) {
       float rain = u_fogK.x;
       // cave fog
@@ -907,12 +922,16 @@ class ShaderPack {
       }
       return out;
     };
+    // the textures of blocks that give no light: a light block's faces shared with them don't glow (a jack o'lantern's
+    // pumpkin sides and top, a lit furnace's sides and top - every pumpkin and unlit furnace glowed)
+    const dimLayers = new Set();
+    for (const b of BLOCKS) if (b && b.tex && !(b.light >= 10)) for (const l of [].concat(b.tex)) dimLayers.add(l);
     for (const b of BLOCKS) {
       if (!b || !b.tex) continue;
       const layers = Array.isArray(b.tex) ? b.tex : [b.tex];
       let v = 0;
       if (b.key.endsWith('leaves')) v = MAT_LEAVES;
-      else if (b.shape === SH_CROSS || b.shape === SH_CROP) v = MAT_PLANT;
+      else if (b.shape === SH_CROSS || b.shape === SH_CROP) v = b.key === 'sugar_cane' ? MAT_PLANT_STILL : MAT_PLANT;
       else if (b.id === WATER) v = MAT_WATER;
       else if (b.id === LAVA || b.key === 'magma_block') v = MAT_LAVA;
       else if (b.light >= 10) v = MAT_EMIT;
@@ -928,7 +947,27 @@ class ShaderPack {
           mark(l, v);
         }
       }
-      else for (const l of layers) mark(l, v);
+      else for (const l of layers) if (v !== MAT_EMIT || !dimLayers.has(l)) mark(l, v);
+    }
+    // plants drawn from vanilla models as crosses (tall grass, bushes, most flowers and saplings): plants too - they were
+    // dark, with no light through them and no sway, beside the short grass. A double plant's halves sway together; the
+    // ones that stack (vines, kelp, roots) are lit as plants but stay still, each block swaying alone came apart at the joints
+    // (only those that stack: not crimson / warped roots or a bamboo sapling)
+    const STACKS = /^(weeping|twisting|cave)_vines|^kelp|seagrass|^hanging_roots$|dripleaf_stem|^bamboo$|hanging_moss/;
+    for (const b of BLOCKS) {
+      if (!b || b.shape !== SH_MODEL || b.solid || !b.needsSupport || b.light >= 10) continue;
+      const halves = new Map();
+      let cross = true;
+      for (let meta = 0, n = b.states ? b.states.length : 1; meta < n && cross; meta++) {
+        let st = null;
+        try { st = vanillaState(b, meta, null); } catch (e) { continue; }
+        if (!VM.has(st.key)) { cross = false; break; }
+        for (const qs of VM.select(st.key, st.p, 0)) for (const q of qs) { if (q.dir >= 0) cross = false; halves.set(q.layer, st.p && st.p.half); }
+      }
+      if (!cross) continue;
+      // (a melon / pumpkin stem's texture is also the straight part of the attached stem, whose bent part can't sway)
+      const still = STACKS.test(b.key) || /^(melon|pumpkin)_stem$/.test(b.key);
+      for (const [l, half] of halves) mark(l, still ? MAT_PLANT_STILL : half === 'upper' ? MAT_PLANT_UP : half === 'lower' ? MAT_PLANT_LOW : MAT_PLANT);
     }
     for (const k of ['water_still', 'water_flow']) if (ASSETS.tiles[k] !== undefined) mark(ASSETS.tiles[k], MAT_WATER);
     for (const k of ['lava_still', 'lava_flow']) if (ASSETS.tiles[k] !== undefined) mark(ASSETS.tiles[k], MAT_LAVA);
@@ -1454,7 +1493,7 @@ class ShaderPack {
     const lin = this.target('lin', W, H, 'hdr'), black = this.blackTex();
     const skyOn = env.sky === 'overworld' && !game.headInWater && !game.headInLava ? 1 : 0;
     this.pass(this.pCompose, lin, (bind, P) => {
-      bind('u_color', color); bind('u_depth', depth); bind('u_clouds', clouds || black); bind('u_vol', vol || black); bind('u_noise', this.noiseTex());
+      bind('u_color', color); bind('u_depth', depth); bind('u_depthO', this.copyDepth); bind('u_clouds', clouds || black); bind('u_vol', vol || black); bind('u_noise', this.noiseTex());
       this.setSky(P);
       gl.uniform1i(P.u.u_useClouds, clouds ? 1 : 0); gl.uniform1i(P.u.u_useVol, vol ? 1 : 0);
       gl.uniform1i(P.u.u_skyOn, skyOn); gl.uniform1i(P.u.u_fogOn, !this.special && env.sky === 'overworld' ? 1 : 0);

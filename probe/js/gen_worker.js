@@ -10,7 +10,7 @@
 //   {type:'biomes', list: [[cx, cz]...], dim, id} -> {type:'biomes', id, qy, data} (3D biomes, 16 * qy a chunk)
 (function () {
   const inWorker = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
-  if (inWorker) importScripts('worldgen_data.js', 'blockdata.js', 'worldgen.js', 'structures_data.js', 'structgen.js', 'structtypes.js');
+  if (inWorker) importScripts('worldgen_data.js', 'blockdata.js', 'modapi.js', ...(new URLSearchParams(self.location.search).get('mods') || '').split(',').filter((m) => /^[a-z0-9_]{1,32}$/.test(m)).map((m) => '../mods/' + m + '/data.js'), 'worldgen.js', 'structures_data.js', 'structgen.js', 'structtypes.js');
 
   function makeGenCore() {
     let gen = null, seed = null, palette = null, initErr = null;
@@ -24,6 +24,9 @@
     return async function handle(m, post) {
       try {
         if (m.type === 'init') {
+          // (again for another world - GenPool.reseed: the other dimensions' generators were the last world's)
+          for (const k in gens) delete gens[k];
+          gen = null; initErr = null;
           seed = m.seed; palette = m.palette;
           if (m.smap && self.SG) { SG.setStateMap(m.smap, m.swl); SG.setPalette(m.palette); }
           gen = new WG.Generator(BigInt(m.seed), self.WG_DATA, m.palette);

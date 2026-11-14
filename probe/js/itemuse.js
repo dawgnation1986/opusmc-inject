@@ -46,6 +46,8 @@ Game.prototype.useOnBlockItem = function (held, def) {
     if (cu && cu.waxed) { this.swapBlock(x, y, z, cu.name(cu.stage, false)); Sound.ev('item.axe.wax_off', c, 1, 1); this.particles.spawn('crit', ...c, 0, 0.1, 0); this.damageHeld(1); p.swing(); return true; }
     if (cu && cu.stage > 0) { this.swapBlock(x, y, z, cu.name(cu.stage - 1, false)); Sound.ev('item.axe.scrape', c, 1, 1); this.damageHeld(1); p.swing(); return true; }
   }
+  // shovels: a lit campfire put out (ShovelItem.useOn, not from below)
+  if (def.tool && def.tool.type === 'shovel' && t.face !== 2 && /(^|_)campfire$/.test(tk) && this.dowseCampfire && this.dowseCampfire(x, y, z, 'block.fire.extinguish')) { this.damageHeld(1); p.swing(); return true; }
   // shovels: a path from grass or dirt (with air above)
   if (def.tool && def.tool.type === 'shovel' && PATHABLE.has(tk) && t.face !== 2 && !w.getBlock(x, y + 1, z) && BID.dirt_path !== undefined) {
     w.setBlock(x, y, z, BID.dirt_path, 0); Sound.ev('item.shovel.flatten', c, 1, 1); this.damageHeld(1); p.swing(); this.flushMesh(); return true;
@@ -88,6 +90,9 @@ class Thrown extends Arrow {
         if (d > 2.4 || d < 1e-3) continue;
         const f = (1 - d / 2.4) * 1.22;
         e.vel[0] += dx / d * f; e.vel[1] += dy / d * f + 0.3; e.vel[2] += dz / d * f;
+        // (vanilla ServerPlayer.onExplosionHit: a player's fall is counted from here only, for at least 2 seconds - a
+        // wind charge's, not a breeze's; a mob's fall counts whole)
+        if (e === g.player && !(this.shooter instanceof Mob)) { e.impulseY = e.pos[1]; e.impulseGrace = Math.max(e.impulseGrace || 0, 40); }
         if (e === g.player) e.fallDist = 0;
       }
     } else { // eggs: a chick now and then
@@ -152,23 +157,63 @@ Game.prototype.usingTick = function (st) {
     }
   }
 };
-// a firework rocket: flies up for its flight time, then bursts
+// a firework rocket: flies up for its flight time, then bursts. Shot from a crossbow (vel given) it flies straight
+// at that speed (vanilla isShotAtAngle) and bursts on what it hits - against a block only with stars, else it waits
+// out its time there (it had been an arrow with a flag nothing read: no burst, no damage)
 class FireworkRocket extends Entity {
-  constructor(game, x, y, z, stack) {
+  constructor(game, x, y, z, stack, vel, shooter) {
     super(game, x, y, z, 0.25, 0.25);
     this.life = 10 * ((stack && stack.flight) || 1) + 6 + Math.floor(Math.random() * 6) + Math.floor(Math.random() * 7);
-    this.vel = [(Math.random() - 0.5) * 0.023, 0.05, (Math.random() - 0.5) * 0.023];
+    this.vel = vel ? [...vel] : [(Math.random() - 0.5) * 0.023, 0.05, (Math.random() - 0.5) * 0.023];
+    this.shot = !!vel; this.shooter = shooter || null; this.stackRef = stack ? { ...stack } : null;
     this.spriteLayer = T('i_firework_rocket');
   }
   tick() {
     this.savePrev(); this.age++;
-    this.vel[0] *= 1.15; this.vel[2] *= 1.15; this.vel[1] += 0.04;
-    for (let i = 0; i < 3; i++) this.pos[i] += this.vel[i];
+    if (this.shot) this.shotMove();
+    else { this.vel[0] *= 1.15; this.vel[2] *= 1.15; this.vel[1] += 0.04; for (let i = 0; i < 3; i++) this.pos[i] += this.vel[i]; }
     if (this.age % 2 === 0) this.game.particles.spawn('smoke', this.pos[0], this.pos[1] - 0.3, this.pos[2], 0, -0.05, 0);
-    if (this.age >= this.life || this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1]), Math.floor(this.pos[2]))) {
+    if (this.age >= this.life || (!this.shot && this.world.getBlock(Math.floor(this.pos[0]), Math.floor(this.pos[1]), Math.floor(this.pos[2])))) {
       this.dead = true;
       Sound.ev('entity.firework_rocket.blast', this.pos, 3, 1);
       for (let i = 0; i < 40; i++) { const a = Math.random() * Math.PI * 2, b = Math.acos(Math.random() * 2 - 1), s = 0.3; this.game.particles.spawn('crit', ...this.pos, Math.sin(b) * Math.cos(a) * s, Math.cos(b) * s, Math.sin(b) * Math.sin(a) * s); }
+      this.blastDamage();
+    }
+  }
+  // a shot rocket's step: what it runs into on the way (a burst next tick: life cut short)
+  shotMove() {
+    if (this.stopped) return;
+    const g = this.game, v = this.vel, n = Math.max(1, Math.ceil(Math.hypot(v[0], v[1], v[2]) / 0.3));
+    const stop = (burst) => { this.stopped = true; if (burst) this.life = Math.min(this.life, this.age + 1); };
+    for (let s = 0; s < n; s++) {
+      const nx = this.pos[0] + v[0] / n, ny = this.pos[1] + v[1] / n, nz = this.pos[2] + v[2] / n;
+      for (const e of [g.player, ...g.entities]) {
+        if (!(e instanceof Living) || e.dead || e.deathTime > 0 || (e === this.shooter && this.age < 5)) continue;
+        const b = e.box();
+        if (nx > b[0] - 0.125 && nx < b[3] + 0.125 && ny > b[1] - 0.125 && ny < b[4] + 0.125 && nz > b[2] - 0.125 && nz < b[5] + 0.125) return stop(true);
+      }
+      const id = this.world.getBlock(Math.floor(nx), Math.floor(ny), Math.floor(nz));
+      if (id && BLOCKS[id].solid) return stop(!!(this.stackRef && this.stackRef.explosions && this.stackRef.explosions.length));
+      this.pos[0] = nx; this.pos[1] = ny; this.pos[2] = nz;
+    }
+  }
+  // vanilla dealExplosionDamage: with stars, 5 + 2 a star to every living thing within 5 blocks it can see, less with
+  // the distance
+  blastDamage() {
+    const ex = this.stackRef && this.stackRef.explosions, g = this.game;
+    if (!ex || !ex.length || g.net) return;
+    const dmg = 5 + ex.length * 2, o = this.pos;
+    for (const e of [g.player, ...g.entities]) {
+      if (!(e instanceof Living) || e.dead || e.deathTime > 0) continue;
+      const d = Math.hypot(e.pos[0] - o[0], e.pos[1] - o[1], e.pos[2] - o[2]);
+      if (d > 5) continue;
+      const seen = [0, 0.5].some((k) => {
+        const to = [e.pos[0] - o[0], e.pos[1] + e.h * k - o[1], e.pos[2] - o[2]], l = Math.hypot(...to);
+        if (l < 1e-6) return true;
+        const hit = g.raycast(o, to.map((c) => c / l), l, false);
+        return !hit || hit.t >= l;
+      });
+      if (seen) e.hurt(dmg * Math.sqrt((5 - d) / 5), { type: 'firework', attacker: this.shooter, knockFrom: [...o], knock: 0, player: this.shooter === g.player });
     }
   }
 }
@@ -183,6 +228,15 @@ Mob.prototype.interact = function (p, held) {
       if (this.game.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; }
       return true;
     }
+  }
+  // flint and steel or a fire charge lights a creeper: it swells to the end whatever its target does (vanilla
+  // Creeper.mobInteract, #creeper_igniters)
+  if (this.type === 'creeper' && (k === 'flint_and_steel' || k === 'fire_charge') && !this.dead && !(this.deathTime > 0)) {
+    Sound.ev(k === 'fire_charge' ? 'item.firecharge.use' : 'item.flintandsteel.use', this.pos, 1, Math.random() * 0.4 + 0.8);
+    if (!this.ignited) { this.ignited = true; if (this.fuse < 0) { this.fuse = 0; Sound.fuse(this.pos); } }
+    if (k === 'flint_and_steel') this.game.damageHeld(1);
+    else if (this.game.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; }
+    return true;
   }
   return _iuMobInteract ? _iuMobInteract.call(this, p, held) : false;
 };

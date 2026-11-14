@@ -17,7 +17,9 @@ Game.prototype.makeWorld = function (dim) {
   w.grassMap = this.renderer.grassMap; w.foliageMap = this.renderer.foliageMap;
   w.listener = this;
   w.flat = dim === 'overworld' && !!(this.worldMeta && this.worldMeta.flat);
+  if (w.flat) w.flatTop = this.worldMeta.flatClassic ? 3 : 60; // (the grass layer's height)
   w.structures = !this.worldMeta || this.worldMeta.structures !== false;
+  if (dim === 'end') w.oldPodium = !!(this.worldMeta && this.worldMeta.end && !this.worldMeta.end.podium2);
   return w;
 };
 Game.prototype.dimStoreId = function (dim) { return dim === 'overworld' ? this.worldMeta.id : this.worldMeta.id + '~' + dim; };
@@ -30,6 +32,9 @@ Game.prototype.initDims = async function (meta) {
   if (!meta.dims.overworld) meta.dims.overworld = { blockEntities: meta.blockEntities || {}, mobs: meta.mobs || [] };
   meta.portals = meta.portals || { overworld: [], nether: [] };
   meta.end = meta.end || { dragonKilled: false, dragonSpawned: false, credits: false };
+  // (podium2: the End is made with vanilla's podium; an End entered before 2026-11-12 keeps its old, higher one so
+  // its saved and newly generated chunks still fit together)
+  if (!meta.end.dragonSpawned && !meta.end.dragonKilled) meta.end.podium2 = true;
   const d = await this.loadDimData(this.dim);
   this.applyDim(d);
 };
@@ -96,7 +101,10 @@ Game.prototype.collectDimSave = function () {
     const ents = (dim === this.dim ? this.entities : d.entities);
     m.dims[dim] = {
       blockEntities: Object.fromEntries(d.blockEntities),
-      mobs: ents.filter(e => !e.dead && this.isSavedEntity(e)).map(e => this.mobRecord(e)).concat(d.pendingMobs || []),
+      // (and the mobs that may despawn, around the player now: vanilla saves every mob with its chunk - they were lost
+      // on every reload. They come back still able to despawn; one in a chunk that unloads is dropped as before.
+      // A mob in its death animation isn't saved, as in vanilla: it came back alive with 0 health and dropped its loot twice)
+      mobs: ents.filter(e => !e.dead && !(e instanceof Mob && e.deathTime > 0) && (this.isSavedEntity(e)|| (e instanceof Mob && !e.remote && !e.p2pMirror && !e.persistent))).map(e => this.mobRecord(e)).concat(d.pendingMobs || []),
     };
     out.push([this.dimStoreId(dim), list]);
   }
@@ -108,7 +116,7 @@ Game.prototype.collectDimSave = function () {
 // the entities a save keeps, and the record each is saved as (restoreMob reads it back)
 Game.prototype.isSavedEntity = function (e) { return (e instanceof Mob && e.persistent) || e instanceof EnderDragon || e instanceof EndCrystal || e.isVehicle || e.keepSaved; };
 Game.prototype.mobRecord = function (e) {
-  return { type: e.type, pos: [...e.pos], yaw: e.yaw, health: e.health, sheared: e.sheared, wool: e.woolColor, baby: e.baby ? e.growT : 0, size: typeof e.size === 'number' ? e.size : undefined, x: e.saveData ? e.saveData() : undefined, ride: e.vehicleRef && !e.remote ? 1 : undefined };
+  return { type: e.type, pos: [...e.pos], yaw: e.yaw, health: e.health, sheared: e.sheared, wool: e.woolColor, baby: e.baby ? e.growT : 0, size: typeof e.size === 'number' ? e.size : undefined, x: e.saveData ? e.saveData() : undefined, ride: e.vehicleRef && !e.remote ? 1 : undefined, np: e instanceof Mob && !e.persistent ? 1 : undefined, ts: e.tsKey, dt: e.deathTime > 0 ? e.deathTime : undefined };
 };
 // Chunks that unload take their entities with them, like vanilla's: the saved kinds go back to the pending
 // list (restored when the chunk loads again, and saved from there), mobs that may despawn are dropped (they
@@ -140,8 +148,14 @@ Game.prototype.restoreMob = function (m) {
     if (m.size && e.setSize) { e.setSize(m.size); e.health = m.health; }
     if (m.x && e.loadData) e.loadData(m.x);
     if (m.ride) e.wantsRide = true; // (seatPassengers puts it back in its boat / minecart)
-    e.persistent = true;
+    e.persistent = !m.np;
+    // a trial spawner's mob: tracked by its spawner again (items3.js tickTrialSpawners; m.ts names the trial, so
+    // one from an earlier trial goes to a list nobody reads)
+    if (m.ts) { e.tsKey = m.ts; const tsm = this._tsMobs || (this._tsMobs = new Map()); (tsm.get(m.ts) || tsm.set(m.ts, []).get(m.ts)).push(e); }
   } else if (m.x && e.loadData) e.loadData(m.x); // boats, minecarts
+  // one saved while dying goes on dying (vanilla keeps DeathTime / DragonDeathTime): it came back alive at 0 health -
+  // a dragon /kill-ed and saved during its 10 s death hung there and only died when hit
+  if (e instanceof Living && m.health != null && m.health <= 0) e.deathTime = Math.max(1, m.dt || 1);
   return e;
 };
 
@@ -274,13 +288,14 @@ Game.prototype.buildPortalNear = function (tx, tz) {
     return true;
   };
   let spot = null;
+  const sea = w.flat ? 1 : SEA; // (a classic superflat's ground is at y 3)
   outer: for (let r = 0; r <= 12; r += 2) for (let a = 0; a < (r ? 8 : 1); a++) {
     const x = tx + Math.round(Math.cos(a / 8 * Math.PI * 2) * r), z = tz + Math.round(Math.sin(a / 8 * Math.PI * 2) * r);
     if (nether) { for (let y = 100; y > 33; y--) if (fits(x, y, z)) { spot = [x, y, z]; break outer; } }
-    else { const y = w.surfaceY(x, z) + 1; if (y > SEA && y < HEIGHT - 16 && fits(x, y, z)) { spot = [x, y, z]; break outer; } }
+    else { const y = w.surfaceY(x, z) + 1; if (y > sea && y < HEIGHT - 16 && fits(x, y, z)) { spot = [x, y, z]; break outer; } }
   }
   if (!spot) {
-    let y = nether ? 70 : Math.max(SEA + 2, w.surfaceY(tx, tz) + 1);
+    let y = nether ? 70 : Math.max(sea + 2, w.surfaceY(tx, tz) + 1);
     spot = [tx, y, tz];
     for (let i = -2; i <= 3; i++) for (let k = -2; k <= 2; k++) {
       w.setBlock(tx + i, y - 1, tz + k, 28, 0, 0);
@@ -302,6 +317,13 @@ Game.prototype.buildPortalNear = function (tx, tz) {
 Game.prototype.fillEndFrame = function (x, y, z) {
   const w = this.world;
   w.setMeta(x, y, z, w.getMeta(x, y, z) | 4);
+  // whoever stands in the eye's place goes up onto it (vanilla Block.pushEntitiesUp) - stood in it, a player was pushed
+  // down to crawling: "放末影之眼被卡成趴下 / 卡进去", feedback 11-04
+  for (const e of [this.player, ...this.entities]) {
+    if (!e || e.dead || e.noClip || e.vehicle) continue;
+    const b = e.box();
+    if (b[0] < x + 0.75 && b[3] > x + 0.25 && b[2] < z + 0.75 && b[5] > z + 0.25 && b[1] < y + 1 && b[4] > y + 13 / 16) { e.pos[1] = y + 1; if (e.prev) e.prev[1] = y + 1; }
+  }
   Sound.ev('block.end_portal_frame.fill', [x, y, z], 1, 1);
   for (let i = 0; i < 12; i++) this.particles.spawn('smoke', x + 0.2 + Math.random() * 0.6, y + 1, z + 0.2 + Math.random() * 0.6, 0, 0.02, 0);
   const isEye = (a, b, c) => w.getBlock(a, b, c) === 174 && (w.getMeta(a, b, c) & 4);
@@ -346,7 +368,7 @@ Game.prototype.dragon = function () { return this.dim === 'end' ? this.entities.
 Game.prototype.onDragonKilled = function (dr) {
   const w = this.world, end = this.worldMeta.end, first = !end.dragonKilled;
   end.dragonKilled = true;
-  const yb = w.endTop0 + 1;
+  const yb = w.podiumY() - 1;
   for (let x = -3; x <= 3; x++) for (let z = -3; z <= 3; z++) { const d = Math.hypot(x, z); if (d <= 2.5 && (x || z)) w.setBlock(x, yb + 1, z, 175, 0); }
   if (first) { w.setBlock(0, yb + 5, 0, 176, 0); this.dropXp(0.5, yb + 3, 0.5, 12000); } else this.dropXp(0.5, yb + 3, 0.5, 500);
   this.grant('free_end');
@@ -357,12 +379,8 @@ Game.prototype.leaveEnd = function () {
   const end = this.worldMeta.end;
   const go = () => {
     const s = this.player.spawn;
-    this.changeDimension('overworld', [s[0] + 0.5, s[1], s[2] + 0.5], () => {
-      const p = this.player;
-      let y = s[1];
-      while (p.collides(p.box()) && y < HEIGHT) { y++; p.pos[1] = y; }
-      p.prev = [...p.pos];
-    });
+    // (placed as a respawn is, beside the bed if there is one: climbing out of blocks put it on the roof)
+    this.changeDimension('overworld', [s[0] + 0.5, s[1], s[2] + 0.5], () => { this.player.respawnGround = true; this.respawnSettle(); });
   };
   if (end.dragonKilled && !end.credits) { end.credits = true; this.ui.open(new CreditsScreen(this, go)); }
   else go();
@@ -375,6 +393,12 @@ Game.prototype.fireSupported = function (x, y, z) {
   if (SOLIDCUBE[below] || below === 119 || below === 120) return true;
   for (const D of DIRS) if (FLAMMABLE.has(w.getBlock(x + D[0], y + D[1], z + D[2]))) return true;
   return false;
+};
+// the fire that goes into a cell: soul fire over soul sand / soul soil (vanilla BaseFireBlock.getState). Soul fire never
+// spreads or burns out; it goes when its block below does (features.js canSurvive)
+Game.prototype.fireIdAt = function (x, y, z) {
+  const b = this.world.getBlock(x, y - 1, z);
+  return BID.soul_fire !== undefined && (b === BID.soul_sand || b === BID.soul_soil) ? BID.soul_fire : 171;
 };
 Game.prototype.fireTick = function (x, y, z) {
   const w = this.world, below = w.getBlock(x, y - 1, z);
@@ -389,20 +413,52 @@ Game.prototype.fireTick = function (x, y, z) {
     const nx = x + D[0], ny = y + D[1], nz = z + D[2], id = w.getBlock(nx, ny, nz);
     if (FLAMMABLE.has(id) && Math.random() < 0.08) {
       if (id === 26) { w.setBlock(nx, ny, nz, 0, 0); this.addEntity(new PrimedTNT(this, nx, ny, nz, 40)); }
-      else w.setBlock(nx, ny, nz, Math.random() < 0.6 ? 171 : 0, 0);
+      else w.setBlock(nx, ny, nz, Math.random() < 0.6 ? this.fireIdAt(nx, ny, nz) : 0, 0);
     }
   }
   for (let i = 0; i < 2; i++) {
     const nx = x + ((Math.random() * 3) | 0) - 1, ny = y + ((Math.random() * 4) | 0) - 1, nz = z + ((Math.random() * 3) | 0) - 1;
     if (w.getBlock(nx, ny, nz) === 0 && this.fireSupported(nx, ny, nz) && Math.random() < 0.3) {
       let fuel = false; for (const D of DIRS) if (FLAMMABLE.has(w.getBlock(nx + D[0], ny + D[1], nz + D[2]))) fuel = true;
-      if (fuel) w.setBlock(nx, ny, nz, 171, 0);
+      if (fuel) w.setBlock(nx, ny, nz, this.fireIdAt(nx, ny, nz), 0);
+    }
+  }
+};
+
+// lava lights what burns near it - wood, wool, leaves, TNT (vanilla LavaFluid.randomTick): it never did, "岩浆不能点燃TNT"
+Game.prototype.lavaTick = function (x, y, z) {
+  const w = this.world, R = Math.random;
+  if (this.rule && this.rule('fire_spread_radius_around_player') === 0) return;
+  const burns = (a, b, c) => FLAMMABLE.has(w.getBlock(a, b, c));
+  const passes = (R() * 3) | 0;
+  if (passes > 0) {
+    let tx = x, ty = y, tz = z;
+    for (let i = 0; i < passes; i++) {
+      tx += ((R() * 3) | 0) - 1; ty++; tz += ((R() * 3) | 0) - 1;
+      if (!w.isLoaded(tx, tz) || ty >= HEIGHT) return;
+      const id = w.getBlock(tx, ty, tz);
+      if (id === 0) { if (DIRS.some((D) => burns(tx + D[0], ty + D[1], tz + D[2]))) { w.setBlock(tx, ty, tz, this.fireIdAt(tx, ty, tz), 0); return; } }
+      else if (BLOCKS[id].solid) return;
+    }
+  } else {
+    for (let i = 0; i < 3; i++) {
+      const tx = x + ((R() * 3) | 0) - 1, tz = z + ((R() * 3) | 0) - 1;
+      if (!w.isLoaded(tx, tz)) return;
+      if (y + 1 < HEIGHT && w.getBlock(tx, y + 1, tz) === 0 && burns(tx, y, tz)) w.setBlock(tx, y + 1, tz, this.fireIdAt(tx, y + 1, tz), 0);
     }
   }
 };
 
 // ---- spawners ------------------------------------------------------------------------------------
 const SPAWNER_MOBS = ['zombie', 'skeleton', 'spider', 'blaze'];
+// the mob a spawner spawns: its block entity's when it has one (a structure template's SpawnData, a mineshaft's cave
+// spider, a spawn egg's; a placed spawner is empty, null - spawns and shows nothing, like vanilla's), else the old
+// meta kinds above (dungeons, fortresses, older worlds)
+Game.prototype.spawnerMob = function (x, y, z) {
+  const be = this.blockEntities.get(x + ',' + y + ',' + z);
+  if (be && be.type === 'spawner') return be.mob && MOB_TYPES[be.mob] ? be.mob : null;
+  return SPAWNER_MOBS[this.world.getMeta(x, y, z) & 3];
+};
 Game.prototype.tickSpawners = function () {
   const p = this.player, w = this.world, px = Math.floor(p.pos[0]), py = Math.floor(p.pos[1]), pz = Math.floor(p.pos[2]);
   this.spawnerT = this.spawnerT || new Map();
@@ -413,6 +469,8 @@ Game.prototype.tickSpawners = function () {
       const [x, y, z] = s;
       if (w.getBlock(x, y, z) !== 127) continue;
       if (Math.hypot(x - px, y - py, z - pz) > 16) continue;
+      const type = this.spawnerMob(x, y, z);
+      if (!type) continue;
       if (Math.random() < 0.3) this.particles.spawn('flame', x + Math.random(), y + Math.random(), z + Math.random(), 0, 0.01, 0);
       const k = s.join(',');
       let t = this.spawnerT.get(k);
@@ -420,7 +478,6 @@ Game.prototype.tickSpawners = function () {
       t -= 20; // called once every 20 ticks
       if (t > 0) { this.spawnerT.set(k, t); continue; }
       this.spawnerT.set(k, 200 + Math.random() * 600);
-      const type = SPAWNER_MOBS[w.getMeta(x, y, z) & 3];
       const near = this.entities.filter(e => e instanceof Mob && e.type === type && e.distTo({ pos: [x, y, z] }) < 9).length;
       if (near >= 6) continue;
       for (let n = 0; n < 4; n++) {

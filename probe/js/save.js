@@ -152,9 +152,36 @@ const DB = {
     return this.mem.worlds.get(id);
   },
   async putWorld(w) {
-    if (this.backend === 'idb') return this.tx('worlds', 'readwrite', s => s.put(w));
+    // (a live object that got into the world's record - a mob, a canvas - made every save fail with a DataCloneError
+    // after its chunks were written: blocks saved, the player's items and position not. It is written without them)
+    if (this.backend === 'idb') {
+      try { return await this.tx('worlds', 'readwrite', s => s.put(w)); }
+      catch (e) {
+        if (!e || e.name !== 'DataCloneError') throw e;
+        if (typeof Telemetry !== 'undefined' && Telemetry.count) Telemetry.count('save_clone_fixed');
+        return this.tx('worlds', 'readwrite', s => s.put(this.plain(w)));
+      }
+    }
     if (this.backend === 'local') { try { LS.set('mcjs:w:' + w.id, w); } catch (e) { throw this.nice(e); } return; }
     this.mem.worlds.set(w.id, w);
+  },
+  // a copy of a record with only what can be stored: plain objects, arrays, maps, sets, typed arrays and plain values
+  // (class instances, functions, DOM objects and loops are left out)
+  plain(v, path = new Set()) {
+    if (v === null || typeof v !== 'object') return typeof v === 'function' || typeof v === 'symbol' ? undefined : v;
+    if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer || v instanceof Date || (typeof Blob !== 'undefined' && v instanceof Blob)) return v;
+    if (path.has(v)) return undefined;
+    path.add(v);
+    let out;
+    if (Array.isArray(v)) out = v.map((x) => this.plain(x, path));
+    else if (v instanceof Map) { out = new Map(); for (const [k, x] of v) { const c = this.plain(x, path); if (c !== undefined) out.set(k, c); } }
+    else if (v instanceof Set) { out = new Set(); for (const x of v) { const c = this.plain(x, path); if (c !== undefined) out.add(c); } }
+    else {
+      const pr = Object.getPrototypeOf(v);
+      if (pr === null || Object.getPrototypeOf(pr) === null) { out = {}; for (const k of Object.keys(v)) { const c = this.plain(v[k], path); if (c !== undefined) out[k] = c; } }
+    }
+    path.delete(v);
+    return out;
   },
   async deleteWorld(id) {
     if (this.backend === 'idb') {

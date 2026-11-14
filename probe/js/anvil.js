@@ -17,6 +17,25 @@ const VanillaImport = (() => {
     { dim: 'end', minY: 0, paths: ['dimensions/minecraft/the_end/region/', 'DIM1/region/'] },
   ];
   const strip = (s) => String(s).replace(/^minecraft:/, '');
+  // a text component as plain text: 26.x stores a string, a list or a compound (text / translate, extra); worlds before
+  // 1.20.5 its JSON. There is no language table here, so a translation shows its fallback or its key and arguments
+  const compText = (c, top) => {
+    if (c == null) return '';
+    if (typeof c === 'string') {
+      if (top && /^\s*[{"]/.test(c)) { try { return compText(JSON.parse(c)); } catch (e) { } }
+      return c;
+    }
+    if (typeof c !== 'object') return String(c);
+    if (Array.isArray(c)) return c.map((x) => compText(x)).join('');
+    const ks = Object.keys(c);
+    if (ks.length === 1 && ks[0] === '') return compText(c['']); // a mixed-type list's element, wrapped as {"": value}
+    let s = c.text != null ? compText(c.text) : '';
+    if (c.text == null && c.translate != null) {
+      const args = Array.isArray(c.with) ? c.with.map((x) => compText(x)) : [];
+      s = c.fallback != null ? String(c.fallback) : String(c.translate) + (args.length ? ' ' + args.join(', ') : '');
+    }
+    return s + (Array.isArray(c.extra) ? c.extra.map((x) => compText(x)).join('') : '');
+  };
 
   // ---- reading the picked files: a folder (File objects with webkitRelativePath) or a .zip ----
   // entries: Map of path inside the world folder -> () => Promise<Uint8Array>
@@ -144,8 +163,16 @@ const VanillaImport = (() => {
       } else if ((t === 'furnace' || t === 'blast_furnace' || t === 'smoker') && at.onUse === 'furnace') {
         const f = { type: 'furnace', pos: [x, y, z], input: null, fuel: null, output: null, burn: 0, burnMax: 0, cook: 0 };
         for (const it of items) { const s = stackOf(it); if (it.Slot === 0) f.input = s; else if (it.Slot === 1) f.fuel = s; else if (it.Slot === 2) f.output = s; }
+        // one saved while burning keeps burning for the time it had left, then goes out (a lit one stayed lit for good)
+        // (26.x lit_time_remaining / lit_total_time / cooking_time_spent; older worlds BurnTime / CookTime)
+        f.burn = Math.max(0, (be.lit_time_remaining ?? be.BurnTime ?? 0) | 0); f.burnMax = Math.max(f.burn, be.lit_total_time | 0);
+        f.cook = Math.max(0, (be.cooking_time_spent ?? be.CookTime ?? 0) | 0);
         bes[`${x},${y},${z}`] = f;
         stats.containers++;
+      } else if (t === 'command_block' && /^(chain_|repeating_)?command_block$/.test(at.key)) {
+        // a command block's command and state (vanilla BaseCommandBlock / CommandBlockEntity; cmdblock.js cmdEntity)
+        bes[`${x},${y},${z}`] = { type: 'command_block', pos: [x, y, z], command: String(be.Command || ''), success: be.SuccessCount | 0, output: compText(be.LastOutput, true), track: be.TrackOutput !== 0,
+          auto: !!be.auto, powered: !!be.powered, met: !!be.conditionMet };
       }
     }
     const rec = { b: new Uint16Array(rleEncode(B)), m: new Uint16Array(rleEncode(M)) };

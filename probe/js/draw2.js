@@ -144,7 +144,8 @@ Game.prototype.drawSpawners = function (a, env) {
       const [x, y, z] = s;
       if (w.getBlock(x, y, z) !== 127) continue;
       if (!aabbInFrustum(r.planes, x, y, z, x + 1, y + 1, z + 1)) continue;
-      const type = SPAWNER_MOBS[w.getMeta(x, y, z) & 3];
+      const type = this.spawnerMob(x, y, z);
+      if (!type) continue;
       let d = this.spawnerDummies[type];
       if (!d) { d = this.spawnerDummies[type] = createMob(this, type, 0, 0, 0); d.displayMatrix = null; }
       // spin speeds up as the next spawn approaches, and only while a player is in range

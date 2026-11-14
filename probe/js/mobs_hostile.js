@@ -35,9 +35,15 @@ function drawVArmor(g, r, e, md, m, lt, env, overlay) {
     const a = ITEMS[st.id].armor, mat = a && a.mat; if (!mat || mat === 'elytra') return;
     const am = EM.get(r, base + '#' + slot); if (!am) return;
     EM.reset(am); EM.copy(md, am);
-    const dir = slot === 'leggings' ? 'humanoid_leggings' : 'humanoid', m2 = mat === 'golden' ? 'gold' : mat === 'chain' || mat === 'chainmail' ? 'chainmail' : mat === 'turtle' ? 'turtle_scute' : mat;
+    // (a baby model's armour layers take the 64x64 baby textures in every slot, like vanilla HUMANOID_BABY)
+    const dir = /_baby$/.test(base) ? 'humanoid_baby' : slot === 'leggings' ? 'humanoid_leggings' : 'humanoid', m2 = mat === 'golden' ? 'gold' : mat === 'chain' || mat === 'chainmail' ? 'chainmail' : mat === 'turtle' ? 'turtle_scute' : mat;
     r.drawEM(am, r.etex('entity/equipment/' + dir + '/' + m2), m, lt, env, { overlay, tint: m2 === 'leather' ? dyeTintOf(st, [160 / 255, 101 / 255, 64 / 255]) : null, cull: false });
+    // enchanted: the armour glint over that first layer only (render.js drawGlint; the overlay and trim cover it)
+    if (typeof stackGlint === 'function' && stackGlint(st)) r.drawEM(am, r.etex('entity/equipment/' + dir + '/' + m2), m, lt, env, { overlay, cull: false, glint: 'armor', glintOnly: true });
     if (m2 === 'leather') r.drawEM(am, r.etex('entity/equipment/' + dir + '/leather_overlay'), m, lt, env, { overlay, cull: false });
+    // its trim over it (equip.js trimTex; vanilla draws none on babies)
+    const tt = st.trim && r.trimTex && !e.baby ? r.trimTex(st.trim, mat, slot === 'leggings') : null;
+    if (tt) { r.gl.depthFunc(r.gl.LEQUAL); r.drawEM(am, tt, m, lt, env, { overlay, cull: false }); r.gl.depthFunc(r.gl.LESS); }
   });
 }
 // random armour on spawn (vanilla: chance by difficulty, mostly leather / gold / chain / iron)
@@ -174,7 +180,11 @@ class Crawler extends VMob {
     const w = this.world, x0 = Math.floor(this.pos[0]), y0 = Math.floor(this.pos[1]), z0 = Math.floor(this.pos[2]);
     for (let dx = -5; dx <= 5; dx++) for (let dy = -3; dy <= 3; dy++) for (let dz = -5; dz <= 5; dz++) {
       const k = BLOCKS[w.getBlock(x0 + dx, y0 + dy, z0 + dz)].key;
-      if (k && k.startsWith('infested_') && Math.random() < 0.3) { w.setBlock(x0 + dx, y0 + dy, z0 + dz, 0, 0); const s = spawnAt(this.game, 'silverfish', x0 + dx + 0.5, y0 + dy, z0 + dz + 0.5); s.target = src.attacker; s.persistent = false; }
+      if (k && k.startsWith('infested_') && Math.random() < 0.3) {
+        // without mob_griefing the block turns back into its host block (infested_deepslate keeps its axis)
+        const host = this.game.rule('mob_griefing') === false ? BID[k.slice(9)] : undefined;
+        if (host !== undefined) w.setBlock(x0 + dx, y0 + dy, z0 + dz, host, w.getMeta(x0 + dx, y0 + dy, z0 + dz)); else w.setBlock(x0 + dx, y0 + dy, z0 + dz, 0, 0);
+        const s = spawnAt(this.game, 'silverfish', x0 + dx + 0.5, y0 + dy, z0 + dz + 0.5); s.target = src.attacker; s.persistent = false; }
     }
   }
   setupAnim(md, a) {
@@ -236,12 +246,28 @@ defVMob('slime', { cls: Slime, xp: 0, shadowR: 0.25, T: { hostile: true }, stepS
 VMOB.slime.loot = 'slime';
 (() => { const _x = VMob.prototype.die; Slime.prototype.die = function (src) { this.D.xp = this.size; _x.call(this, src); }; })();
 // sulfur cubes (26.2): bouncy cubes that swallow a block and carry it; grow on slime balls, fit in a bucket when small
+const SULFUR_BLOCK_IMMUNE = new Set(['mob', 'player', 'arrow', 'trident', 'pearl', 'fall', 'cactus', 'berry', 'freeze', 'hotFloor', 'explosion']);
 class SulfurCube extends Slime {
   constructor(g, type, x, y, z) { super(g, type, x, y, z); this.setSize(Math.random() < 0.5 ? 1 : 2); this.block = null; }
   setSize(s) { this.size = s; this.w = this.h = 0.49 * s; this.maxHealth = this.health = 10 * s; this.T = { ...MOB_TYPES[this.type], speed: 0.25, attack: 0 }; }
   extraSave() { return { sz: this.size, blk: this.block }; }
   extraLoad(o) { if (o.sz) this.setSize(o.sz); this.block = o.blk || null; }
   wantsPlayer() { return false; }
+  // with a block inside, vanilla takes all its goals away: it no longer hops about, it only rolls where it is knocked
+  think(c) { if (this.block) { this.goal = null; this.target = null; return; } super.think(c); }
+  // ... and shrugs off blows, shots, falls, magma blocks, explosions and the like (damage tag
+  // sulfur_cube_with_block_immune_to - fire, lava and fireballs are not in it), only knocked back by them
+  hurt(a, src) {
+    if (this.block && src && SULFUR_BLOCK_IMMUNE.has(src.type) && !this.dead && !this.deathTime) {
+      if (src.knockFrom && (src.knock ?? 0.4) > 0) {
+        const dx = this.pos[0] - src.knockFrom[0], dz = this.pos[2] - src.knockFrom[2], d = Math.hypot(dx, dz) || 1, k = src.knock ?? 0.4;
+        this.vel[0] = this.vel[0] / 2 + dx / d * k; this.vel[2] = this.vel[2] / 2 + dz / d * k;
+        if (this.onGround) this.vel[1] = Math.min(0.4, this.vel[1] / 2 + 0.36);
+      }
+      return true;
+    }
+    return super.hurt(a, src);
+  }
   onDeath() { if (this.block) this.game.dropItem(this.pos[0], this.pos[1] + 0.3, this.pos[2], this.block); }
   preInteract(p, held) {
     const g = this.game, k = held && ITEMS[held.id].key;
@@ -253,13 +279,16 @@ class SulfurCube extends Slime {
   }
   layerKey() { return this.size > 1 ? 'sulfur_cube#main' : 'sulfur_cube_small#main'; }
   renderScale() { return 1; }
-  preDraw(m, a) { M4.translate(m, 0, this.h / 2, 0); const sq = lerp(this.prevSquish, this.squish, a) * 0.3, k = 1 / (sq + 1); M4.scale(m, 1 / k, k, 1 / k); M4.translate(m, 0, -1.501, 0); }
+  // (vanilla: no squish while it holds a block)
+  preDraw(m, a) { M4.translate(m, 0, this.h / 2, 0); const sq = this.block ? 0 : lerp(this.prevSquish, this.squish, a) * 0.3, k = 1 / (sq + 1); M4.scale(m, 1 / k, k, 1 / k); M4.translate(m, 0, -1.501, 0); }
   texKey(r) { return r.etex('entity/sulfur_cube/sulfur_cube_inner' + (this.size > 1 ? '' : '_small')); }
   drawVM(g, r, m, a, env, lt, overlay) {
     const big = this.size > 1, im = EM.get(r, big ? 'sulfur_cube#inner' : 'sulfur_cube_small#inner'), om = EM.get(r, this.layerKey());
-    if (im) r.drawEM(im, this.texKey(r), m, lt, env, { overlay });
-    // the swallowed block, inside
-    if (this.block && g.blockMesh && ITEMS[this.block.id].block !== undefined) { const mm = M4.copy(m); M4.translate(mm, 0, 1.501, 0); const s = big ? 0.55 : 0.3; M4.translate(mm, -s / 2, -s / 2, -s / 2); M4.scale(mm, s, s, s); r.drawMesh(g.blockMesh(ITEMS[this.block.id].block, 0), mm, env, lt); }
+    // the swallowed block takes the inner cube's place at its size (vanilla SulfurCubeInnerLayer: the block instead of
+    // the cube - drawn smaller inside the opaque cube, it was never seen)
+    const blk = this.block && g.blockMesh && ITEMS[this.block.id] ? ITEMS[this.block.id].block : undefined;
+    if (blk !== undefined) { const mm = M4.copy(m); M4.translate(mm, 0, 1.501, 0); const s = big ? 1 : 0.5; M4.translate(mm, -s / 2, -0.518 * s, -s / 2); M4.scale(mm, s, s, s); r.drawMesh(g.blockMesh(blk, 0), mm, env, lt); }
+    else if (im) r.drawEM(im, this.texKey(r), m, lt, env, { overlay });
     if (om) { const gl = r.gl; gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); r.drawEM(om, r.etex('entity/sulfur_cube/sulfur_cube_outer' + (big ? '' : '_small')), m, lt, env, { overlay }); gl.disable(gl.BLEND); }
   }
 }
@@ -304,7 +333,7 @@ Game.prototype.trySpawnPhantoms = function () {
   p.sinceRest = (p.sinceRest || 0) + 1200;
   if (this.sleeping || spawnDarken(this) < 5) return;
   if (p.sinceRest < 72000 || Math.random() * p.sinceRest < 72000) return;
-  if (Math.floor(p.pos[1]) < SEA + 1 || w.skyAt(Math.floor(p.pos[0]), Math.floor(p.pos[1] + 2), Math.floor(p.pos[2])) < 15) return;
+  if (Math.floor(p.pos[1]) < (w.flat ? 0 : SEA + 1) || w.skyAt(Math.floor(p.pos[0]), Math.floor(p.pos[1] + 2), Math.floor(p.pos[2])) < 15) return;
   const n = 1 + randInt(0, this.difficulty);
   for (let i = 0; i < n; i++) { const m = spawnAt(this, 'phantom', p.pos[0] + randInt(-10, 10), p.pos[1] + 20 + randInt(0, 14), p.pos[2] + randInt(-10, 10)); m.persistent = false; m.target = p; }
 };
@@ -466,6 +495,9 @@ function evokerFang(g, owner, x, z, delay) {
 class Vex extends VMob {
   constructor(g, type, x, y, z) { super(g, type, x, y, z); this.noClip = true; this.life = 0; this.hand = makeStack('iron_sword', 1); this.chargeT = 0; this.persistent = false; }
   wantsPlayer() { return this.game.difficulty > 0; }
+  // its limited life is saved (vanilla LifeTicks); an evoker's vex doesn't come back as the player's
+  extraSave() { return { own: this.owner && this.owner === this.game.player ? 1 : 0, life: this.life }; }
+  extraLoad(o) { this.life = o.life | 0; }
   think(c) {
     if (this.life > 0 && --this.life === 0) { this.hurt(1000, { type: 'generic' }); return; }
     if (this.target) {
@@ -510,8 +542,8 @@ class Ravager extends VMob {
       return;
     }
     VMob.prototype.think.call(this, c);
-    // tramples leaves and crops in the way
-    if (this.collidedH && this.age % 5 === 0) {
+    // tramples leaves and crops in the way (vanilla: only with mob_griefing)
+    if (this.collidedH && this.age % 5 === 0 && this.game.rule('mob_griefing') !== false) {
       const x = Math.floor(this.pos[0] - Math.sin(this.yaw) * 1.6), z = Math.floor(this.pos[2] - Math.cos(this.yaw) * 1.6);
       for (let dy = 0; dy < 3; dy++) { const id = this.world.getBlock(x, Math.floor(this.pos[1]) + dy, z), k = BLOCKS[id].key; if (/leaves$|^(wheat|carrots|potatoes|beetroots|melon_stem|pumpkin_stem)$/.test(k)) this.game.breakBlockAt ? this.game.breakBlockAt(x, Math.floor(this.pos[1]) + dy, z) : this.world.setBlock(x, Math.floor(this.pos[1]) + dy, z, 0, 0); }
     }
@@ -638,8 +670,19 @@ class Warden extends VMob {
     return r;
   }
   addAnger(e, n) {
-    if (e === this.game.player && this.game.player.creative) return; this.angerAt.set(e, Math.min(150, (this.angerAt.get(e) || 0) + n)); if ((this.angerAt.get(e) || 0) >= 80 && this.target !== e) { this.target = e; this.anims.ROAR = this.age; this.roarT = 84; this.sound('roar'); } }
-  findTarget() { if (this.target && (this.target.dead || this.target.deathTime || (this.target === this.game.player && this.game.player.creative))) this.target = null; }
+    if (e === this.game.player && this.game.player.creative) return; this.angerAt.set(e, Math.min(150, (this.angerAt.get(e) || 0) + n)); if ((this.angerAt.get(e) || 0) >= 80 && this.target !== e) this.roarAt(e); }
+  // (vanilla setAttackTarget: no sonic boom for the first 10 s)
+  roarAt(e) { this.target = e; this.anims.ROAR = this.age; this.roarT = 84; this.sound('roar'); this.sonicT = 0; this.boomCd = 200; }
+  // a target dead (or gone creative) is let go and its anger forgotten; then the one it is angriest at (80 or more) is
+  // next, as vanilla's AngerManagement - it went on swinging at the dead one
+  findTarget() {
+    const p = this.game.player, bad = (e) => e.dead || e.deathTime || (e === p && (p.creative || p.spectator));
+    if (this.target && bad(this.target)) { this.angerAt.delete(this.target); this.target = null; this.sonicT = 0; }
+    if (this.target) return;
+    let best = null, bv = 79;
+    for (const [e, v] of this.angerAt) if (v > bv && !bad(e)) { best = e; bv = v; }
+    if (best) this.roarAt(best);
+  }
   think(c) {
     const g = this.game, p = g.player;
     this.stT++;
@@ -651,18 +694,23 @@ class Warden extends VMob {
     if (this.age % 120 === 0 && !p.creative && this.distTo(p) < 20 && p.addEffect) p.addEffect('darkness', 0, 260);
     if (this.boomCd > 0) this.boomCd--;
     for (const [e, v] of this.angerAt) { if (v <= 1 || e.dead) this.angerAt.delete(e); else if (this.age % 20 === 0) this.angerAt.set(e, v - 1); }
+    this.findTarget();
+    if (this.roarT > 0) return;
     if (this.target) {
       const t = this.target, d = this.distTo(t);
       c.look = t;
-      // the sonic boom: when out of reach for a while
+      // the sonic boom: when out of reach for a while; the next no sooner than 2 s after this one is over (vanilla
+      // SonicBoom.stop - the cooldown ran out while it charged, so they came one right after another)
       if (this.sonicT > 0) {
         if (--this.sonicT === 26) {
-          t.hurt(10, { type: 'sonic_boom', attacker: this }); const [vx, , vz] = lookVec(this, t); t.vel[0] += vx * 2.5; t.vel[1] += 0.5; t.vel[2] += vz * 2.5;
+          const [vx, , vz] = lookVec(this, t), kr = 1 - (t.T && t.T.kbRes || 0);
+          if (t.hurt(10, { type: 'sonic_boom', attacker: this }) && kr > 0) { t.vel[0] += vx * 2.5 * kr; t.vel[1] += 0.5 * kr; t.vel[2] += vz * 2.5 * kr; }
           this.sound('sonic_boom', 3); for (let i = 1; i < Math.floor(d); i++) g.particles.spawn('poof', this.pos[0] + vx * i, this.pos[1] + 1.6 + (t.pos[1] - this.pos[1]) * i / d, this.pos[2] + vz * i, 0, 0, 0);
         }
+        if (this.sonicT === 0) this.boomCd = 40;
         return;
       }
-      if (d > 4 && d < 15 && this.boomCd <= 0 && this.canSee(t) && Math.random() < 0.05) { this.sonicT = 60; this.boomCd = 40; this.anims.SONIC_BOOM = this.age; this.sound('sonic_charge', 3); return; }
+      if (d > 4 && d < 15 && this.boomCd <= 0 && this.canSee(t) && Math.random() < 0.05) { this.sonicT = 60; this.anims.SONIC_BOOM = this.age; this.sound('sonic_charge', 3); return; }
       c.goal = [t.pos[0], t.pos[1], t.pos[2]]; c.mod = 1.2;
       if (d < 2.5 && this.attackCd <= 0) { this.melee(t); this.anims.ATTACK = this.age; }
       return;
@@ -673,7 +721,7 @@ class Warden extends VMob {
     if (this.angerAt.size) this.idleCalm = 0;
     VMob.prototype.think.call(this, c);
   }
-  melee(t) { super.melee(t); if (t.usingItem && t.inv && t.inv.held && ITEMS[t.inv.held.id].key === 'shield') t.shieldDown = 100; }
+  melee(t) { this.boomCd = 40; super.melee(t); if (t.usingItem && t.inv && t.inv.held && ITEMS[t.inv.held.id].key === 'shield') t.shieldDown = 100; }
   setupAnim(md, a) {
     const P = md.parts, [pos, spd] = emLimbs(this, a), t = this.age + a;
     if (P.head) { P.head.yRot = -(this.headYaw || 0); P.head.xRot = -(this.pitch || 0); }
@@ -791,7 +839,7 @@ class Wither extends VMob {
     if (this.invulT > 0) {
       // charging up after being built, then a big explosion
       this.invulT--; this.health = Math.min(this.maxHealth, this.health + this.maxHealth / 220 * (2 / 3));
-      if (this.invulT === 0) { g.explode(this.pos[0], this.pos[1] + this.h / 2, this.pos[2], 7, this); Sound.ev('entity.wither.spawn', null, 1, 1); }
+      if (this.invulT === 0) { g.explode(this.pos[0], this.pos[1] + this.h / 2, this.pos[2], 7, this, false, false, true); Sound.ev('entity.wither.spawn', null, 1, 1); }
       return;
     }
     if (this.age % 20 === 0) this.health = Math.min(this.maxHealth, this.health + 1);
@@ -804,8 +852,8 @@ class Wither extends VMob {
       this.skullCd[i] = i === 0 ? 40 : 30 + randInt(0, 30);
       this.shootSkull(i, ht, i > 0 && Math.random() < 0.001);
     }
-    // break blocks it gets stuck in
-    if (--this.blockCd <= 0 && this.collidedH) { this.blockCd = 20; const x0 = Math.floor(this.pos[0]), y0 = Math.floor(this.pos[1]), z0 = Math.floor(this.pos[2]); for (let dx = -1; dx <= 1; dx++) for (let dy = 0; dy <= 3; dy++) for (let dz = -1; dz <= 1; dz++) { const id = this.world.getBlock(x0 + dx, y0 + dy, z0 + dz); if (id && BLOCKS[id].hardness >= 0 && BLOCKS[id].hardness < 50 && !IS_FLUID[id]) this.world.setBlock(x0 + dx, y0 + dy, z0 + dz, 0, 0); } }
+    // break blocks it gets stuck in (vanilla: only with mob_griefing)
+    if (--this.blockCd <= 0 && this.collidedH && g.rule('mob_griefing') !== false) { this.blockCd = 20; const x0 = Math.floor(this.pos[0]), y0 = Math.floor(this.pos[1]), z0 = Math.floor(this.pos[2]); for (let dx = -1; dx <= 1; dx++) for (let dy = 0; dy <= 3; dy++) for (let dz = -1; dz <= 1; dz++) { const id = this.world.getBlock(x0 + dx, y0 + dy, z0 + dz); if (id && BLOCKS[id].hardness >= 0 && BLOCKS[id].hardness < 50 && !IS_FLUID[id]) this.world.setBlock(x0 + dx, y0 + dy, z0 + dz, 0, 0); } }
     // fly: above the target, circling
     if (t) { c.look = t; const hh = this.armored ? 0 : 5; c.goal = [t.pos[0] + Math.cos(this.age * 0.02) * 6, t.pos[1] + hh, t.pos[2] + Math.sin(this.age * 0.02) * 6]; }
     else { this.findTarget(); if (!this.goal || this.near(this.goal, 2)) this.goal = this.randomGoal(10, 3); c.goal = this.goal; }
@@ -852,7 +900,7 @@ class WitherSkull extends Entity {
   hit(e) {
     const g = this.game;
     if (e) { if (e.hurt(8, { type: 'mob', attacker: this.owner, projectile: true })) { const d = g.difficulty; if (d >= 2 && e.addEffect) e.addEffect('wither', 1, (d === 3 ? 40 : 10) * 20); if (e.dead || e.deathTime) { if (this.owner) this.owner.health = Math.min(this.owner.maxHealth, this.owner.health + 5); } } }
-    g.explode(this.pos[0], this.pos[1], this.pos[2], 1, this.owner);
+    g.explode(this.pos[0], this.pos[1], this.pos[2], 1, this.owner, false, false, true);
     this.dead = true;
   }
   drawSelf(g, ip, a, env, l) {

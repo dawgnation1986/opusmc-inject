@@ -63,6 +63,7 @@ function defBlock(id, key, cn, o = {}) {
   }
   if (o.overlay) b.overlay = [T(o.overlay), T(o.overlay), 0, 0, T(o.overlay), T(o.overlay)];
   b.particle = o.particle ? T(o.particle) : b.tex[0];
+  if (o.particle) b.particleOwn = true; // (the model's own "particle" texture beats texFn: a grass block's is dirt)
   if (b.texFront && !o.texFn) {
     b.texFn = (face, meta) => (face === (meta & 7) ? ((meta & 8) && b.texFrontOn ? b.texFrontOn : b.texFront) : b.tex[face]);
   }
@@ -135,7 +136,8 @@ defBlock(3, 'dirt', '泥土', { tex: 'dirt', hardness: 0.5, tool: 'shovel', soun
 defBlock(4, 'cobblestone', '圆石', { tex: 'cobblestone', hardness: 2, tool: 'pickaxe', needsTool: true });
 defBlock(5, 'oak_planks', '橡木木板', { tex: 'oak_planks', hardness: 2, tool: 'axe', sound: 'wood', fuel: 300, flammable: true });
 defBlock(6, 'bedrock', '基岩', { tex: 'bedrock', hardness: -1 });
-defBlock(7, 'water', '水', { shape: SH_LIQUID, tex: 'water_still', render: 'translucent', solid: false, opacity: 2, hardness: -1, replaceable: true, noItem: true, tint: 'water', cullSame: true });
+// (water and ice take 1 off the light a block like vanilla's light dampening - with 2 the sea went dark twice as fast)
+defBlock(7, 'water', '水', { shape: SH_LIQUID, tex: 'water_still', render: 'translucent', solid: false, opacity: 1, hardness: -1, replaceable: true, noItem: true, tint: 'water', cullSame: true });
 defBlock(8, 'lava', '熔岩', { shape: SH_LIQUID, tex: 'lava_still', render: 'opaque', solid: false, opacity: 15, light: 15, hardness: -1, replaceable: true, noItem: true, cullSame: true });
 defBlock(9, 'sand', '沙子', { tex: 'sand', hardness: 0.5, tool: 'shovel', sound: 'sand', gravity: true });
 defBlock(10, 'gravel', '沙砾', { tex: 'gravel', hardness: 0.6, tool: 'shovel', sound: 'gravel', gravity: true, drops: (m, r) => [[r() < 0.1 ? 'flint' : 'gravel', 1]] });
@@ -166,7 +168,7 @@ defBlock(33, 'snow_block', '雪块', { tex: 'snow', hardness: 0.2, tool: 'shovel
 // (meta & 7: layers - 1, like vanilla's 1-8; snow on snow adds one - game.js useItem. Before it was always one layer and
 // would not stack, players' feedback 2026-10-31)
 defBlock(34, 'snow', '雪', { shape: SH_BOXES, boxes: (m) => [[0, 0, 0, 16, 2 * ((m & 7) + 1), 16]], tex: 'snow', render: 'opaque', solid: false, hardness: 0.1, tool: 'shovel', needsTool: true, sound: 'snow', replaceable: true, needsSupport: true, drops: (m) => [['snowball', (m & 7) + 1]] });
-defBlock(35, 'ice', '冰', { tex: 'ice', render: 'translucent', opaque: false, opacity: 2, hardness: 0.5, tool: 'pickaxe', sound: 'glass', drops: nothing, cullSame: true, slip: 0.98 });
+defBlock(35, 'ice', '冰', { tex: 'ice', render: 'translucent', opaque: false, opacity: 1, hardness: 0.5, tool: 'pickaxe', sound: 'glass', drops: nothing, cullSame: true, slip: 0.98 });
 defBlock(36, 'clay', '黏土块', { tex: 'clay', hardness: 0.6, tool: 'shovel', sound: 'gravel', drops: drop('clay_ball', 4) });
 defBlock(37, 'cactus', '仙人掌', { shape: SH_CACTUS, tex: { top: 'cactus_top', bottom: 'cactus_bottom', side: 'cactus_side' }, render: 'cutout', hardness: 0.4, sound: 'wool', needsSupport: true, damage: 1 });
 defBlock(38, 'sugar_cane', '甘蔗', { shape: SH_CROSS, tex: 'sugar_cane', tint: 'grass', solid: false, hardness: 0, sound: 'grass', needsSupport: true, drops: drop('sugar_cane'), noItem: true });
@@ -213,7 +215,7 @@ defBlock(63, 'farmland', '耕地', { shape: SH_BOXES, boxes: () => [[0, 0, 0, 16
 const WHEAT_TEX = [0, 1, 2, 3, 4, 5, 6, 7].map(i => 'wheat_stage' + i);
 defBlock(64, 'wheat', '小麦', { shape: SH_CROP, tex: 'wheat_stage0', solid: false, hardness: 0, sound: 'grass', needsSupport: true, noItem: true,
   texFn(face, meta) { return T(WHEAT_TEX[meta & 7]); },
-  drops: (m, r) => (m & 7) >= 7 ? [['wheat', 1], ['wheat_seeds', 1 + (r() * 3 | 0)]] : [['wheat_seeds', 1]] });
+  drops: (m, r, tool) => (m & 7) >= 7 ? [['wheat', 1], ['wheat_seeds', cropBonusCount(r, tool)]] : [['wheat_seeds', 1]] }); // (enchant.js)
 defBlock(65, 'oak_sapling', '橡树树苗', { shape: SH_CROSS, tex: 'oak_sapling', solid: false, hardness: 0, sound: 'grass', needsSupport: true, flatIcon: 'oak_sapling', fuel: 100 });
 defBlock(66, 'birch_sapling', '白桦树苗', { shape: SH_CROSS, tex: 'birch_sapling', solid: false, hardness: 0, sound: 'grass', needsSupport: true, flatIcon: 'birch_sapling', fuel: 100 });
 defBlock(67, 'spruce_sapling', '云杉树苗', { shape: SH_CROSS, tex: 'spruce_sapling', solid: false, hardness: 0, sound: 'grass', needsSupport: true, flatIcon: 'spruce_sapling', fuel: 100 });
@@ -322,7 +324,10 @@ defBlock(180, 'crying_obsidian', '哭泣的黑曜石', { tex: 'crying_obsidian',
 defBlock(116, 'birch_slab', '白桦木台阶', { shape: SH_BOXES, boxes: (m) => SLAB_BOXES[m & 3], tex: 'birch_planks', render: 'opaque', hardness: 2, tool: 'axe', sound: 'wood', slab: true, fuel: 150, drops: slabDrop('birch_slab') });
 
 const WOOLS = [['white', '白色'], ['orange', '橙色'], ['magenta', '品红色'], ['light_blue', '淡蓝色'], ['yellow', '黄色'], ['lime', '黄绿色'], ['pink', '粉红色'], ['gray', '灰色'], ['light_gray', '淡灰色'], ['cyan', '青色'], ['purple', '紫色'], ['blue', '蓝色'], ['brown', '棕色'], ['green', '绿色'], ['red', '红色'], ['black', '黑色']];
-WOOLS.forEach(([c, cn], i) => defBlock(128 + i, c + '_wool', cn + '羊毛', { tex: c + '_wool', hardness: 0.8, sound: 'wool', tool: 'shears', fuel: 100 }));
+// (these first wool blocks drop the wool item of the name - the vanilla import's, what creative, recipes and trades
+// take; a sheep's wool is that one too: woolKey)
+WOOLS.forEach(([c, cn], i) => defBlock(128 + i, c + '_wool', cn + '羊毛', { tex: c + '_wool', hardness: 0.8, sound: 'wool', tool: 'shears', fuel: 100, drops: drop(c + '_wool') }));
+const woolKey = (color) => (WOOLS[color] || WOOLS[0])[0] + '_wool';
 const SGLASS = [['white', '白色'], ['orange', '橙色'], ['light_blue', '淡蓝色'], ['yellow', '黄色'], ['lime', '黄绿色'], ['pink', '粉红色'], ['cyan', '青色'], ['purple', '紫色'], ['blue', '蓝色'], ['red', '红色'], ['black', '黑色'], ['green', '绿色']];
 SGLASS.forEach(([c, cn], i) => defBlock(144 + i, c + '_stained_glass', cn + '染色玻璃', { tex: c + '_stained_glass', render: 'translucent', opaque: false, hardness: 0.3, sound: 'glass', drops: nothing, cullSame: true }));
 const CONCRETE = [['white', '白色'], ['orange', '橙色'], ['yellow', '黄色'], ['lime', '黄绿色'], ['light_blue', '淡蓝色'], ['blue', '蓝色'], ['red', '红色'], ['black', '黑色'], ['gray', '灰色']];
@@ -398,6 +403,14 @@ function defDataBlock(d) {
   else if (d.drop) o.drops = drop(d.drop);
   if (d.ore) { const [a, b] = d.oreCount || [1, 1]; o.drops = (m, r) => [[ITEM_KEY[d.ore] !== undefined ? d.ore : d.key, a + ((r() * (b - a + 1)) | 0)]]; }
   if (d.xp) o.xp = d.xp;
+  // a mod's fluid (mods.js): drawn and flowing like water or lava, its own still texture
+  if (d.kind === 'fluid') {
+    const b = defBlock(d.id, d.key, d.cn, { shape: SH_LIQUID, tex: d.still, render: d.hot ? 'opaque' : 'translucent', solid: false, opacity: d.hot ? 15 : 1, light: d.light || 0,
+      hardness: -1, replaceable: true, noItem: true, cullSame: true });
+    b.fluidKind = d.hot ? 'lava' : 'water'; if (d.bucket) b.bucket = d.bucket; // (set on the block: defBlock keeps only the fields it knows)
+    b.soundGroup = d.hot ? 'lava' : 'water';
+    return b;
+  }
   if (d.kind === 'entity') {
     // drawn by blockents.js; the boxes are for selection and collision
     Object.assign(o, { shape: SH_BOXES, beRender: d.be !== 'invisible', be: d.be, render: 'cutout', opaque: false, opacity: 0, solid: !d.nonsolid, tex: d.particle || 'white' });
@@ -432,7 +445,7 @@ function defDataBlock(d) {
     else if (d.gate) Object.assign(o, { gate: true, boxes: (m) => modelBoxes(BLOCKS[d.id], m) || [[0, 0, 6, 16, 16, 10]], collide: gateCollide });
     else o.boxes = (m) => modelBoxes(BLOCKS[d.id], m) || [[0, 0, 0, 16, 16, 16]];
   }
-  if (CULL_SAME_GEN.has(d.key)) o.cullSame = true;
+  if (CULL_SAME_GEN.has(d.key)) o.cullSame = true; else if (d.cullSame) o.cullSame = true; // (a mod's glass: no faces between two of its own - mods.js)
   // powder snow's picture has no see-through pixels: drawn as translucent (no depth), its two-sided faces showed
   // through one another - holes in a flat field of it (players' feedback 2026-10-31「细雪显示bug」)
   if (d.key === 'powder_snow') o.render = 'cutout';
@@ -440,8 +453,12 @@ function defDataBlock(d) {
   if (d.states) b.states = d.states;
   // lit / unlit states (candles give 3 per candle)
   if (d.states && d.light && d.states.some(s => 'lit' in s)) b.stateLight = d.states.map(s => s.lit === 'true' ? (s.candles ? 3 * +s.candles : d.light) : 0);
+  if (d.stateLight) b.stateLight = d.stateLight; // (a mod's blocks: the light of each state, given - mods.js)
   b.soundGroup = d.sound;
   if (d.tint && d.tint[0] === '#') b.tintRGB = [1, 3, 5].map(i => parseInt(d.tint.slice(i, i + 2), 16));
+  // (a mod's block fields the data has no word for, set here so the workers have them too: waterlogged - always in
+  // water, as seagrass; waterloggable - can hold water, as the WATERLOGGABLE_RE blocks; 农夫乐事's rice)
+  if (d.props) Object.assign(b, d.props);
   return b;
 }
 for (const d of (self.BLOCK_DATA || [])) defDataBlock(d);
@@ -459,15 +476,117 @@ if (BID.redstone_wire !== undefined) {
   for (let p = 1; p <= 15; p++) { const id = 4080 + p; BLOCKS[id] = Object.assign(Object.create(Object.getPrototypeOf(w)), w, { id, tintRGB: wireColor(p), wirePower: p }); WIRE_ID[p] = id; }
 }
 if (BID.barrel !== undefined) BLOCKS[BID.barrel].onUse = 'barrel';
-// a lily pad can be stood on (its 1.5-pixel box collides, like vanilla); a sweet berry bush slows whoever goes
-// through it (players' feedback 2026-10-31)
+// a lily pad can be stood on (its 1.5-pixel box collides, like vanilla). (A sweet berry bush holds whoever goes
+// through it back: entity.js, Living.baseTick)
 if (BID.lily_pad !== undefined) BLOCKS[BID.lily_pad].solid = true;
-if (BID.sweet_berry_bush !== undefined) BLOCKS[BID.sweet_berry_bush].slow = 0.8;
+// the data blocks' colours as vanilla's BlockColors: a tinted model face (tintindex) of a block with none there is drawn
+// as it is (vmodels.js) - the stonecutter's blade, bamboo, lava and powder snow in a cauldron were grass-green, and so was
+// leaf litter (its dry foliage colour), the cauldron's water, the stems (their age's colour)
+for (const [k, t] of [['water_cauldron', 'water'], ['leaf_litter', 'dry_foliage'], ['melon_stem', 'stem'], ['pumpkin_stem', 'stem'],
+  ['attached_melon_stem', '#e0c71c'], ['attached_pumpkin_stem', '#e0c71c'], ['lava_cauldron', null], ['powder_snow_cauldron', null]]) {
+  const b = BLOCKS[BID[k]];
+  if (!b) continue;
+  b.tint = t; delete b.tintRGB;
+  if (t && t[0] === '#') b.tintRGB = [1, 3, 5].map(i => parseInt(t.slice(i, i + 2), 16));
+}
+// (vanilla BlockTintSources.stem)
+function stemTint(age) { age = +age || 0; return [age * 32, 255 - age * 8, age * 4]; }
+// blocks with vanilla's snowy state (SnowyDirtBlock: Game.snowyUpdate; the grass block's is meta bit 1)
+const SNOWY_DIRT = new Set([2, BID.podzol, BID.mycelium].filter((i) => i !== undefined));
+// pink petals and wildflowers tint only their stems (layer 1): their particles (layer 0) are not tinted
+for (const k of ['pink_petals', 'wildflowers']) if (BID[k] !== undefined) Object.assign(BLOCKS[BID[k]], { tint: 'grass', particleTint: false });
+if (BID.soul_fire !== undefined) BLOCKS[BID.soul_fire].replaceable = true; // (like fire: a block put there, water flowing in takes it)
+// vanilla's shapes where the model's bounds are wrong (getShape / getCollisionShape): the flames of a lit campfire and
+// the stonecutter's saw made them a whole block high, the sculk sensor's tendrils too, a tripwire's flat model gave a
+// box nothing could hit (it couldn't be mined). A block that isn't solid but has a collide is still stood on and
+// bumped into (entity.js blockBoxes): bamboo, end rods, azaleas, the big dripleaf's leaf, the shrieker had none -
+// they stay non-solid for everything else (support, fluids, mob paths)
+// (the feet slot: a player's inventory slot 39 - 36..39 are head..feet - a mob's armorItems[3])
+function wearsLeatherBoots(e) {
+  const s = e.inv ? e.inv.slots[39] : e.armorItems && e.armorItems[3];
+  return !!(s && ITEMS[s.id] && ITEMS[s.id].key === 'leather_boots');
+}
+{
+  const set = (k, o) => { if (BID[k] !== undefined) Object.assign(BLOCKS[BID[k]], o); };
+  const prop = (k, m, p) => { const s = BLOCKS[BID[k]].states; return s && s[m] ? s[m][p] : undefined; };
+  for (const k of ['campfire', 'soul_campfire']) set(k, { boxes: () => [[0, 0, 0, 16, 7, 16]] });
+  set('stonecutter', { boxes: () => [[0, 0, 0, 16, 9, 16]] });
+  for (const k of ['sculk_sensor', 'calibrated_sculk_sensor']) set(k, { boxes: () => [[0, 0, 0, 16, 8, 16]], collide: () => [[0, 0, 0, 16, 8, 16]] });
+  set('sculk_shrieker', { collide: () => [[0, 0, 0, 16, 8, 16]] });
+  set('tripwire', { boxes: (m) => (prop('tripwire', m, 'attached') === 'true' ? [[0, 1, 0, 16, 2.5, 16]] : [[0, 0, 0, 16, 8, 16]]) });
+  set('bamboo', { collide: () => [[6.5, 0, 6.5, 9.5, 16, 9.5]] });
+  set('end_rod', { collide: (m) => { const f = prop('end_rod', m, 'facing'); return f === 'east' || f === 'west' ? [[0, 6, 6, 16, 10, 10]] : f === 'north' || f === 'south' ? [[6, 6, 0, 10, 10, 16]] : [[6, 0, 6, 10, 16, 10]]; } });
+  for (const k of ['azalea', 'flowering_azalea']) set(k, { collide: () => [[0, 8, 0, 16, 16, 16], [6, 0, 6, 10, 8, 10]] });
+  set('big_dripleaf', { collide: (m) => { const t = prop('big_dripleaf', m, 'tilt'); return t === 'full' ? [] : [[0, 11, 0, 16, t === 'partial' ? 13 : 15, 16]]; } });
+  // snow layers: a layer less than they show (none for one)
+  // (shared arrays: one-layer snow covers every snowy biome and blockBoxes runs for every mob each tick)
+  const SNOW = [[]]; for (let l = 1; l < 8; l++) SNOW.push([[0, 0, 0, 16, 2 * l, 16]]);
+  set('snow', { collide: (m) => SNOW[m & 7] });
+  // honey: a little narrower and lower than a block, slows (0.4) and halves jumps; whoever slides down its side is
+  // held (entity.js). Slime throws back up whoever lands on it (entity.js)
+  set('honey_block', { collide: () => [[1, 0, 1, 15, 15, 15]], slow: 0.4, jumpFactor: 0.5 });
+  set('slime_block', { bounce: 1, slip: 0.8 });
+  // powder snow (PowderSnowBlock.getCollisionShape): 0.9 high under anything falling more than 2.5 blocks (caught, no
+  // fall damage), a whole block under a falling block, and under one in leather boots (rabbits, foxes, endermites,
+  // silverfish too) that is above it and not sneaking; nothing for the rest, who sink into it
+  const PS_FALL = [[0, 0, 0, 16, 14.4, 16]], PS_FULL = [[0, 0, 0, 16, 16, 16]], NONE = [];
+  const walker = (e) => /^(rabbit|endermite|silverfish|fox)$/.test(e.type || '') || wearsLeatherBoots(e);
+  set('powder_snow', { collide: (m, e, y) => (!e ? NONE : e.fallDist > 2.5 ? PS_FALL : (typeof FallingBlock !== 'undefined' && e instanceof FallingBlock) || (e.pos[1] > y + 1 - 1e-5 && !e.sneaking && !e.sneakHeld && walker(e)) ? PS_FULL : NONE) });
+}
 // plants that only exist under water render (and behave) as if their cell were also water; like vanilla they
 // are cutout, so the translucent water drawn after them tints them
-for (const k of ['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'sea_pickle', 'tube_coral', 'brain_coral', 'bubble_coral', 'fire_coral', 'horn_coral',
+// (not sea pickles: they hold water only when waterlogged, like vanilla's - on land one brought its own water)
+for (const k of ['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'tube_coral', 'brain_coral', 'bubble_coral', 'fire_coral', 'horn_coral',
   'tube_coral_fan', 'brain_coral_fan', 'bubble_coral_fan', 'fire_coral_fan', 'horn_coral_fan', 'tube_coral_wall_fan', 'brain_coral_wall_fan', 'bubble_coral_wall_fan', 'fire_coral_wall_fan', 'horn_coral_wall_fan'])
   if (BID[k] !== undefined) Object.assign(BLOCKS[BID[k]], { waterlogged: true, render: 'cutout', solid: false, replaceable: k.includes('seagrass') });
+// vanilla block loot the data has no word for (its loot tables): what drops itself only to silk touch (or shears) or
+// drops something else - deepslate gave deepslate, sculk, amethyst buds and bee nests themselves (players' feedback
+// 2026-11). Silk touch still takes them whole (game.js dropBlockLoot); shearsDrop: what shears take
+(() => {
+  const fortune = (t) => typeof enchLevel === 'function' ? Math.min(3, enchLevel(t, 'fortune')) : 0;
+  // (silk touch takes the vine whole too: the stem blocks have no item of their own, silk didn't reach them)
+  const vines = (k) => ({ shearsDrop: k, drops: (m, r, t) => (typeof enchLevel === 'function' && enchLevel(t, 'silk_touch')) || r() < [0.33, 0.55, 0.77, 1][fortune(t)] ? [[k, 1]] : [] });
+  // glow lichen, sculk vein: one per face covered (a shearsDrop may be a function: the drops shears give)
+  const faces = (k, m) => { const s = (BLOCKS[BID[k]].states || [])[m] || {}; return ['down', 'up', 'north', 'south', 'west', 'east'].filter(f => s[f] === 'true').length; };
+  const tall = (k) => ({ drops: (m, r) => r() < 0.125 ? [['wheat_seeds', 1]] : [], shearsDrop: () => [[k, 2]] });
+  const L = {
+    deepslate: { drops: drop('cobbled_deepslate') },
+    sea_lantern: { drops: (m, r, t) => [['prismarine_crystals', Math.min(5, 2 + (r() * 2 | 0) + (r() * (fortune(t) + 1) | 0))]] },
+    gilded_blackstone: { drops: (m, r, t) => r() < [0.1, 1 / 7, 0.25, 1][fortune(t)] ? [['gold_nugget', 2 + (r() * 4 | 0)]] : [['gilded_blackstone', 1]] },
+    // 4 shards to a pickaxe (fortune multiplies them), 2 to anything else; no tool needed
+    amethyst_cluster: { needsTool: false, drops: (m, r, t) => { const d = t && ITEMS[t.id] && ITEMS[t.id].tool; return [['amethyst_shard', d && d.type === 'pickaxe' ? fortuneCount(4, fortune(t)) : 2]]; } },
+    sculk: { xp: [1, 1] }, sculk_sensor: { xp: [5, 5] }, calibrated_sculk_sensor: { xp: [5, 5] }, sculk_shrieker: { xp: [5, 5] }, sculk_catalyst: { xp: [5, 5] },
+    weeping_vines: vines('weeping_vines'), weeping_vines_plant: vines('weeping_vines'), twisting_vines: vines('twisting_vines'), twisting_vines_plant: vines('twisting_vines'),
+    sculk_vein: { drops: (m, r, t) => typeof enchLevel === 'function' && enchLevel(t, 'silk_touch') ? [['sculk_vein', faces('sculk_vein', m)]] : [] },
+    glow_lichen: { drops: nothing, shearsDrop: (m) => [['glow_lichen', faces('glow_lichen', m)]] },
+    tall_seagrass: { drops: nothing, shearsDrop: () => [['seagrass', 2]] }, tall_grass: tall('short_grass'), large_fern: tall('fern'),
+  };
+  for (const k of ['sculk', 'sculk_sensor', 'calibrated_sculk_sensor', 'sculk_shrieker', 'sculk_catalyst', 'bee_nest', 'chiseled_bookshelf', 'turtle_egg'])
+    L[k] = Object.assign(L[k] || {}, { drops: nothing });
+  for (const k of ['small_amethyst_bud', 'medium_amethyst_bud', 'large_amethyst_bud']) L[k] = { needsTool: false, drops: nothing };
+  for (const k of ['bush', 'pale_hanging_moss', 'small_dripleaf', 'hanging_roots', 'seagrass', 'vine', 'nether_sprouts', 'short_dry_grass', 'tall_dry_grass'])
+    L[k] = { drops: nothing, shearsDrop: k };
+  for (const c of ['tube', 'brain', 'bubble', 'fire', 'horn']) {
+    L[c + '_coral_block'] = { drops: drop('dead_' + c + '_coral_block') };
+    // (the wall fans: their fan's loot, silk touch only - WALL_FORM below)
+    L['dead_' + c + '_coral'] = L['dead_' + c + '_coral_fan'] = L[c + '_coral_wall_fan'] = { drops: nothing };
+  }
+  for (const c of ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray', 'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black'])
+    L[c + '_stained_glass'] = L[c + '_stained_glass_pane'] = { drops: nothing };
+  for (const b of BLOCKS) if (b && L[b.key]) Object.assign(b, L[b.key]);
+})();
+// sea pickles: light 3 + 3 a pickle while waterlogged, none when dry (SeaPickleBlock; world.js WET_EMIT)
+if (BID.sea_pickle !== undefined && BLOCKS[BID.sea_pickle].states) Object.assign(BLOCKS[BID.sea_pickle], { wetLight: true, stateLight: BLOCKS[BID.sea_pickle].states.map(s => 3 + 3 * (+s.pickles || 1)) });
+// glow berries give light 14 and drop only on a vine that has them (CaveVines: berries=true; they gave none and
+// every vine dropped one); leaf litter, pink petals and wildflowers drop as many as they hold (createSegmentedBlockDrops)
+for (const k of ['cave_vines', 'cave_vines_plant']) if (BID[k] !== undefined) {
+  const b = BLOCKS[BID[k]];
+  if (b.states) { b.light = 14; b.stateLight = b.states.map(s => s.berries === 'true' ? 14 : 0); b.drops = (m) => b.states[m] && b.states[m].berries === 'true' ? [['glow_berries', 1]] : []; }
+}
+for (const [k, p] of [['leaf_litter', 'segment_amount'], ['pink_petals', 'flower_amount'], ['wildflowers', 'flower_amount']]) if (BID[k] !== undefined && BLOCKS[BID[k]].states) {
+  const b = BLOCKS[BID[k]];
+  b.drops = (m) => [[k, Math.max(1, +(b.states[m] && b.states[m][p]) || 1)]];
+}
 
 // ---------------------------------------------------------------------------
 // Items
@@ -592,7 +711,12 @@ for (const d of (self.ITEM_DATA || [])) {
   if (d.rep) it.repair = d.rep;
   if (d.rar) it.rarity = d.rar;
   if (d.glint) it.glint = true;
+  // a mod's own item kinds (Tinkers' parts and tools: tcPart / tcTool), for its code to find
+  if (d.tcPart) it.tcPart = d.tcPart;
+  if (d.tcTool) it.tcTool = d.tcTool;
 }
+// the spawner's item came from itemdata.js as a plain item (the block is an old one, without an item): it placed nothing
+if (ITEM_KEY.spawner !== undefined && !ITEMS[ITEM_KEY.spawner].places && ITEMS[ITEM_KEY.spawner].block === undefined) ITEMS[ITEM_KEY.spawner].places = 'spawner';
 // vanilla's tool tiers ([mining level, speed]) and attack damage, armour materials ([points by slot], toughness),
 // for every tool and piece of armour (the hand-written ones included)
 const TOOL_TIER = { wooden: [0, 2], stone: [1, 4], copper: [1, 5], iron: [2, 6], golden: [0, 12], diamond: [3, 8], netherite: [4, 9] };
@@ -626,7 +750,9 @@ for (const k in BID) {
 // broke into nothing - players' feedback 2026-10-31)
 for (const k in WALL_FORM) {
   const wb = BLOCKS[BID[WALL_FORM[k]]], sb = BLOCKS[BID[k]];
-  if (wb.drops && !wb.drops(0, () => 0.5).length) wb.drops = (m, r, t) => sb.drops ? sb.drops(0, r, t) : sb.noItem ? [] : [[sb.id, 1]];
+  // (silk touch too, as game.js dropBlockLoot gives the standing form: the coral wall fans)
+  const silk = (t) => typeof enchLevel === 'function' && enchLevel(t, 'silk_touch') && ITEMS[sb.id] && !sb.noItem && !NO_SILK.has(sb.key);
+  if (wb.drops && !wb.drops(0, () => 0.5).length) wb.drops = (m, r, t) => sb.drops ? (silk(t) ? [[sb.id, 1]] : sb.drops(0, r, t)) : sb.noItem ? [] : [[sb.id, 1]];
 }
 // a saved stack of an item that no longer exists: the block items whose vanilla item has another name
 const LEGACY_ITEM = { cocoa: 'cocoa_beans', sweet_berry_bush: 'sweet_berries', cave_vines: 'glow_berries', cave_vines_plant: 'glow_berries',
@@ -639,7 +765,9 @@ function fixSavedStack(s) {
 }
 // two stacks that may merge: the same item, and the same potion (or other data) if they carry one
 function sameKind(a, b) {
+  // (maps: each its own - a drawn map took every new one in creative, two maps stacked as one in survival)
   return a.id === b.id && (a.pot || '') === (b.pot || '') && (a.x || '') === (b.x || '') && (a.name || '') === (b.name || '') && (a.rc || 0) === (b.rc || 0) && JSON.stringify(a.trim || null) === JSON.stringify(b.trim || null)
+    && (a.mapId ?? null) === (b.mapId ?? null)
     && (!a.e && !b.e || !!a.e && !!b.e && sameEnchants(a, b));
 }
 function item(key) { const id = ITEM_KEY[key]; if (id === undefined) throw new Error('no item ' + key); return id; }
@@ -822,7 +950,12 @@ function itemIds(v) {
     if (r[0] === 's') {
       const keys = {}; let ok = true;
       for (const c in r[4]) { keys[c] = ids(r[4][c]); if (!keys[c].length) ok = false; }
-      if (ok) RECIPES.push({ type: 'shaped', result: res, count: r[2], pattern: r[3], keys, w: r[3][0].length, h: r[3].length });
+      // empty rows and columns at the edges dropped, as vanilla's ShapedRecipePattern.shrink (the spyglass is
+      // ' # ', ' X ', ' X ': matched against the grid's filled box, it was never made)
+      let p = r[3].slice(); while (p.length && !p[0].trim()) p.shift(); while (p.length && !p[p.length - 1].trim()) p.pop();
+      const full = p.filter(s => s.trim()), a = Math.min(...full.map(s => s.search(/\S/))), b = Math.max(...full.map(s => s.trimEnd().length));
+      p = p.map(s => s.slice(a, b).padEnd(b - a));
+      if (ok && p.length) RECIPES.push({ type: 'shaped', result: res, count: r[2], pattern: p, keys, w: p[0].length, h: p.length });
     } else {
       const ing = r[0] === 'l' ? r[3].map(ids) : [ids(r[2]), ids(r[3])];
       // transmute (dyeing a shulker box or bundle): the result keeps the first ingredient's other data
@@ -882,7 +1015,7 @@ let WATERLOGGABLE = null;
 function canWaterlog(id, meta) {
   if (!WATERLOGGABLE) {
     WATERLOGGABLE = new Uint8Array(MAX_BLOCKS);
-    for (const b of BLOCKS) if (b && WATERLOGGABLE_RE.test(b.key) && !/^(jack_o|sea)_lantern$/.test(b.key)) WATERLOGGABLE[b.id] = 1;
+    for (const b of BLOCKS) if (b && (WATERLOGGABLE_RE.test(b.key) || b.waterloggable) && !/^(jack_o|sea)_lantern$/.test(b.key)) WATERLOGGABLE[b.id] = 1;
   }
   return !!WATERLOGGABLE[id] && !(BLOCKS[id].slab && (meta & 3) === 2);
 }

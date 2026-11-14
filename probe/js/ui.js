@@ -114,13 +114,24 @@ class UI {
 
   open(screen) {
     if (this.screen && this.screen.close) this.screen.close();
+    const wide = (this.screen && this.screen.needW) || (screen && screen.needW);
     this.screen = screen;
     this.hideInput();
-    if (screen) { if (screen.layout) screen.layout(); if (!screen.keepPointer) this.game.releasePointer(); }
+    if (wide) this.resize();
+    if (screen) {
+      if (screen.layout && !wide) screen.layout();
+      // (opened by a mouse button still down - right click on a chest: the lock goes when it is let go, main.js -
+      // the pointer jumping back with the right button down is a mouse gesture to Edge, which closed the page)
+      const g = this.game, held = g.rawMouse && (g.rawMouse[0] || g.rawMouse[1] || g.rawMouse[2]) && document.pointerLockElement === g.canvas;
+      if (!screen.keepPointer) { if (held) g.unlockOnUp = true; else g.releasePointer(); }
+    }
   }
   close() {
+    this.game.unlockOnUp = false;
     if (this.screen && this.screen.close) this.screen.close();
+    const wide = this.screen && this.screen.needW;
     this.screen = null;
+    if (wide) this.resize();
     if (this.cursor) { this.returnStack(this.cursor); this.cursor = null; }
     this.hideInput();
     this.game.capturePointer();
@@ -151,6 +162,23 @@ class UI {
     const im = this.img[name];
     this.ctx.drawImage(im, sx, sy, sw ?? (w ?? im.width), sh ?? (h ?? im.height), x, y, w ?? im.width, h ?? im.height);
   }
+  // vanilla's purple boss bar (the wither's), made once from the pink one: its pixels are the pink's with red moved to
+  // blue and red at 0.52 of it (within 1 of the jar's purple_background / purple_progress); false until it can be made
+  bossPurple() {
+    if (this.img.boss_purple_bg) return true;
+    const src = [this.img.boss_bg, this.img.boss_fg];
+    if (src.some((im) => !im || !im.width || im.complete === false)) return false;
+    const out = src.map((im) => {
+      const cv = document.createElement('canvas'); cv.width = im.width; cv.height = im.height;
+      const x = cv.getContext('2d'); x.drawImage(im, 0, 0);
+      const d = x.getImageData(0, 0, cv.width, cv.height), q = d.data;
+      for (let i = 0; i < q.length; i += 4) { const r = q[i]; q[i] = Math.round(r * 0.52); q[i + 1] = 0; q[i + 2] = r; }
+      x.putImageData(d, 0, 0);
+      return cv;
+    });
+    this.img.boss_purple_bg = out[0]; this.img.boss_purple_fg = out[1];
+    return true;
+  }
   nine(name, x, y, w, h, border) {
     const im = this.img[name], c = this.ctx, iw = im.width, ih = im.height, b = border;
     c.drawImage(im, 0, 0, b, b, x, y, b, b); c.drawImage(im, iw - b, 0, b, b, x + w - b, y, b, b);
@@ -169,7 +197,8 @@ class UI {
     // held item's name threw on one, every frame): the missing texture
     if (stack.unk || !def) {
       c.fillStyle = '#000'; c.fillRect(x, y, 16, 16); c.fillStyle = '#F800F8'; c.fillRect(x, y, 8, 8); c.fillRect(x + 8, y + 8, 8, 8);
-    } else if (stackTinted(stack) && r.stackIcon(id, stack)) c.drawImage(r.stackIcon(id, stack), x, y, 16, 16);
+    } else if (def.key === 'shield' && r.shieldStackIcon && r.shieldStackIcon(stack)) c.drawImage(r.shieldStackIcon(stack), x, y, 16, 16); // (with its banner: equip.js)
+    else if (stackTinted(stack) && r.stackIcon(id, stack)) c.drawImage(r.stackIcon(id, stack), x, y, 16, 16);
     else if (typeof itemStateTex === 'function' && itemStateTex(stack, this.game.player)) c.drawImage(r.tileIcon(itemStateTex(stack, this.game.player)), x, y, 16, 16);
     else c.drawImage(this.itemIcon(id), x, y, 16, 16);
     c.imageSmoothingEnabled = false; c.imageSmoothingQuality = 'low';
@@ -209,10 +238,12 @@ class UI {
   // the item's 64 px picture copied out of the atlas into one canvas kept for it, to be scaled from there: the same
   // picture to the bit as before (scaled straight out of the 2048x3200 atlas, 75 flat icons came out a pixel off at
   // their edges and 1032 block icons up to 29/255 apart - the texel picked on the half-pixel steps of 64 -> 48 px, 11-04)
+  // (a canvas of its own each time - only when the icon isn't kept yet: one canvas used again for every icon, WebKit can
+  // draw it later than asked with the next icon's picture in it - iPhones / iPads, 11-13, see render.js flatInto)
   iconCopy(id) {
-    const r = this.game.renderer, S = r.iconSize, cv = this.iconTmp || (this.iconTmp = document.createElement('canvas'));
-    if (cv.width !== S || cv.height !== S) cv.width = cv.height = S;
-    const k = cv.getContext('2d'); k.clearRect(0, 0, S, S); k.drawImage(r.iconAtlas, ...r.iconXY(id), S, S, 0, 0, S, S);
+    const r = this.game.renderer, S = r.iconSize, cv = document.createElement('canvas');
+    cv.width = cv.height = S;
+    cv.getContext('2d').drawImage(r.iconAtlas, ...r.iconXY(id), S, S, 0, 0, S, S);
     return cv;
   }
   // the enchantment glint: the icon's shape tinted purple, pulsing (its shape from the 64 px picture, once per item)
@@ -267,7 +298,7 @@ class UI {
     if (d.durability) lines.push({ text: `耐久度: ${d.durability - (stack.dmg || 0)} / ${d.durability}`, color: '#AAAAAA' });
     if (fuelValue(stack.id)) lines.push({ text: `燃料: ${(fuelValue(stack.id) / 200).toFixed(1)} 个物品`, color: '#777777' });
     if (this.game.settings.advTooltips) lines.push({ text: 'minecraft:' + d.key, color: '#555555' });
-    if (stack.name || stack.e || stack.pot) netItemLines(stack, lines); // a server's stack (net.js)
+    if (stack.name || stack.e || stack.pot || stack.lore) netItemLines(stack, lines); // a server's stack (net.js)
     if (stack.pot && !this.game.net) { const i = lines.findIndex((l, k) => k > 0 && (l.color === '#5555FF' || l.color === '#AAAAAA')); if (i > 0) lines.splice(i, 1); potionLines(stack, lines); }
     return lines;
   }
@@ -278,6 +309,8 @@ class UI {
     const c = this.ctx, k = b.goldFrom ? Math.min(1, (performance.now() - b.goldFrom) / 700) : 1;
     if ((b.gold || b.glowBlue) && b.enabled !== false) { c.save(); c.globalAlpha = k; this.goldShine(b, hover); c.restore(); }
     // (blue: the way into your own room)
+    // (tint: a colour of its own over the button - the light blue of the mods)
+    if (b.tint && b.enabled !== false) { c.fillStyle = b.tint; c.fillRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2); if (hover) { c.fillStyle = 'rgba(255,255,255,0.12)'; c.fillRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2); } }
     if (b.blue && b.enabled !== false) { c.fillStyle = hover ? 'rgba(80,140,255,0.6)' : 'rgba(40,90,220,0.55)'; c.fillRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2); }
     if (b.icon) { const im = this.img[b.icon]; if (im) c.drawImage(im, Math.floor(b.x + (b.w - im.width) / 2), Math.floor(b.y + (b.h - im.height) / 2)); return; }
     const col = b.enabled === false ? '#A0A0A0' : b.color || '#FFFFFF', ty = b.y + (b.h - 8) / 2;
@@ -360,7 +393,8 @@ class UI {
     el.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') onEnter(el.value); if (e.key === 'Escape') { if (!e.repeat) this.game.escHeld = performance.now(); if (opts.onEsc) opts.onEsc(); } };
     el.oninput = () => { if (opts.onInput) opts.onInput(el.value); };
     // after a touch the field waits for its own tap, so the on-screen keyboard doesn't pop up uninvited
-    if (!(this.lastTouch && performance.now() - this.lastTouch < 2000)) setTimeout(() => el.focus(), 0);
+    // (not again when it already has the focus: a layout on every resize - the keyboard's own - focused it once more)
+    if (!(this.lastTouch && performance.now() - this.lastTouch < 2000) && document.activeElement !== el) setTimeout(() => el.focus(), 0);
   }
   hideInput() { this.input.style.display = 'none'; this.input.onkeydown = null; this.input.blur(); this.inputBox = null; }
   // vanilla-style text field contents: pixel font, scrolled to keep the caret visible, blinking caret
@@ -504,18 +538,29 @@ class UI {
     if (hd && dt < 2500) {
       const a = dt > 2000 ? 1 - (dt - 2000) / 500 : 1;
       c.globalAlpha = a;
-      Font.center(c, hd.cn || hd.key, W / 2, H - (p.creative ? 38 : 58), '#FFFFFF');
+      // (stackName: an item named per stack by a mod - Tinkers' tools by what they are made of, 钴镐)
+      Font.center(c, hd.stackName ? hd.stackName(held) : (hd.cn || hd.key), W / 2, H - (p.creative ? 38 : 58), '#FFFFFF');
       c.globalAlpha = 1;
     }
     // action bar message
     if (this.actionBar && performance.now() - this.actionBar.t < 2500) Font.center(c, this.actionBar.text, W / 2, H - (p.creative ? 50 : 70), this.actionBar.color || '#FFFFFF');
-    // boss bars (vanilla BossHealthOverlay): the dragon's (pink), the raids' (red, in tenths), one under another
+    // boss bars (vanilla BossHealthOverlay): the dragon's (pink), the withers' (purple), the raids' (red, in tenths), one
+    // under another
     const bars = [];
     const dr = g.dragon && g.dragon();
     if (dr) bars.push({ name: '末影龙', progress: dr.health / dr.maxHealth, color: 'pink' });
+    // (vanilla WitherBoss's boss event: filling up while it charges, then its health; shown while it is tracked - 10
+    // chunks. Online the server's boss events aren't read and a server's mob has no health here: not there. A local
+    // room's guest has the host's value from the snapshot, bossProg - none from a host without it)
+    if (!g.net && typeof Wither !== 'undefined') for (const e of g.entities) {
+      if (!(e instanceof Wither) || e.dead || e.distTo(p) >= 160 || (g.p2pGuest && typeof e.bossProg !== 'number')) continue;
+      bars.push({ name: e.customName || '凋灵', progress: g.p2pGuest ? e.bossProg : e.invulT > 0 ? 1 - e.invulT / 220 : e.health / e.maxHealth, color: 'purple' });
+    }
     if (g.raidBars) bars.push(...g.raidBars());
     bars.forEach((b, i) => {
-      const bx = Math.floor(W / 2 - 91), by = 12 + i * 19, bg = b.color === 'red' ? 'boss_red_bg' : 'boss_bg', fg = b.color === 'red' ? 'boss_red_fg' : 'boss_fg';
+      const bx = Math.floor(W / 2 - 91), by = 12 + i * 19;
+      let bg = b.color === 'red' ? 'boss_red_bg' : 'boss_bg', fg = b.color === 'red' ? 'boss_red_fg' : 'boss_fg';
+      if (b.color === 'purple' && this.bossPurple()) { bg = 'boss_purple_bg'; fg = 'boss_purple_fg'; }
       Font.center(c, b.name, W / 2, by - 9, '#FFFFFF');
       this.sprite(bg, bx, by);
       if (b.notch === 10 && this.img.boss_n10_bg) this.sprite('boss_n10_bg', bx, by);
@@ -553,25 +598,72 @@ class UI {
     const c = this.ctx, now = performance.now(), open = this.screen && this.screen.isChat;
     let y = this.h - 48 - (this.touch ? this.touch.chatLift() : 0);
     const pin = this.pinned;
+    // (a row: [text, colour] runs - an administrator's coloured name; null is the message's own colour)
+    const row = (m, r) => { let x = 4; for (const [t, col] of r) x = Font.draw(c, t, x, y, col || m.color); };
+    let pinRows = 0;
     if (pin && now >= pin.until) { this.pinned = null; this.message(pin.text, pin.color); }
     else if (pin) {
-      c.globalAlpha = 0.5; c.fillStyle = '#000'; c.fillRect(2, y - 1, 320, 10); c.globalAlpha = 1;
-      Font.draw(c, pin.text, 4, y, pin.color);
-      y -= 10;
+      const rows = this.chatWrap(pin);
+      for (let i = rows.length - 1; i >= 0; i--) {
+        c.globalAlpha = 0.5; c.fillStyle = '#000'; c.fillRect(2, y - 1, 320, 10); c.globalAlpha = 1;
+        row(pin, rows[i]);
+        y -= 10;
+      }
+      pinRows = rows.length;
     }
-    const off = open ? Math.min(this.chatOff || 0, Math.max(0, this.chat.length - 20)) : 0, n = open ? (this.pinned ? 19 : 20) : (this.pinned ? 9 : 10);
-    const list = this.chat.slice(Math.max(0, this.chat.length - off - n), this.chat.length - off);
-    for (let i = list.length - 1; i >= 0; i--) {
-      const m = list[i], age = now - m.t;
+    // counted in rows, as vanilla's ChatComponent (20 open, 10 closed; scrolled by rows)
+    const n = Math.max(1, (open ? 20 : 10) - pinRows), off = open ? Math.min(this.chatOff || 0, Math.max(0, this.chatRowCount() - 20)) : 0;
+    for (const [m, r] of this.chatRowsBack(off + n).slice(off)) {
+      const age = now - m.t;
       if (!open && age > 10000) continue;
       const a = open ? 1 : clamp((10000 - age) / 1000, 0, 1);
       c.globalAlpha = a * 0.5; c.fillStyle = '#000'; c.fillRect(2, y - 1, 320, 10); c.globalAlpha = a;
-      if (m.parts) { let x = 4; for (const [t, col] of m.parts) { Font.draw(c, t, x, y, col); x += Font.width(t); } } // (an administrator's coloured name)
-      else Font.draw(c, m.text, 4, y, m.color);
+      row(m, r);
       c.globalAlpha = 1;
       y -= 10;
     }
   }
+  // a chat message in rows that fit the box, as vanilla's ComponentRenderUtils.wrapComponents: broken at the last space
+  // that fits (anywhere in Chinese), at a line break, a row carried over indented by a space. A long message went on
+  // past the box and off the screen. Kept on the message (m.parts may come after it was added: net.js)
+  chatWrap(m) {
+    const src = m.parts || m.text;
+    if (m.wrap && m.wrapOf === src && m.wrapFont === Font.adv) return m.wrap;
+    const ch = [], rows = [], MAX = 316, SP = Font.charW(' ');
+    for (const [t, col] of m.parts || [[m.text, null]]) for (const s of String(t ?? '')) ch.push([s, col]);
+    let st = 0, w = 0, sp = -1, ind = false;
+    const emit = (a, b) => {
+      const r = ind ? [[' ', null]] : [];
+      for (let i = a; i < b; i++) { const last = r[r.length - 1]; if (last && last[1] === ch[i][1] && (r.length > 1 || !ind)) last[0] += ch[i][0]; else r.push([ch[i][0], ch[i][1]]); }
+      rows.push(r);
+    };
+    for (let i = 0; i < ch.length; i++) {
+      const s = ch[i][0], cw = Font.charW(s);
+      if (s === '\n') { emit(st, i); st = i + 1; w = 0; sp = -1; ind = false; continue; }
+      if (w + cw > MAX - (ind ? SP : 0) && i > st) {
+        if (s === ' ') { emit(st, i); st = i + 1; ind = true; w = 0; sp = -1; continue; }
+        if (sp > st) { emit(st, sp); st = sp + 1; } else { emit(st, i); st = i; }
+        ind = true; sp = -1; w = 0;
+        for (let k = st; k < i; k++) w += Font.charW(ch[k][0]);
+        i--; continue; // (this character again, on the new row)
+      }
+      if (s === ' ') sp = i;
+      w += cw;
+    }
+    emit(st, ch.length);
+    m.wrapOf = src; m.wrapFont = Font.adv; // (the font's widths: a message wrapped before they loaded is wrapped again)
+    return (m.wrap = rows);
+  }
+  // the newest max rows, newest first: [message, row]
+  chatRowsBack(max) {
+    const out = [];
+    for (let i = this.chat.length - 1; i >= 0 && out.length < max; i--) {
+      const m = this.chat[i], rs = this.chatWrap(m);
+      for (let j = rs.length - 1; j >= 0 && out.length < max; j--) out.push([m, rs[j]]);
+    }
+    return out;
+  }
+  chatRowCount() { let n = 0; for (const m of this.chat) n += this.chatWrap(m).length; return n; }
   // subtitles (vanilla SubtitleOverlay): the sounds heard in the last 3 seconds, each where it was last heard - an
   // arrow on the side it comes from when it's off to a side, the text greying as it gets older
   hearSound(ev, pos, vol) {
@@ -676,6 +768,10 @@ class UI {
     c.setTransform(this.scale, 0, 0, this.scale, 0, 0);
     c.imageSmoothingEnabled = false;
     const g = this.game;
+    // played with the mouse free (the browser refuses the lock, main.js freeMouse): no pointer over the world, as when
+    // locked - it stayed in sight the whole game (phones / tablets with a mouse, QQ / WeChat / learning-machine browsers)
+    const hide = g.state === 'play' && !this.screen && g.lockFails > 0 && document.pointerLockElement !== g.canvas && !touchOn(g);
+    if (hide !== !!this.ptrHidden && document.body) { this.ptrHidden = hide; document.body.style.cursor = hide ? 'none' : ''; }
     if (g.state === 'play') {
       this.drawOverlays();
       this.drawHUD();
@@ -943,7 +1039,9 @@ class ContainerScreen {
         let room = 0; const ms = maxStack(out.id);
         for (let i = 0; i < 36; i++) { const t = inv.slots[i]; room += !t ? ms : sameKind(t, out) && !ITEMS[t.id].durability ? Math.max(0, ms - t.count) : 0; }
         if (room < out.count) break;
-        inv.add({ ...out });
+        // (vanilla quickMoveStack of a result: the hotbar from its right end, then the inventory from its last slot -
+        // not the selected slot or the offhand first, as a pickup)
+        inv.add({ ...out }, [8, 7, 6, 5, 4, 3, 2, 1, 0, ...Array.from({ length: 27 }, (_, i) => 35 - i)]);
         s.onTake(out);
         this.changed();
       }
@@ -953,20 +1051,26 @@ class ContainerScreen {
     else if (sameKind(ui.cursor, st) && ui.cursor.count + st.count <= maxStack(st.id)) { ui.cursor.count += st.count; s.onTake(st); }
     this.changed();
   }
+  // the hotbar keys, swap-with-offhand and drop as bound (按键绑定), like vanilla's AbstractContainerScreen
+  // (checkHotbarKeyPressed, keyDrop) - they were 1-9 and Q whatever the bindings said, and no offhand key
   key(ui, ev) {
-    const k = ev.key;
-    if (k >= '1' && k <= '9') {
+    const acts = bindingsFor(this.game, ev.code);
+    if (acts.includes('inventory')) return false; // (closes the screen first, as vanilla: main.js)
+    const hb = acts.find((a) => a.startsWith('hotbar.'));
+    if (hb || acts.includes('swapOffhand')) {
       const s = this.slotAt(ui.mouse.x, ui.mouse.y);
-      if (s && !s.output) {
-        const inv = this.game.player.inv, i = +k - 1;
+      if (s && !s.output && !ui.cursor) { // (not while an item is carried, as vanilla)
+        const inv = this.game.player.inv, i = hb ? +hb.slice(7) - 1 : 40;
         const a = s.get(), b = inv.slots[i];
-        if (!b || this.canPlace(s, b)) { s.set(b); inv.slots[i] = a; this.changed(); }
+        // creative palette / trash: a full stack into the slot, nothing back; empty cell does nothing (vanilla SWAP)
+        if (s.creative || s.trash) { if (a) { inv.slots[i] = { ...a, count: maxStack(a.id), dmg: 0 }; this.changed(); } }
+        else if (!b || this.canPlace(s, b)) { s.set(b); inv.slots[i] = a; this.changed(); }
       }
       return true;
     }
-    if (k === 'q' || k === 'Q') {
+    if (acts.includes('drop')) {
       const s = this.slotAt(ui.mouse.x, ui.mouse.y);
-      if (s && s.get() && !s.output) { const st = s.get(); const n = ev.ctrlKey ? st.count : 1; this.game.dropFromPlayer({ ...st, count: n }); st.count -= n; if (!st.count) s.set(null); this.changed(); }
+      if (s && s.get() && !s.output && !ui.cursor) { const st = s.get(); const n = ev.ctrlKey ? (s.creative ? maxStack(st.id) : st.count) : 1; this.game.dropFromPlayer({ ...st, count: n }); st.count -= n; if (!st.count) s.set(null); this.changed(); }
       return true;
     }
     return false;
@@ -1200,6 +1304,8 @@ class CraftingScreen extends ContainerScreen {
     super.mouseDown(ui, mx, my, button, shift);
   }
   wheel(ui, dy) { if (this.bookOpen && !this.peek && ui.hit(this.bookLayout())) this.page += Math.sign(dy); }
+  // (touch: a finger dragged from the open book scrolls it, even from over the slots under it on a narrow screen - #B1)
+  scrollsAt(x, y) { return !!this.bookOpen && !this.peek && this.game.ui.hit(this.bookLayout(), x, y); }
   outside(mx, my) { return super.outside(mx, my) && !(this.bookOpen && !this.peek && this.game.ui.hit(this.bookLayout(), mx, my)); }
   drawExtra(ui) {
     if (this.size === 2) {
@@ -1234,6 +1340,8 @@ class ChestScreen extends ContainerScreen {
     });
     this.addPlayerSlots(31 + rows * 18, 89 + rows * 18);
     for (const be of bes) game.openChests.add(be.pos.join(','));
+    const p = this.be.pos, ob = game.world && BLOCKS[game.world.getBlock(p[0], p[1], p[2])];
+    this.blockKey = ob ? ob.key : ''; // (what it is a screen of: barrels, shulker boxes and the ender chest close with their own sound)
   }
   // closing the screen when a half is broken
   owns(be) { return this.bes.includes(be); }
@@ -1247,7 +1355,15 @@ class ChestScreen extends ContainerScreen {
   }
   close() {
     for (const be of this.bes) { this.game.markBlockEntity(be); this.game.openChests.delete(be.pos.join(',')); }
-    const p = this.be.pos; Sound.chest([p[0] + 0.5, p[1] + 0.5, p[2] + 0.5], false);
+    const p = this.be.pos, c = [p[0] + 0.5, p[1] + 0.5, p[2] + 0.5], k = this.blockKey, w = this.game.world, pitch = Math.random() * 0.1 + 0.9;
+    if (k === 'barrel') {
+      // the barrel shuts again (game.js opened it)
+      const id = w.getBlock(p[0], p[1], p[2]), m = w.getMeta(p[0], p[1], p[2]);
+      if (BLOCKS[id] && BLOCKS[id].key === 'barrel' && Features.propOf(id, m, 'open') === 'true') { w.setMeta(p[0], p[1], p[2], Features.withProp(id, m, 'open', false)); if (this.game.flushMesh) this.game.flushMesh(); }
+      Sound.ev('block.barrel.close', c, 0.5, pitch);
+    } else if (/(^|_)shulker_box$/.test(k)) Sound.ev('block.shulker_box.close', c, 0.5, pitch);
+    else if (k === 'ender_chest') Sound.ev('block.ender_chest.close', c, 0.5, pitch);
+    else Sound.chest(c, false);
   }
 }
 
@@ -1314,7 +1430,10 @@ class CreativeScreen extends ContainerScreen {
     ];
     this.setTab(0);
   }
-  tabs() { return [...CREATIVE_TABS, { name: '搜索物品', icon: 'compass_search', search: true }, { name: '生存模式物品栏', inv: true }]; }
+  // vanilla's ten, search, the survival inventory; then any more (a mod's - 匠魂's seven) on pages of their own, ten
+  // to a page in the same places as vanilla's, search and the inventory on every page (as Forge pages them; they took
+  // the search tab's place before, and search and the inventory both sat at the bottom right)
+  tabs() { return [...CREATIVE_TABS.slice(0, 10), { name: '搜索物品', icon: 'compass_search', search: true }, { name: '生存模式物品栏', inv: true }, ...CREATIVE_TABS.slice(10)]; }
   setTab(t) {
     this.tab = t; this.scroll = 0;
     const tabs = this.tabs();
@@ -1340,21 +1459,58 @@ class CreativeScreen extends ContainerScreen {
   layout() { super.layout(); if (this.tabs()[this.tab].search) this.setTab(this.tab); }
   maxScroll() { return Math.max(0, Math.ceil(this.items.length / 9) - 5); }
   wheel(ui, dy) { this.scroll = clamp(this.scroll + Math.sign(dy), 0, this.maxScroll()); }
-  // vanilla's tab places: five on top, five below, the search tab at the top right
-  tabCol(i) { return i >= 10 ? 6 : i % 5; }
-  tabTop(i) { return i < 5 || i === 10; }
+  // ---- pages: 0 vanilla's ten, then ten more each; search (10) and the inventory (11) on all of them ----
+  // (the tabs after them ten to a page; a tab with newPage starts a page of its own - 农夫乐事's kinds after 匠魂's
+  // seven, the user 11-13)
+  tabLayout() {
+    const tabs = this.tabs();
+    if (this._tl && this._tl.n === tabs.length) return this._tl;
+    const page = [], slot = []; let p = 1, s = 0;
+    for (let i = 12; i < tabs.length; i++) { if ((tabs[i].newPage && s > 0) || s === 10) { p++; s = 0; } page[i] = p; slot[i] = s++; }
+    return (this._tl = { n: tabs.length, page, slot, pages: tabs.length > 12 ? p + 1 : 1 });
+  }
+  pages() { return this.tabLayout().pages; }
+  tabPage(i) { return i === 10 || i === 11 ? -1 : i < 10 ? 0 : this.tabLayout().page[i]; }
+  tabShown(i) { const p = this.tabPage(i); return p < 0 || p === (this.page || 0); }
+  // (its place on its page: 0-4 on top, 5-9 below)
+  tabSlot(i) { return i < 10 ? i : this.tabLayout().slot[i]; }
+  // vanilla's tab places: five on top, five below, the search tab at the top right, the inventory at the bottom right
+  tabCol(i) { return i === 10 || i === 11 ? 6 : this.tabSlot(i) % 5; }
+  tabTop(i) { return i === 10 || (i !== 11 && this.tabSlot(i) < 5); }
   tabRect(i) { const c = this.tabCol(i); return { x: this.x + (c === 6 ? 167 : c * 27), y: this.tabTop(i) ? this.y - 28 : this.y + 132, w: 26, h: 30 }; }
   tabSprite(i, sel) { return 'tab_' + (this.tabTop(i) ? 'top' : 'bottom') + (sel ? '_selected_' : '_unselected_') + (this.tabCol(i) + 1); }
+  // the page buttons: ◀ ▶ in the top corner, between the fifth tab and search (Forge's page buttons; the user 11-07)
+  pageBtn(d) { return { x: this.x + (d < 0 ? 136 : 152), y: this.y - 24, w: 15, h: 18 }; }
+  setPage(p) {
+    const n = this.pages(); p = clamp(p, 0, n - 1);
+    if (p === (this.page || 0)) return;
+    this.page = p;
+    // (the page's first tab, unless search or the inventory is open - those stay)
+    const tabs = this.tabs();
+    if (!tabs[this.tab].search && !tabs[this.tab].inv) { const i = tabs.findIndex((_, k) => this.tabPage(k) === p); if (i >= 0) this.setTab(i); }
+  }
   draw(ui) {
     ui.dim(0.6);
-    const c = ui.ctx, tabs = this.tabs();
-    for (let i = 0; i < tabs.length; i++) if (i !== this.tab) { const r = this.tabRect(i); ui.sprite(this.tabSprite(i, false), r.x, r.y); }
+    const c = ui.ctx, tabs = this.tabs(), sel = this.tabShown(this.tab);
+    for (let i = 0; i < tabs.length; i++) if (i !== this.tab && this.tabShown(i)) { const r = this.tabRect(i); ui.sprite(this.tabSprite(i, false), r.x, r.y); }
     c.drawImage(ui.img[this.bg], 0, 0, 195, 136, this.x, this.y, 195, 136);
-    { const r = this.tabRect(this.tab); ui.sprite(this.tabSprite(this.tab, true), r.x, r.y); }
+    if (sel) { const r = this.tabRect(this.tab); ui.sprite(this.tabSprite(this.tab, true), r.x, r.y); }
     for (let i = 0; i < tabs.length; i++) {
-      const r = this.tabRect(i);
-      const icon = tabs[i].search ? item('book') : tabs[i].inv ? item('chest') : item(tabs[i].icon);
-      ui.drawItem({ id: icon, count: 1 }, r.x + 5, r.y + (this.tabTop(i) ? 9 : 7));
+      if (!this.tabShown(i)) continue;
+      const r = this.tabRect(i), t = tabs[i];
+      // (iconStack: a tab's icon that needs its data - a tool in a material, a filled gauge)
+      const st = (!t.search && !t.inv && t.iconStack) || { id: t.search ? item('book') : t.inv ? item('chest') : item(t.icon), count: 1 };
+      ui.drawItem(st, r.x + 5, r.y + (this.tabTop(i) ? 9 : 7));
+    }
+    if (this.pages() > 1) {
+      const p = this.page || 0;
+      for (const d of [-1, 1]) {
+        const b = this.pageBtn(d), on = d < 0 ? p > 0 : p < this.pages() - 1, hov = on && ui.hit(b);
+        ui.nine(on ? (hov ? 'button_hl' : 'button') : 'button_dis', b.x, b.y, b.w, b.h, 3);
+        Font.center(c, d < 0 ? '<' : '>', b.x + b.w / 2 + 1, b.y + 5, on ? '#FFFFFF' : '#A0A0A0');
+      }
+      // (which page: 1 / 2, above the buttons)
+      Font.center(c, (p + 1) + ' / ' + this.pages(), this.x + 151, this.y - 37, '#FFFFFF');
     }
     if (!tabs[this.tab].inv) Font.draw(c, tabs[this.tab].name, this.x + 8, this.y + 6, '#404040', false);
     // scroller
@@ -1370,7 +1526,11 @@ class CreativeScreen extends ContainerScreen {
     ui.ctx.fillStyle = '#8b8b8b'; ui.ctx.fillRect(this.x + 173, this.y + 112, 16, 16);
     Font.center(c, 'X', this.x + 181, this.y + 116, '#FF5555');
     this.drawSlots(ui);
-    for (let i = 0; i < tabs.length; i++) if (ui.hit(this.tabRect(i))) ui.tooltip([{ text: tabs[i].name }], ui.mouse.x, ui.mouse.y);
+    for (let i = 0; i < tabs.length; i++) if (this.tabShown(i) && ui.hit(this.tabRect(i))) ui.tooltip([{ text: tabs[i].name }], ui.mouse.x, ui.mouse.y);
+    if (this.pages() > 1) for (const d of [-1, 1]) {
+      const tp = (this.page || 0) + d;
+      if (tp >= 0 && tp < this.pages() && ui.hit(this.pageBtn(d))) ui.tooltip([{ text: d < 0 ? '上一页' : '下一页' }, { text: tp === 0 ? '原版物品' : '模组物品', color: '#AAAAAA' }], ui.mouse.x, ui.mouse.y);
+    }
   }
   drawSlots(ui) {
     const hov = this.slotAt(ui.mouse.x, ui.mouse.y);
@@ -1384,7 +1544,8 @@ class CreativeScreen extends ContainerScreen {
   }
   mouseDown(ui, mx, my, button, shift) {
     const tabs = this.tabs();
-    for (let i = 0; i < tabs.length; i++) if (ui.hit(this.tabRect(i), mx, my)) { this.setTab(i); Sound.click(); return; }
+    if (this.pages() > 1) for (const d of [-1, 1]) if (ui.hit(this.pageBtn(d), mx, my)) { const p = this.page || 0; this.setPage(p + d); if ((this.page || 0) !== p) Sound.click(); return; }
+    for (let i = 0; i < tabs.length; i++) if (this.tabShown(i) && ui.hit(this.tabRect(i), mx, my)) { this.setTab(i); Sound.click(); return; }
     if (!tabs[this.tab].inv && mx >= this.x + 175 && mx < this.x + 187 && my >= this.y + 18 && my < this.y + 130) { this.scrolling = true; this.mouseMove(ui, mx, my); return; }
     const s = this.slotAt(mx, my);
     if (s && s.trash) { if (ui.cursor) ui.cursor = null; else if (shift) this.game.player.inv.slots.fill(null, 0, 36); return; }

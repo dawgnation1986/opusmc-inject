@@ -27,8 +27,11 @@ const RS_PLATE = /pressure_plate$/, RS_BUTTON = /_button$/;
 const RS = {
   wires: true,       // false while dust works out its own power (dust doesn't feed dust through blocks)
   mem: new Map(),    // position -> logic state vanilla keeps in the block (comparator output, daylight power, ...)
-  queue: [], queued: new Set(), busy: false,
+  queue: [], qi: 0, queued: new Set(), busy: false,
   torchHist: new Map(),
+  events: [], evSet: new Set(), // pistons to act once this round of updates is done (vanilla block events)
+  pistonT: new Map(),           // position -> { t, ext }: a piston's last move (it is still moving for 2 ticks)
+  meshDirty: false,
 };
 
 // ---- what counts as what ----
@@ -155,12 +158,26 @@ RS.process = function (g) {
   RS.busy = true;
   let n = 0;
   try {
-    while (RS.queue.length && n++ < 60000) {
-      const [x, y, z] = RS.queue.shift();
-      RS.queued.delete(rsKey(x, y, z));
-      RS.update(g, x, y, z);
+    // (read by an index: shift() moved the whole queue each time). The updates first, then one piston's move, and
+    // the updates that brings - as vanilla's block events, run after the updates
+    for (;;) {
+      while (RS.qi < RS.queue.length && n++ < 60000) {
+        const [x, y, z] = RS.queue[RS.qi++];
+        RS.queued.delete(rsKey(x, y, z));
+        RS.update(g, x, y, z);
+      }
+      if (n >= 60000 || !RS.events.length) break;
+      const [x, y, z] = RS.events.shift();
+      RS.evSet.delete(rsKey(x, y, z));
+      RS.pistonEvent(g, x, y, z);
     }
-  } finally { RS.busy = false; if (RS.queue.length > 60000) { RS.queue.length = 0; RS.queued.clear(); } }
+  } finally {
+    RS.busy = false;
+    if (RS.qi >= RS.queue.length || RS.queue.length - RS.qi > 60000) { RS.queue.length = 0; RS.queued.clear(); } else RS.queue = RS.queue.slice(RS.qi);
+    RS.qi = 0;
+    // (the chunks the pistons changed meshed again once, not after every piston)
+    if (RS.meshDirty) { RS.meshDirty = false; if (g.flushMesh) g.flushMesh(); }
+  }
 };
 
 // ---- dust ----
@@ -306,18 +323,18 @@ RS.update = function (g, x, y, z) {
     const mem = RS.memOf(x, base, z);
     if (p !== !!mem.powered) {
       mem.powered = p;
-      if (!!(bm & 4) !== p && k !== 'iron_door_never') { const nm = p ? bm | 4 : bm & ~4; w.setMeta(x, base, z, nm); w.setMeta(x, base + 1, z, nm | 8); Sound.door([x, y, z], p); g.flushMesh && g.flushMesh(); }
+      if (!!(bm & 4) !== p && k !== 'iron_door_never') { const nm = p ? bm | 4 : bm & ~4; w.setMeta(x, base, z, nm); w.setMeta(x, base + 1, z, nm | 8); Sound.door([x, y, z], p, k); g.flushMesh && g.flushMesh(); }
     }
     return;
   }
   if (b.trapdoor) {
     const p = RS.neighborSignal(g, x, y, z), mem = RS.memOf(x, y, z);
-    if (p !== !!mem.powered) { mem.powered = p; if (!!(m & 4) !== p) { w.setMeta(x, y, z, p ? m | 4 : m & ~4); Sound.door([x, y, z], p); } }
+    if (p !== !!mem.powered) { mem.powered = p; if (!!(m & 4) !== p) { w.setMeta(x, y, z, p ? m | 4 : m & ~4); Sound.door([x, y, z], p, k); } }
     return;
   }
   if (b.gate) {
     const p = RS.neighborSignal(g, x, y, z), mem = RS.memOf(x, y, z);
-    if (p !== !!mem.powered) { mem.powered = p; if ((prop(id, m, 'open') === 'true') !== p) { w.setMeta(x, y, z, Features.withProp(id, m, 'open', p)); Sound.door([x, y, z], p); } }
+    if (p !== !!mem.powered) { mem.powered = p; if ((prop(id, m, 'open') === 'true') !== p) { w.setMeta(x, y, z, Features.withProp(id, m, 'open', p)); Sound.door([x, y, z], p, k); } }
   }
 };
 RS.memOf = (x, y, z) => { const k = rsKey(x, y, z); let v = RS.mem.get(k); if (!v) RS.mem.set(k, v = {}); return v; };
@@ -330,7 +347,11 @@ RS.edge = function (g, x, y, z, powered, fire) {
 
 // ---- torches ----
 RS.torchAttach = function (id, m) { return rsk(id) === 'redstone_wall_torch' ? RS_OPP[prop(id, m, 'facing')] : 'down'; };
-RS.torchSupported = function (g, x, y, z, id, m) { const d = RS.torchAttach(id, m), v = RS_DIRS[d]; return rsFull(g.world.getBlock(x + v[0], y + v[1], z + v[2])); };
+// (the same rule as the other torches: the middle of a fence's / wall's top, glass, a top slab ... - not only full cubes)
+RS.torchSupported = function (g, x, y, z, id, m) {
+  if (typeof Features !== 'undefined' && g.survivalR) return Features.canSurvive(g.survivalR(), id, m, x, y, z);
+  const d = RS.torchAttach(id, m), v = RS_DIRS[d]; return rsFull(g.world.getBlock(x + v[0], y + v[1], z + v[2]));
+};
 RS.torchPowered = function (g, x, y, z, id, m) { const d = RS.torchAttach(id, m), v = RS_DIRS[d]; return RS.has(g, x + v[0], y + v[1], z + v[2], d); };
 
 // ---- repeaters and comparators ----
@@ -356,7 +377,7 @@ RS.comparatorOut = function (g, x, y, z, id, m) {
   // reading a block behind it (or behind a solid block)
   const r1 = RS.analog(g, x + v[0], y, z + v[2]);
   if (r1 !== null) a = r1;
-  else if (a < 15 && conductor(w.getBlock(x + v[0], y, z + v[2]))) { const r2 = RS.analog(g, x + 2 * v[0], y, z + 2 * v[2]); if (r2 !== null) a = Math.max(a, r2); }
+  else if (a < 15 && conductor(w.getBlock(x + v[0], y, z + v[2]))) { const r2 = RS.analog(g, x + 2 * v[0], y, z + 2 * v[2]); if (r2 !== null) a = r2; } // (replaces the block's power: ComparatorBlock.getInputSignal)
   let s = 0;
   for (const d of RS_SIDES(f)) {
     const u = RS_DIRS[d], sx = x + u[0], sz = z + u[2], sid = w.getBlock(sx, y, sz);
@@ -376,6 +397,7 @@ RS.analog = function (g, x, y, z) {
     return any ? Math.floor(1 + f / c.size * 14) : 0;
   }
   if (k === 'cake') return (7 - (+prop(id, m, 'bites') || 0)) * 2;
+  if (/copper_bulb$/.test(k)) return prop(id, m, 'lit') === 'true' ? 15 : 0; // (it read nothing)
   if (k === 'composter') return +prop(id, m, 'level') || 0;
   if (/cauldron$/.test(k)) return k === 'water_cauldron' || k === 'powder_snow_cauldron' ? +prop(id, m, 'level') || 0 : k === 'lava_cauldron' ? 3 : 0;
   if (k === 'end_portal_frame') return prop(id, m, 'eye') === 'true' ? 15 : 0;
@@ -495,6 +517,7 @@ RS.tick = function (g, x, y, z) {
     }
     case 'dispenser': case 'dropper': RS.dispense(g, x, y, z, id, m); return true;
     case 'crafter': RS.craft(g, x, y, z, id, m); return true;
+    case 'piston': case 'sticky_piston': RS.updatePiston(g, x, y, z, id, m); return true; // (done moving: pushes again if powered)
     case 'detector_rail': RS.detectorCheck(g, x, y, z); return true;
     case 'tripwire_hook': case 'tripwire': RS.tripCheck(g, x, y, z); return true;
   }
@@ -610,6 +633,7 @@ function blockPushReaction(g, x, y, z) {
   if ((k === 'piston' || k === 'sticky_piston') && prop(id, w.getMeta(x, y, z), 'extended') === 'true') return 'block';
   if (g.blockEntities.has(rsKey(x, y, z)) || b.chestLike || b.beRender || b.onUse === 'furnace' || /^(hopper|dispenser|dropper|crafter|brewing_stand|jukebox|lectern|beehive|bee_nest|chiseled_bookshelf|decorated_pot|bell|campfire|soul_campfire)$/.test(k) || b.be) return 'block';
   if (k.endsWith('glazed_terracotta')) return 'push';
+  if (/^(end_rod|powder_snow|dead_\w+_coral(_fan|_wall_fan)?)$/.test(k)) return 'move'; // (vanilla pushes these, though not solid: end rods popped off as items; a wall fan off its wall pops after)
   if (REPLACEABLE[id] || b.needsSupport || b.door || b.bed || !b.solid || isWire(id) || /^(repeater|comparator|lever|.*_button|redstone_torch|redstone_wall_torch|.*pressure_plate|cobweb|cactus|.*_carpet_never|flower_pot|.*_flower_pot|ladder|scaffolding|snow|.*_sign|.*_hanging_sign|.*_banner|dragon_egg|.*lantern|.*_bed|.*_head|.*_skull|melon|pumpkin_never|tripwire|tripwire_hook)$/.test(k)) return 'destroy';
   return 'move';
 }
@@ -681,17 +705,36 @@ RS.resolve = function (g, px, py, pz, dir, extending) {
   return { toMove, toDestroy };
 };
 function stickTogether(a, b) { const ka = rsk(a), kb = rsk(b); return !((ka === 'slime_block' && kb === 'honey_block') || (ka === 'honey_block' && kb === 'slime_block')) && (isSticky(a) || isSticky(b)); }
+// a piston that should move does it as an event after the updates (vanilla checkIfExtend -> blockEvent): it moved at
+// once inside them, so one powering itself (a redstone block it pushes away and pulls back) went back and forth
+// 60,000 times a frame - the game froze ("粘性活塞上放红石块卡死", "飞行器卡住")
 RS.updatePiston = function (g, x, y, z, id, m) {
   const f = prop(id, m, 'facing'), ext = prop(id, m, 'extended') === 'true';
-  const p = RS.qcPowered(g, x, y, z, f);
-  if (p && !ext) RS.pistonMove(g, x, y, z, id, m, true);
-  else if (!p && ext) RS.pistonMove(g, x, y, z, id, m, false);
+  if (RS.qcPowered(g, x, y, z, f) === ext) return;
+  const k = rsKey(x, y, z);
+  if (!RS.evSet.has(k)) { RS.evSet.add(k); RS.events.push([x, y, z]); }
 };
-RS.pistonMove = function (g, x, y, z, id, m, extending) {
+// the event (vanilla triggerEvent): power looked at again; what vanilla's moving blocks take 2 ticks for is kept as
+// time - a piston that pulled back can push again 3 ticks later, one pulled back within 2 ticks of pushing leaves its
+// block where it went (a sticky piston's short pulse)
+RS.pistonEvent = function (g, x, y, z) {
+  const w = g.world, id = w.getBlock(x, y, z), k = rsk(id);
+  if (k !== 'piston' && k !== 'sticky_piston') return;
+  const m = w.getMeta(x, y, z), ext = prop(id, m, 'extended') === 'true', p = RS.qcPowered(g, x, y, z, prop(id, m, 'facing'));
+  if (p === ext) return;
+  const key = rsKey(x, y, z), now = g.tickCount;
+  let last = RS.pistonT.get(key);
+  if (last && (last.t > now || now - last.t >= 3)) { RS.pistonT.delete(key); last = null; }
+  if (p && last && !last.ext) { w.schedule(x, y, z, 3 - (now - last.t)); return; }
+  if (!RS.pistonMove(g, x, y, z, id, m, p, !p && !!last && last.ext)) return;
+  if (RS.pistonT.size > 4096) for (const [pk, v] of RS.pistonT) if (v.t > now || now - v.t >= 3) RS.pistonT.delete(pk);
+  RS.pistonT.set(key, { t: now, ext: p });
+};
+RS.pistonMove = function (g, x, y, z, id, m, extending, spit) {
   const w = g.world, f = prop(id, m, 'facing'), v = RS_DIRS[f], sticky = rsk(id) === 'sticky_piston';
   const head = [x + v[0], y + v[1], z + v[2]];
   let res = { toMove: [], toDestroy: [] };
-  if (extending || sticky) {
+  if (extending || (sticky && !spit)) {
     res = RS.resolve(g, x, y, z, f, extending);
     if (!res) return false;
   }
@@ -700,14 +743,17 @@ RS.pistonMove = function (g, x, y, z, id, m, extending) {
   for (const p of res.toDestroy) { const did = w.getBlock(...p); if (did && !IS_FLUID[did]) g.dropBlockLoot(...p, did, w.getMeta(...p), null); w.setBlock(...p, 0, 0); }
   // move: take them all out, then put them all back one step on
   // (a waterlogged block takes its water along, leaving none behind)
+  // (a dead coral wall fan goes out first and back last: taken off a block moving with it, it popped and came back too)
   const blocks = res.toMove.map(p => [p, w.getBlock(...p), w.getMeta(...p), w.isWaterlogged(...p)]);
+  const wallFan = (bid) => /_wall_fan$/.test(rsk(bid));
+  blocks.sort((a, b) => wallFan(b[1]) - wallFan(a[1]));
   if (!extending) w.setBlock(...head, 0, 0); // the head goes first
   for (const [p, , , wl] of blocks) { if (wl) w.setWaterlogged(...p, false); w.setBlock(...p, 0, 0, 3); }
   // the head is in place before the blocks come back, and they come back from the bottom up, so nothing that
   // falls (sand, gravel, anvils ...) finds air under it on the way
   let hm = 0; const hid = BID.piston_head;
   if (extending) { hm = Features.withProp(hid, 0, 'facing', f); hm = Features.withProp(hid, hm, 'type', sticky ? 'sticky' : 'normal'); hm = Features.withProp(hid, hm, 'short', 'false'); w.setBlock(...head, hid, hm); }
-  for (const [p, bid, bm, wl] of blocks.slice().sort((a, b) => a[0][1] - b[0][1])) {
+  for (const [p, bid, bm, wl] of blocks.slice().sort((a, b) => wallFan(a[1]) - wallFan(b[1]) || a[0][1] - b[0][1])) {
     w.setBlock(p[0] + d[0], p[1] + d[1], p[2] + d[2], bid, bm);
     if (wl) w.setWaterlogged(p[0] + d[0], p[1] + d[1], p[2] + d[2], true);
   }
@@ -735,7 +781,16 @@ RS.pistonMove = function (g, x, y, z, id, m, extending) {
   // everything that moved, and around it, gets its update (observers see it too)
   for (const [p] of blocks) { RS.wake(...p); RS.wake(p[0] + d[0], p[1] + d[1], p[2] + d[2]); }
   RS.wake(...head);
-  g.flushMesh && g.flushMesh();
+  // an observer moved sees its new place once it has got there (vanilla: its shape updated when the moving block
+  // finishes, 2 ticks on - a pulse 2 later); one moved while powered goes off. It never fired: flying machines stood still
+  for (const [p, bid, bm] of blocks) {
+    if (rsk(bid) !== 'observer') continue;
+    const nx = p[0] + d[0], ny = p[1] + d[1], nz = p[2] + d[2];
+    if (w.getBlock(nx, ny, nz) !== bid) continue;
+    if (prop(bid, bm, 'powered') === 'true') RS.set(g, nx, ny, nz, bid, Features.withProp(bid, bm, 'powered', false));
+    else { w.ticks.delete(rsKey(nx, ny, nz)); w.schedule(nx, ny, nz, 4); }
+  }
+  RS.meshDirty = true;
   return true;
 };
 
@@ -776,7 +831,7 @@ RS.dispense = function (g, x, y, z, id, m) {
   else if (key === 'tnt') { g.entities.push(new PrimedTNT(g, ...front)); take(); }
   else if (key === 'water_bucket' || key === 'lava_bucket') {
     const cur = w.getBlock(...front);
-    if (key === 'water_bucket' && canWaterlog(cur, w.getMeta(...front)) && !w.isWaterlogged(...front)) { w.setWaterlogged(...front, true); be.slots[i] = makeStack('bucket'); }
+    if (key === 'water_bucket' && canWaterlog(cur, w.getMeta(...front)) && !w.isWaterlogged(...front)) { w.setWaterlogged(...front, true); if (g.dowseCampfire) g.dowseCampfire(...front, 'entity.generic.extinguish_fire'); be.slots[i] = makeStack('bucket'); }
     else if (!cur || REPLACEABLE[cur]) { w.setBlock(...front, key === 'water_bucket' ? WATER : LAVA, 0); be.slots[i] = makeStack('bucket'); } else done = false;
   } else if (key === 'bucket') {
     const cur = w.getBlock(...front);
@@ -785,7 +840,7 @@ RS.dispense = function (g, x, y, z, id, m) {
   } else if (key === 'flint_and_steel') {
     const cur = w.getBlock(...front);
     if (rsk(cur) === 'tnt') { w.setBlock(...front, 0, 0); g.entities.push(new PrimedTNT(g, ...front)); }
-    else if (!cur && g.fireSupported(...front)) w.setBlock(...front, 171, 0); else done = false;
+    else if (!cur && g.fireSupported(...front)) w.setBlock(...front, g.fireIdAt(...front), 0); else done = false;
     if (done) { st.dmg = (st.dmg || 0) + 1; if (st.dmg >= ITEMS[st.id].durability) be.slots[i] = null; }
   } else if (key === 'bone_meal') {
     const cur = w.getBlock(...front);
@@ -797,7 +852,7 @@ RS.dispense = function (g, x, y, z, id, m) {
   } else if (typeof CART_ITEM !== 'undefined' && CART_ITEM[key] !== undefined && isRail(w.getBlock(...front))) { g.entities.push(new Minecart(g, front[0] + 0.5, front[1] + 0.0625, front[2] + 0.5, CART_ITEM[key])); take(); }
   else if (key === 'shears') {
     const sheep = RS.entitiesIn(g, [front[0], front[1], front[2], front[0] + 1, front[1] + 1, front[2] + 1], (e) => e.type === 'sheep' && !e.sheared && !e.baby)[0];
-    if (sheep) { sheep.sheared = true; for (let k = 0, n = 1 + ((Math.random() * 3) | 0); k < n; k++) g.dropItem(sheep.pos[0], sheep.pos[1] + 1, sheep.pos[2], makeStack(128 + sheep.woolColor, 1)); st.dmg = (st.dmg || 0) + 1; } else done = false;
+    if (sheep) { sheep.sheared = true; for (let k = 0, n = 1 + ((Math.random() * 3) | 0); k < n; k++) g.dropItem(sheep.pos[0], sheep.pos[1] + 1, sheep.pos[2], makeStack(woolKey(sheep.woolColor), 1)); st.dmg = (st.dmg || 0) + 1; } else done = false;
   } else if (key === 'glass_bottle') {
     const cur = w.getBlock(...front);
     if (cur === WATER) { take(); const pot = { id: ITEM_KEY.potion, count: 1, dmg: 0, pot: 'water' }; if (RS.insert(RS.container(g, x, y, z), pot, null)) g.dropItem(...c, pot, shoot(0.2)); } else done = false;

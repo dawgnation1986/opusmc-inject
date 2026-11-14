@@ -8,6 +8,7 @@ const OFF = 40;
 const keyOfStack = (s) => s && ITEMS[s.id] ? ITEMS[s.id].key : null;
 const isSpear = (k) => !!k && /_spear$/.test(k);
 const AMMO = new Set(['arrow', 'tipped_arrow', 'spectral_arrow']);
+const glintOf = (st) => typeof stackGlint === 'function' && stackGlint(st); // (enchanted: the glint in the hand, render.js)
 
 // ---- models: the shield and trident (vanilla ShieldModel / TridentModel, turned y-up) ----
 Renderer.prototype.initEquipModels = function () {
@@ -42,13 +43,99 @@ function applyDisplay(m, d, left) {
   M4.scale(m, sc[0], sc[1], sc[2]);
 }
 // the shield's inventory icon: its model at the item model's gui angle (vanilla item/shield display)
-Renderer.prototype.shieldIcon = function (d, env, vp) {
+Renderer.prototype.shieldIcon = function (d, env, vp, tex) {
   this.initEquipModels();
   d = d || { r: [15, -25, -5], t: [2, 3, 0], s: [0.65, 0.65, 0.65] };
   const m = M4.create();
   applyDisplay(m, d, false);
   M4.translate(m, -0.5, -0.5, -0.5); M4.scale(m, 1, 1, -1);
-  this.drawModel('eq_shield', this.beTex('shield_base'), m, null, [1, 0], { ...env, ambient: [0.3, 0.3, 0.3] }, { vp });
+  this.drawModel('eq_shield', tex || this.beTex('shield_base'), m, null, [1, 0], { ...env, ambient: [0.3, 0.3, 0.3] }, { vp });
+};
+// a shield with a banner on it: its own icon (the atlas has the plain one), drawn like buildIcons' once per pattern
+// texture and kept; null for a plain shield or while the pattern texture loads
+Renderer.prototype.shieldStackIcon = function (st) {
+  const tex = typeof shieldTex === 'function' && st && (st.base || (st.patterns && st.patterns.length)) ? shieldTex(this, st) : null;
+  if (!tex || tex === 'shield_base' || !this.iconSize) return null;
+  const cache = this._shieldIcons || (this._shieldIcons = new Map());
+  if (cache.has(tex)) return cache.get(tex);
+  const gl = this.gl, S = this.iconSize;
+  const prevFb = gl.getParameter(gl.FRAMEBUFFER_BINDING), view = gl.getParameter(gl.VIEWPORT), cc = gl.getParameter(gl.COLOR_CLEAR_VALUE);
+  const sc = gl.isEnabled(gl.SCISSOR_TEST), dt = gl.isEnabled(gl.DEPTH_TEST), cu = gl.isEnabled(gl.CULL_FACE), bl = gl.isEnabled(gl.BLEND);
+  const fb = gl.createFramebuffer(), t = gl.createTexture(), rb = gl.createRenderbuffer();
+  gl.bindTexture(gl.TEXTURE_2D, t); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  this.texEp = -1; // (a texture bound on the active unit: the frame's go again, like tex2D)
+  gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, S, S);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+  gl.viewport(0, 0, S, S); gl.disable(gl.SCISSOR_TEST); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
+  const vp = M4.create(); M4.ortho(vp, -0.5, 0.5, -0.5, 0.5, -10, 10);
+  const savedVP = this.vp, savedCam = this.camPos, savedFx = this.fxOn; this.vp = vp; this.camPos = [0, 0, 0]; this.fxOn = false;
+  const px = new Uint8Array(S * S * 4);
+  try {
+    const info = typeof VM !== 'undefined' && VM.ready && VM.data.items.shield, model = info && info.m !== undefined ? VM.data.models[info.m] : null;
+    this.shieldIcon(model && model.display && model.display.gui, { tick: 0, day: 1, fogColor: [0, 0, 0], fogNear: 1e8, fogFar: 2e8, nightTint: [1, 1, 1] }, vp, tex);
+    gl.readPixels(0, 0, S, S, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  } catch (e) { cache.set(tex, null); return null; } finally {
+    this.vp = savedVP; this.camPos = savedCam; this.fxOn = savedFx;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb); gl.viewport(view[0], view[1], view[2], view[3]); gl.clearColor(cc[0], cc[1], cc[2], cc[3]);
+    if (sc) gl.enable(gl.SCISSOR_TEST); if (!dt) gl.disable(gl.DEPTH_TEST); if (cu) gl.enable(gl.CULL_FACE); if (bl) gl.enable(gl.BLEND);
+    gl.deleteFramebuffer(fb); gl.deleteTexture(t); gl.deleteRenderbuffer(rb);
+  }
+  const cv = document.createElement('canvas'); cv.width = cv.height = S;
+  const x = cv.getContext('2d'), img = x.createImageData(S, S);
+  for (let y = 0; y < S; y++) img.data.set(px.subarray((S - 1 - y) * S * 4, (S - y) * S * 4), y * S * 4); // (GL's rows from the bottom)
+  x.putImageData(img, 0, 0);
+  if (cache.size > 64) cache.delete(cache.keys().next().value);
+  cache.set(tex, cv);
+  return cv;
+};
+// the shield on the ground (ctx 'ground': m at the item's feet) and in item frames ('fixed'): its model with the item
+// model's own transform - the item model has no shape of its own, only a planks texture, and a plank showed
+Game.prototype.drawShieldItem = function (st, m, l, env, ctx) {
+  const r = this.renderer, vim = r.itemModel(st.id), d = vim && vim.model && vim.model.display && vim.model.display[ctx];
+  r.initEquipModels();
+  const mm = r.mat(m);
+  // (vanilla rests an item's lowest point on the ground: the shield's, through its ground transform, is 0.047 below)
+  if (ctx === 'ground') M4.translate(mm, 0, 0.046875, 0);
+  applyDisplay(mm, d || { r: [0, 0, 0], t: [0, 0, 0], s: [0.25, 0.25, 0.25] }, false);
+  M4.translate(mm, -0.5, -0.5, -0.5); M4.scale(mm, 1, 1, -1);
+  const gl = r.gl, cull = gl.isEnabled(gl.CULL_FACE);
+  gl.disable(gl.CULL_FACE);
+  r.drawModel('eq_shield', typeof shieldTex === 'function' ? shieldTex(r, st) : r.beTex('shield_base'), mm, null, l, env, { glint: glintOf(st) && 'entity' });
+  if (cull) gl.enable(gl.CULL_FACE);
+};
+// ---- armour trims, worn (vanilla EquipmentLayerRenderer.renderTrim): the pattern's grey texture for the layer
+// (humanoid / humanoid_leggings) recoloured from trim_palette's keys to the material's palette (PalettedPermutations),
+// the material's darker palette on armour of its own material; null until the images have loaded ----
+const TRIM_DARKER = new Set(['iron', 'gold', 'diamond', 'netherite', 'copper']);
+Renderer.prototype.trimTex = function (trim, armorMat, legs) {
+  if (!trim || !trim.pattern || !trim.material) return null;
+  const asset = armorMat === 'golden' ? 'gold' : armorMat === 'chain' ? 'chainmail' : armorMat;
+  const pal = trim.material + (asset === trim.material && TRIM_DARKER.has(trim.material) ? '_darker' : '');
+  const pat = 'trims/entity/' + (legs ? 'humanoid_leggings/' : 'humanoid/') + trim.pattern, key = '@trim:' + pat + ':' + pal;
+  if (this.entityTex[key]) return key;
+  if (this._trimFail && this._trimFail.has(key)) return null;
+  const paths = [pat, 'trims/color_palettes/trim_palette', 'trims/color_palettes/' + pal];
+  if (paths.some(p => !(window.ETEX && ETEX[p]))) { (this._trimFail || (this._trimFail = new Set())).add(key); return null; } // (a trim this game has no texture for)
+  const ims = paths.map(p => { this.etex(p); return this.images['@' + p]; });
+  if (ims.some(i => !i)) return null;
+  const px = (im) => { const c = document.createElement('canvas'); c.width = im.width; c.height = im.height; const x = c.getContext('2d'); x.drawImage(im, 0, 0); return [c, x, x.getImageData(0, 0, im.width, im.height)]; };
+  const [c, x, d] = px(ims[0]), keys = px(ims[1])[2].data, vals = px(ims[2])[2].data, map = new Map();
+  for (let i = 0; i + 3 < keys.length && i + 3 < vals.length; i += 4) map.set((keys[i] << 16) | (keys[i + 1] << 8) | keys[i + 2], i);
+  const p = d.data;
+  for (let i = 0; i < p.length; i += 4) {
+    if (!p[i + 3]) continue;
+    let j = map.get((p[i] << 16) | (p[i + 1] << 8) | p[i + 2]);
+    // (a key a few levels off - a browser's colour handling of the PNG: the nearest one)
+    if (j === undefined) { let best = 300; for (let q = 0; q + 3 < keys.length; q += 4) { const e = (keys[q] - p[i]) ** 2 + (keys[q + 1] - p[i + 1]) ** 2 + (keys[q + 2] - p[i + 2]) ** 2; if (e < best) { best = e; j = q; } } }
+    if (j === undefined || j + 3 >= vals.length) continue;
+    p[i] = vals[j]; p[i + 1] = vals[j + 1]; p[i + 2] = vals[j + 2]; p[i + 3] = Math.round(p[i + 3] * vals[j + 3] / 255);
+  }
+  x.putImageData(d, 0, 0);
+  this.entityTex[key] = this.tex2D(c, false);
+  return key;
 };
 // a 16x16 picture of one texture of the strip (for icons that change: crossbow, compass, clock)
 Renderer.prototype.tileIcon = function (tex) {
@@ -60,6 +147,8 @@ Renderer.prototype.tileIcon = function (tex) {
 
 // the flat texture an item shows now (crossbow loading / loaded, broken elytra ...), or null for its usual one
 function itemStateTex(st, p) {
+  // (a mod's tool borrowing the crossbow's key - 匠魂's - draws its own loading frames)
+  if (st && ITEMS[st.id] && ITEMS[st.id].tcTool) return null;
   const k = keyOfStack(st);
   if (k === 'crossbow') {
     if (st.charged && st.charged.length) return keyOfStack(st.charged[0]) === 'firework_rocket' ? 'i_crossbow_firework' : 'i_crossbow_arrow';
@@ -107,14 +196,21 @@ Game.prototype.useEquipment = function (held, def) {
     p.boostT = 10 * 1 + 2 + Math.floor(Math.random() * 6);
     Sound.ev('entity.firework_rocket.launch', p.pos, 3, 1);
     if (this.mode !== 'creative') { held.count--; if (!held.count) p.inv.slots[p.inv.sel] = null; }
+    p.swing(); // (vanilla: a successful use swings the hand)
     return true;
   }
-  // the other hand: a shield goes up when the main hand has nothing to do
-  const off = p.inv.slots[OFF], ok = keyOfStack(off);
-  if (ok === 'shield' && !this.mainHandBusy(held, def) && !(p.shieldCd > this.tickCount)) { this.startUsing(off, 'off'); return true; }
+  // (a shield in the other hand: raised by its own turn, Game.useHands)
   return false;
 };
-Game.prototype.rainingAt = function (p) { return this.weather > 0.2 && !this.dryAt(Math.floor(p.pos[0]), Math.floor(p.pos[2])) && this.world.getHeight && Math.floor(p.pos[1]) >= this.world.getHeight(Math.floor(p.pos[0]), Math.floor(p.pos[2])); };
+// vanilla Entity.isInRain: rain (not snow) falls on the feet or the head - nothing above them (World has no getHeight:
+// this was always false, so riptide never worked in the rain)
+Game.prototype.rainingAt = function (p) {
+  if (this.dim !== 'overworld' || !(this.weather > 0.2)) return false;
+  const x = Math.floor(p.pos[0]), z = Math.floor(p.pos[2]);
+  if (this.dryAt(x, z)) return false;
+  const top = this.world.surfaceY(x, z);
+  return [Math.floor(p.pos[1]), Math.floor(p.pos[1] + p.h)].some(y => y > top && !(this.world.gen2 ? this.snowsAt(x, y, z) : this.isCold(x, z)));
+};
 // while held down
 Game.prototype.usingTick = function (st) {
   const p = this.player, k = keyOfStack(st);
@@ -158,9 +254,8 @@ Game.prototype.shootCrossbow = function (cb) {
     const ang = list.length > 1 ? [0, -10, 10][i] * Math.PI / 180 : 0, c = Math.cos(ang), s = Math.sin(ang);
     const dir = [d[0] * c - d[2] * s, d[1], d[0] * s + d[2] * c];
     if (keyOfStack(ammo) === 'firework_rocket') {
-      // a firework flies straight and bursts (the explosion's look comes with the fireworks of phase 3)
-      const a = new Arrow(this, p.pos[0], p.pos[1] + p.eye() - 0.15, p.pos[2], dir.map(v => v * 1.6), p);
-      a.snowball = ammo.id; a.firework = true; a.baseDmg = 5; this.entities.push(a);
+      // a firework flies straight and bursts on what it hits (itemuse.js FireworkRocket, shot)
+      this.entities.push(new FireworkRocket(this, p.pos[0], p.pos[1] + p.eye() - 0.15, p.pos[2], ammo, dir.map(v => v * 1.6), p));
       return;
     }
     const a = new Arrow(this, p.pos[0], p.pos[1] + p.eye() - 0.15, p.pos[2], dir.map(v => v * 3.15), p);
@@ -171,7 +266,8 @@ Game.prototype.shootCrossbow = function (cb) {
   });
   delete cb.charged;
   Sound.ev('item.crossbow.shoot', p.pos, 1, 1 / (Math.random() * 0.5 + 1.8) + 0.63);
-  this.damageHeld(list.length > 1 ? 3 : 1);
+  // (vanilla getDurabilityUse: 3 a firework, 1 an arrow, for each one shot)
+  this.damageHeld(list.reduce((n, a) => n + (keyOfStack(a) === 'firework_rocket' ? 3 : 1), 0));
 };
 
 // ---- trident: thrown (it comes back with loyalty), or riptide carries the player ----
@@ -214,7 +310,7 @@ class ThrownTrident extends Arrow {
     M4.rotY(m, this.yaw); M4.rotX(m, this.pitch - Math.PI / 2);
     M4.translate(m, 0, 0.6, 0);
     r.gl.disable(r.gl.CULL_FACE);
-    r.drawModel('eq_trident', r.beTex('trident'), m, null, l, env);
+    r.drawModel('eq_trident', r.beTex('trident'), m, null, l, env, { glint: glintOf(this.stack) && 'entity' });
     r.gl.enable(r.gl.CULL_FACE);
   }
 }
@@ -301,28 +397,42 @@ Game.prototype.updateTarget = function () {
 // the stab lasts 19 ticks (vanilla swing_animation "stab")
 const _spSwing = Player.prototype.swing;
 Player.prototype.swing = function () {
+  this.swingN = (this.swingN || 0) + 1; // (Game.useHands: did the main hand's use do something)
   if (isSpear(keyOfStack(this.inv && this.inv.held))) { if (this.swingT <= SPEAR.stab / 2) { this.swingT = SPEAR.stab; this.swingDur = SPEAR.stab; this.swingStab = true; } return; }
   this.swingDur = 6; this.swingStab = false;
   return _spSwing.call(this);
 };
-// a jab: hurts every entity on the line, as hard as the charge (vanilla's 0.2 + 0.8 s²; it did nothing at all before
-// the charge was full - "长矛没伤害", feedback 2026-11-01/02); the lunge only with a full charge
+// which hand swings (vanilla's swing(hand)): the other one while its item is used (swingOff); kept while a swing
+// that doesn't restart runs on
+(() => {
+  const _sw = Player.prototype.swing;
+  Player.prototype.swing = function (...args) {
+    const t = this.swingT, r = _sw.apply(this, args);
+    if (this.swingT !== t) this.swingHand = this.offSwing ? 'off' : 'main';
+    return r;
+  };
+  Player.prototype.swingOff = function () { this.offSwing = true; try { this.swing(); } finally { this.offSwing = false; } };
+})();
+// a jab: hurts every entity on the line - only at a full charge (vanilla minimum_attack_charge 1: Minecraft.startAttack
+// does nothing before; it had gone off at any charge, so clicking fast stabbed without end, "长矛没有攻击冷却").
+// false when it can't go yet. (0.1 tick of slack: the item data's attack speed is rounded, 1.05 for vanilla's 1.0526)
 Game.prototype.spearJab = function () {
   const p = this.player, held = p.inv.held, def = ITEMS[held.id];
-  const s = Math.min(1, this.attackStrength()), scale = 0.2 + s * s * 0.8;
+  if (this.attackStrength(0.1) < 1) return false;
   const list = this.spearTargets();
   Sound.ev('item.spear.attack', p.pos, 1, 1);
   let hit = false;
   for (const { e } of list) {
-    const dmg = (Math.max(0, (def.attack || 1) + effectAttackBonus(p)) + enchantAttackBonus(held, e)) * scale;
+    const dmg = Math.max(0, (def.attack || 1) + effectAttackBonus(p)) + enchantAttackBonus(held, e);
     const src = { type: 'player', attacker: p, knockFrom: p.pos, knock: 0.4 + heldEnch(p, 'knockback') * 0.5, player: true, looting: heldEnch(p, 'looting') };
     if (e.hurt(dmg, src)) { hit = true; Sound.ev('item.spear.hit', e.pos, 1, 1); const fa = heldEnch(p, 'fire_aspect'); if (fa && !e.fireproof && e instanceof Living) e.fire = Math.max(e.fire || 0, 80 * fa); }
   }
   // lunge: the jab carries the player forward (at a cost in food)
   const lu = heldEnch(p, 'lunge');
-  if (lu && s >= 0.9) { const d = this.lookDir(); p.vel[0] += d[0] * 0.458 * lu; p.vel[2] += d[2] * 0.458 * lu; p.exhaust(lu * 1.5); }
+  if (lu) { const d = this.lookDir(); p.vel[0] += d[0] * 0.458 * lu; p.vel[2] += d[2] * 0.458 * lu; p.exhaust(lu * 1.5); }
   if (hit) { this.damageHeld(1); p.exhaust(0.1); }
-  p.attackT = 0;
+  p.attackT = 0; p.swing();
+  return true;
 };
 // held up: what the point runs into
 Game.prototype.spearTick = function (st) {
@@ -339,7 +449,12 @@ Game.prototype.spearTick = function (st) {
     const knock = held <= kw.knock && rel >= SPEAR.knockSpeed;
     e.spearHitT = this.tickCount + 10;
     p.spearKickT = this.tickCount;
-    if (e.hurt(kw.mult * rel + enchantAttackBonus(st, e), { type: 'player', attacker: p, player: true, knockFrom: p.pos, knock: knock ? 0.9 : 0 })) { Sound.ev('item.spear.hit', e.pos, 1, 1); this.damageHeld(1); }
+    if (e.hurt(kw.mult * rel + enchantAttackBonus(st, e), { type: 'player', attacker: p, player: true, knockFrom: p.pos, knock: knock ? 0.9 : 0 })) {
+      Sound.ev('item.spear.hit', e.pos, 1, 1);
+      // (fire aspect sets it alight as with any hit - vanilla's post-attack effects; only the jab had it)
+      const fa = enchLevel(st, 'fire_aspect'); if (fa && !e.fireproof) e.fire = Math.max(e.fire || 0, 80 * fa);
+      this.damageHeld(1);
+    }
   }
 };
 
@@ -347,12 +462,20 @@ Game.prototype.spearTick = function (st) {
 const _attack = Game.prototype.attack;
 Game.prototype.attack = function (e) {
   const p = this.player, held = p.inv.held, k = keyOfStack(held);
-  if (isSpear(k)) { this.spearJab(); p.swing(); this.attackCd = 2; return; }
-  if (k === 'mace' && p.fallDist > 1.5 && !p.onGround) {
+  if (isSpear(k)) { if (this.spearJab()) this.attackCd = 2; return; }
+  // (vanilla canSmashAttack: not while gliding)
+  const smash = k === 'mace' && p.fallDist > 1.5 && !p.onGround && !p.gliding;
+  if (smash) {
     const d = p.fallDist, dens = enchLevel(held, 'density');
     let bonus = d <= 3 ? 4 * d : d <= 8 ? 12 + 2 * (d - 3) : 22 + (d - 8);
     bonus += 0.5 * dens * d;
-    p.maceBonus = bonus;
+    p.maceBonus = bonus; // (game.js attack: added after the cool-down's scaling)
+  }
+  _attack.call(this, e);
+  p.maceBonus = 0;
+  // the smash's after-effects come after the hit (vanilla MaceItem.hurtEnemy), so a falling full-strength smash crits too
+  if (smash) {
+    const d = p.fallDist;
     p.fallDist = 0; p.vel[1] = Math.max(p.vel[1], 0.01);
     const wb = enchLevel(held, 'wind_burst');
     if (wb) p.vel[1] = 0.7 + 0.35 * (wb - 1);
@@ -364,12 +487,7 @@ Game.prototype.attack = function (e) {
     for (let i = 0; i < 30; i++) this.particles.spawn('crit', e.pos[0] + (Math.random() - 0.5) * 2, e.pos[1] + 0.1, e.pos[2] + (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 0.4, 0.2, (Math.random() - 0.5) * 0.4);
     Sound.ev(d > 5 ? 'item.mace.smash_ground_heavy' : 'item.mace.smash_ground', e.pos, 1, 1);
   }
-  _attack.call(this, e);
-  p.maceBonus = 0;
 };
-// the attack damage the swing uses: with the mace's bonus
-const _effectAttackBonus = effectAttackBonus;
-effectAttackBonus = function (p) { return _effectAttackBonus(p) + (p.maceBonus || 0); };
 
 // ---- the shield: blocks what hits it from the front once raised (a quarter second) ----
 Player.prototype.blocking = function () {
@@ -434,7 +552,7 @@ Player.prototype.glideTravel = function () {
   if (v[1] < 0 && hl > 0) { const k = v[1] * -0.1 * cp; v[0] += d[0] * k / hl; v[1] += k; v[2] += d[2] * k / hl; }
   if (pitch < 0 && hl > 0) { const k = hv * -Math.sin(pitch) * 0.04; v[0] -= d[0] * k / hl; v[1] += k * 3.2; v[2] -= d[2] * k / hl; }
   if (hl > 0) { v[0] += (d[0] / hl * hv - v[0]) * 0.1; v[2] += (d[2] / hl * hv - v[2]) * 0.1; }
-  if (this.boostT > 0) { this.boostT--; for (let i = 0; i < 3; i++) v[i] += d[i] * 0.1 + (d[i] * 1.5 - v[i]) * 0.5; if (this.game.tickCount % 2) this.game.particles.spawn('smoke', this.pos[0], this.pos[1], this.pos[2], -v[0] * 0.3, -v[1] * 0.3, -v[2] * 0.3); }
+  if (this.boostT > 0) { for (let i = 0; i < 3; i++) v[i] += d[i] * 0.1 + (d[i] * 1.5 - v[i]) * 0.5; if (this.game.tickCount % 2) this.game.particles.spawn('smoke', this.pos[0], this.pos[1], this.pos[2], -v[0] * 0.3, -v[1] * 0.3, -v[2] * 0.3); }
   v[0] *= 0.99; v[1] *= 0.98; v[2] *= 0.99;
   const before = Math.hypot(v[0], v[2]);
   this.move(v[0], v[1], v[2]);
@@ -453,6 +571,11 @@ Player.prototype.travel = function (fwd, strafe, speed, jump) {
   if (this.riptideT > 0) { this.riptideT--; }
   return _travel.call(this, fwd, strafe, speed, jump);
 };
+// a rocket's push lasts its flight, gliding or not (vanilla FireworkRocketEntity: its lifetime runs on, it pushes only
+// while the player glides). It counted down only while gliding: landed, the rest waited for the next glide - "不放烟花
+// 也能长距离加速滑翔", feedback 11-08
+const _eqTick = Player.prototype.tick;
+Player.prototype.tick = function (input) { _eqTick.call(this, input); if (this.boostT > 0) this.boostT--; };
 // jump pressed in the air: start gliding
 Game.prototype.tryGlide = function () {
   const p = this.player;
@@ -494,7 +617,7 @@ Game.prototype.drawHandStack = function (st, left, a, env) {
   if (this.settings.bobbing) { const bob = lerp(p.prevBob, p.bob, a) * PI * 0.6, amt = lerp(p.prevBobAmt || 0, p.bobAmt, a); M4.translate(m, Math.sin(bob) * amt * 0.5, -Math.abs(Math.cos(bob) * amt), 0); }
   const eq = left ? 0 : 1 - lerp(p.oHandH ?? 1, p.handH ?? 1, a);
   const using = p.usingItem === st.id && (p.useHand === 'off') === left;
-  const sw = !left && p.swingT > 0 ? clamp((6 - p.swingT + a) / 6, 0, 1) : 0;
+  const sw = (p.swingHand === 'off') === left && p.swingT > 0 ? clamp((6 - p.swingT + a) / 6, 0, 1) : 0;
   const useT = p.useT + a;
   const armT = () => M4.translate(m, s * 0.56, -0.52 - eq * 0.6, -0.72);
   if (isSpear(k)) {
@@ -528,7 +651,19 @@ Game.prototype.drawHandStack = function (st, left, a, env) {
     if (f > 0.1) M4.translate(m, 0, Math.sin((useT - 0.1) * 1.3) * (f - 0.1) * 0.004, 0);
     M4.translate(m, 0, 0, f * 0.04); M4.scale(m, 1, 1, 1 + f * 0.2); M4.rotY(m, -s * 45 * D);
   } else if (using && k === 'shield') armT();
-  else {
+  else if (using && k === 'bow') {
+    // the bow drawn and the food eaten on this side (as game.js drawHand does them for the main hand)
+    armT(); M4.translate(m, s * -0.2785682, 0.18344387, 0.15731531); M4.rotX(m, -13.935 * D); M4.rotY(m, s * 35.3 * D); M4.rotZ(m, s * -9.785 * D);
+    let f = useT / 20; f = (f * f + f * 2) / 3; if (f > 1) f = 1;
+    if (f > 0.1) M4.translate(m, 0, Math.sin((useT - 0.1) * 1.3) * (f - 0.1) * 0.004, 0);
+    M4.translate(m, 0, 0, f * 0.04); M4.scale(m, 1, 1, 1 + f * 0.2); M4.rotY(m, -s * 45 * D);
+  } else if (using && (def.food || /^(potion|milk_bucket|honey_bottle|ominous_bottle)$/.test(k))) {
+    const dur = k === 'honey_bottle' ? 40 : 32, rest = dur - useT + 1, f1 = rest / dur;
+    if (f1 < 0.8) M4.translate(m, 0, Math.abs(Math.cos(rest / 4 * PI) * 0.1), 0);
+    const f3 = 1 - Math.pow(Math.max(0, f1), 27);
+    M4.translate(m, s * f3 * 0.6, f3 * -0.5, 0); M4.rotY(m, s * f3 * 90 * D); M4.rotX(m, f3 * 10 * D); M4.rotZ(m, s * f3 * 30 * D);
+    armT();
+  } else {
     const f1 = Math.sqrt(sw);
     M4.translate(m, s * -0.4 * Math.sin(f1 * PI), 0.2 * Math.sin(f1 * PI * 2), -0.2 * Math.sin(sw * PI));
     armT();
@@ -538,30 +673,33 @@ Game.prototype.drawHandStack = function (st, left, a, env) {
   }
   const lt = p.lightAt(), env2 = { ...env, fogNear: 1e8, fogFar: 2e8 }, ctx = left ? 'firstperson_lefthand' : 'firstperson_righthand';
   r.gl.disable(r.gl.CULL_FACE);
-  if (k === 'shield' || k === 'trident') {
+  // (匠魂's javelin borrows the trident's key - its aim above - but is drawn as itself, not the trident's model)
+  if (k === 'shield' || (k === 'trident' && !def.tcTool)) {
     r.initEquipModels();
     const disp = DISPLAY[k === 'shield' ? (using ? 'shield_blocking' : 'shield') : 'trident'];
     applyDisplay(m, disp[ctx] || disp.firstperson_righthand, left);
     // the special renderers draw their model flipped (y down to y up, z turned) from the item's corner
     M4.translate(m, -0.5, -0.5, -0.5); M4.scale(m, 1, 1, -1);
-    r.drawModel(k === 'shield' ? 'eq_shield' : 'eq_trident', k === 'shield' ? (typeof shieldTex === 'function' ? shieldTex(r, st) : r.beTex('shield_base')) : r.beTex('trident'), m, null, lt, env2, { vp: proj });
+    r.drawModel(k === 'shield' ? 'eq_shield' : 'eq_trident', k === 'shield' ? (typeof shieldTex === 'function' ? shieldTex(r, st) : r.beTex('shield_base')) : r.beTex('trident'), m, null, lt, env2, { vp: proj, glint: glintOf(st) && 'entity' });
   } else {
     const vim = r.itemModel(st.id), b = def.block !== undefined ? BLOCKS[def.block] : null;
     const flat = vim ? (vim.gen || (!b && !vim.mesh)) : (!b || def.flat || b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door);
     const disp = vim && vim.model && vim.model.display;
     if (flat) {
-      applyDisplay(m, (disp && (disp[ctx] || disp.firstperson_righthand)) || { r: [0, -90, 25], t: [1.13, 3.2, 1.13], s: [0.68, 0.68, 0.68] }, left);
+      // (no model - a mod's tool: item/handheld's left hand, which isn't the right hand's mirrored)
+      const hh = left && (def.tool || def.attack || def.handheld);
+      applyDisplay(m, (disp && (disp[ctx] || disp.firstperson_righthand)) || { r: hh ? [0, 90, -25] : [0, -90, 25], t: [1.13, 3.2, 1.13], s: [0.68, 0.68, 0.68] }, left);
       M4.translate(m, -0.5, -0.5, 0);
       const stTex = itemStateTex(st, p);
-      this.drawLayers(stTex ? [[T(stTex), null]] : this.itemLayers(st, def, vim, b), m, env2, lt);
+      this.drawLayers(stTex ? [[T(stTex), null]] : this.itemLayers(st, def, vim, b), m, env2, lt, glintOf(st));
     } else {
       // a model whose display has no first-person transform is drawn untransformed in vanilla (the spyglass)
-      applyDisplay(m, disp ? (disp[ctx] || disp.firstperson_righthand || { r: [0, 0, 0], t: [0, 0, 0], s: [1, 1, 1] }) : { r: [0, 45, 0], s: [0.4, 0.4, 0.4] }, left);
-      // (a bed: both halves, renderer.itemModel - head at z 0, foot at z 1, so centred at z 1)
-      M4.translate(m, -0.5, -0.5, b && b.bed ? -1 : -0.5);
-      if (vim && vim.mesh) r.drawMesh(vim.mesh, m, env2, lt);
+      applyDisplay(m, disp ? (disp[ctx] || disp.firstperson_righthand || { r: [0, 0, 0], t: [0, 0, 0], s: [1, 1, 1] }) : { r: [0, left ? 225 : 45, 0], s: [0.4, 0.4, 0.4] }, left);
+      // (a bed: both halves, renderer.itemModel - head at z 0, foot at z 1 like vanilla's composite item, from -0.5 too)
+      M4.translate(m, -0.5, -0.5, -0.5);
+      if (vim && vim.mesh) r.drawMesh(vim.mesh, m, env2, lt, { glint: glintOf(st) && 'item' });
       else if (this.isBEItem(st)) { this.drawBEItem(b, m, lt, env2, proj); r.gl.disable(r.gl.CULL_FACE); }
-      else r.drawMesh(this.blockMesh(def.block, b.facing ? 4 : 0), m, env2, lt);
+      else r.drawMesh(this.blockMesh(def.block, b.facing ? 4 : 0), m, env2, lt, { glint: glintOf(st) && 'item' });
     }
   }
   r.gl.enable(r.gl.CULL_FACE);
@@ -624,7 +762,7 @@ Game.prototype.drawWings = function (e, m, lt, env, overlay, vp) {
   }
   const gl = r.gl, cull = gl.isEnabled(gl.CULL_FACE);
   gl.disable(gl.CULL_FACE); // both sides of the wings show
-  r.drawModel('eq_elytra', r.beTex('elytra_wings'), m, { lw: { rx: -xr, rz: zr, zx: true }, rw: { rx: -xr, rz: -zr, zx: true } }, lt, env, { overlay, vp });
+  r.drawModel('eq_elytra', r.beTex('elytra_wings'), m, { lw: { rx: -xr, rz: zr, zx: true }, rw: { rx: -xr, rz: -zr, zx: true } }, lt, env, { overlay, vp, glint: glintOf(c) && 'armor' });
   if (cull) gl.enable(gl.CULL_FACE);
 };
 // held items on a humanoid model (the player, other players, mobs): vanilla's ItemInHandLayer - from the hand,
@@ -634,6 +772,7 @@ Game.prototype.drawWings = function (e, m, lt, env, overlay, vp) {
 const TP_DEFAULT = {
   generated: { r: [0, 0, 0], t: [0, 3, 1], s: [0.55, 0.55, 0.55] }, handheld: { r: [0, -90, 55], t: [0, 4, 0.5], s: [0.85, 0.85, 0.85] },
   block: { r: [75, 45, 0], t: [0, 2.5, 0], s: [0.375, 0.375, 0.375] },
+  handheld_left: { r: [0, 90, -55], t: [0, 4, 0.5], s: [0.85, 0.85, 0.85] }, // (item/handheld's own left hand)
 };
 Game.prototype.heldAttach = function (e, model, main, off, lt, env) {
   if (!main && !off) return null;
@@ -669,28 +808,28 @@ Game.prototype.drawHeldItem = function (am, st, left, lt, env, e, dx) {
   M4.rotX(am, -Math.PI / 2); M4.rotY(am, Math.PI); M4.translate(am, (left ? -1 : 1) / 16, 0.125, -0.625);
   if (isSpear(k)) this.spearInHand(am, st, left, e, using);
   const ctx = left ? 'thirdperson_lefthand' : 'thirdperson_righthand';
-  if (k === 'shield' || k === 'trident') {
+  if (k === 'shield' || (k === 'trident' && !def.tcTool)) {
     r.initEquipModels();
     const disp = DISPLAY[k === 'shield' ? (using ? 'shield_blocking' : 'shield') : (using ? 'trident_throwing' : 'trident')];
     applyDisplay(am, disp[ctx] || disp.thirdperson_righthand, left);
     M4.translate(am, -0.5, -0.5, -0.5); M4.scale(am, 1, 1, -1);
-    r.drawModel(k === 'shield' ? 'eq_shield' : 'eq_trident', k === 'shield' ? (typeof shieldTex === 'function' ? shieldTex(r, st) : r.beTex('shield_base')) : r.beTex('trident'), am, null, lt, env);
+    r.drawModel(k === 'shield' ? 'eq_shield' : 'eq_trident', k === 'shield' ? (typeof shieldTex === 'function' ? shieldTex(r, st) : r.beTex('shield_base')) : r.beTex('trident'), am, null, lt, env, { glint: glintOf(st) && 'entity' });
     return;
   }
   const b = def.block !== undefined ? BLOCKS[def.block] : null, vim = r.itemModel(st.id);
   const flat = vim ? (vim.gen || (!b && !vim.mesh)) : (!b || def.flat || b.shape === SH_CROSS || b.shape === SH_TORCH || b.ladder || b.door);
   const disp = vim && vim.model && vim.model.display;
-  const d = (disp && (disp[ctx] || disp.thirdperson_righthand)) || (flat ? (def.tool || def.attack ? TP_DEFAULT.handheld : TP_DEFAULT.generated) : TP_DEFAULT.block);
+  const d = (disp && (disp[ctx] || disp.thirdperson_righthand)) || (flat ? (def.tool || def.attack || def.handheld ? (left ? TP_DEFAULT.handheld_left : TP_DEFAULT.handheld) : TP_DEFAULT.generated) : TP_DEFAULT.block);
   applyDisplay(am, d, left);
   if (flat) {
     M4.translate(am, -0.5, -0.5, 0);
     const stTex = e === this.player ? itemStateTex(st, e) : null;
-    this.drawLayers(stTex ? [[T(stTex), null]] : this.itemLayers(st, def, vim, b), am, env, lt);
+    this.drawLayers(stTex ? [[T(stTex), null]] : this.itemLayers(st, def, vim, b), am, env, lt, glintOf(st));
   } else {
-    M4.translate(am, -0.5, -0.5, b && b.bed ? -1 : -0.5);
-    if (vim && vim.mesh) r.drawMesh(vim.mesh, am, env, lt);
+    M4.translate(am, -0.5, -0.5, -0.5);
+    if (vim && vim.mesh) r.drawMesh(vim.mesh, am, env, lt, { glint: glintOf(st) && 'item' });
     else if (this.isBEItem(st)) this.drawBEItem(b, am, lt, env);
-    else r.drawMesh(this.blockMesh(def.block, b.facing ? 4 : 0), am, env, lt);
+    else r.drawMesh(this.blockMesh(def.block, b.facing ? 4 : 0), am, env, lt, { glint: glintOf(st) && 'item' });
   }
 };
 
@@ -714,7 +853,8 @@ function dynamicIconTex(st, p) {
   if (!g || !g.world || !(k === 'compass' || k === 'recovery_compass' || k === 'clock')) return null;
   const now = performance.now(), spin = g.dim !== 'overworld';
   if (k === 'clock') {
-    const t = spin ? (now / 1000 * 0.37) % 1 : (((g.world.time % 24000) / 24000 - 0.25) % 1 + 1) % 1;
+    // (vanilla's time property: the sun's angle from the time of day - world.time counts ticks from 0 each session)
+    const t = spin ? (now / 1000 * 0.37) % 1 : g.celestial();
     return 'i_clock_' + String(Math.round(t * 64) % 64).padStart(2, '0');
   }
   const target = k === 'compass' ? (g.worldSpawn || p.spawn) : g.lastDeath && g.lastDeath.dim === g.dim ? g.lastDeath.pos : null;
@@ -729,21 +869,36 @@ function dynamicIconTex(st, p) {
 }
 const _equipDeath = Game.prototype.onPlayerDeath;
 Game.prototype.onPlayerDeath = function (src) { this.lastDeath = { dim: this.dim, pos: this.player.pos.map(Math.floor) }; return _equipDeath.call(this, src); };
-// the other hand's block or torch: placed when the main hand has nothing to do with what is aimed at - vanilla tries
-// the main hand, then the other one; only the main hand was tried, and a torch in the other hand never went down
-// (10-31 feedback). Not when the aimed block has a use of its own (a door, a chest, a bed ...) unless sneaking, and
-// not when the main hand's tool works on blocks (a hoe tills, an axe strips, a shovel makes paths)
-(() => {
-  const _use = Game.prototype.use;
-  const usesBlock = (b) => !!(b && (b.onUse || b.door || b.bed || b.trapdoor || b.gate));
-  Game.prototype.use = function () {
-    const p = this.player, inv = p.inv, held = inv.held, off = inv.slots[OFF], t = this.target;
-    const od = off && ITEMS[off.id], hd = held && ITEMS[held.id];
-    const offPlaces = od && (od.block !== undefined || od.places) && !od.armor;
-    const mainIdle = !this.mainHandBusy(held, hd) && (!hd || !hd.tool || /^(sword|pickaxe)$/.test(hd.tool.type));
-    if (!offPlaces || !t || this.targetEntity || !mainIdle || (!p.sneaking && usesBlock(BLOCKS[t.id]))) return _use.call(this);
-    // (the other hand's stack in the main hand's place for the one use, then back - what it used up stays used up)
-    const sel = inv.sel; inv.slots[sel] = off; inv.slots[OFF] = held || null;
-    try { return _use.call(this); } finally { const left = inv.slots[sel]; inv.slots[sel] = inv.slots[OFF]; inv.slots[OFF] = left || null; }
-  };
-})();
+// ---- the use button with two hands (vanilla Minecraft.startUseItem): the main hand first - the aimed entity, the
+// aimed block, then the item itself - and the other hand only when that did nothing. Only a block or torch (and a
+// shield) of the other hand were ever tried, so its food, bow, crossbow, spear, wind charge, firework or potion did
+// nothing ("副手的东西不能用"), and a shield went up before a hoe could till ("拿着盾不能锄地") ----
+// fn with the other hand's stack in the selected slot, so every use reads it as the held item (what it used up stays
+// used up, a bowl or empty bucket left goes back to the other hand); a use it starts is the other hand's
+Game.prototype.withOffhand = function (fn) {
+  const p = this.player, inv = p.inv, sel = inv.sel, main = inv.slots[sel];
+  inv.slots[sel] = inv.slots[OFF] || null; inv.slots[OFF] = main || null;
+  if (p.useHand === 'off') p.useHand = 'main';
+  // (and the other hand is the one that swings - swingHand: the main hand did, 11-07 feedback)
+  p.offSwing = true;
+  try { return fn(); } finally {
+    p.offSwing = false;
+    const left = inv.slots[sel]; inv.slots[sel] = inv.slots[OFF] || null; inv.slots[OFF] = left || null;
+    if (p.usingItem && p.useHand === 'main') p.useHand = 'off';
+  }
+};
+Game.prototype.useHands = function () {
+  const p = this.player, inv = p.inv;
+  // what a use changes: a held use, a swing, a screen, the hands' stacks, a new entity (thrown, placed), a boost
+  const sig = () => { const h = inv.slots[inv.sel], o = inv.slots[OFF]; return [p.usingItem, p.swingN, this.ui.screen, h, h && h.count, h && h.dmg, o, o && o.count, this.entities.length, p.boostT, p.vehicle]; };
+  p.useHand = 'main';
+  const before = sig(), hd = before[3] && ITEMS[before[3].id];
+  this.use();
+  if (!inv.slots[OFF] || sig().some((v, i) => v !== before[i])) return;
+  // a block the main hand could not put there (someone in the way, no room, no support) failed, it did not pass
+  // (vanilla BlockItem.useOn FAIL): the other hand's torch went down under the feet while pillaring
+  if (hd && (hd.block !== undefined || hd.places) && this.target && !this.targetEntity) return;
+  // (at an entity the other hand has no block to work on)
+  const t = this.target; if (this.targetEntity) this.target = null;
+  try { this.withOffhand(() => this.use()); } finally { this.target = t; }
+};

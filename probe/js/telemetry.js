@@ -17,7 +17,7 @@
 // here must not mix into the real data.
 // ---------------------------------------------------------------------------
 const TELEMETRY_V = 1;
-const GAME_BUILD = '2026.10.30';
+const GAME_BUILD = '2026.11.13p';
 const Telemetry = {
   g: null, sid: Math.random().toString(36).slice(2, 10), seq: 0, t0: performance.now(),
   hist: new Uint16Array(201), frames: 0, sum: { cpu: 0, chunk: 0, render: 0, gpu: 0, gpuN: 0 }, minuteAt: 0, playMs: 0, afkMs: 0,
@@ -27,7 +27,7 @@ const Telemetry = {
   base() { return typeof RoomService !== 'undefined' ? RoomService.base() : ''; },
   on() {
     const g = this.g;
-    if (!g || g.settings.telemetry === false || !/^https?:$/.test(location.protocol) || !this.base()) return false;
+    if (!g || g.settings.telemetry === false || (typeof Live !== 'undefined' && Live.get('client.telemetry', true) === false) || !/^https?:$/.test(location.protocol) || !this.base()) return false;
     // (*.localhost / *.test too: test pages on per-test origins sent their numbers to the live service, and its origin
     // check banned the developer's own address, 2026-11-03)
     const local = /^(localhost|127\.|\[::1\]|192\.168\.|10\.)/.test(location.hostname) || /\.(localhost|test)$/.test(location.hostname);
@@ -86,6 +86,7 @@ const Telemetry = {
   stateChanged(from, to) {
     const now = performance.now();
     this.prevState = to;
+    Crumbs.mark('s:' + to);
     if (to === 'title' && !this.titleAt) { this.titleAt = now; this.event('title', { ms: Math.round(now) }); }
     if (to === 'loading' || to === 'switching') this.loadStart = now;
     if (to === 'play' && this.loadStart) { this.event('enter', { ms: Math.round(now - this.loadStart), net: !!this.g.net, dim: this.g.dim }); this.loadStart = 0; }
@@ -152,8 +153,11 @@ const Telemetry = {
     document.addEventListener('visibilitychange', () => { if (document.hidden) this.flush(false); });
     addEventListener('error', (e) => this.error('page', e.message, e.error && e.error.stack || (e.filename ? `${e.filename}:${e.lineno}` : '')));
     addEventListener('unhandledrejection', (e) => this.error('promise', e.reason && e.reason.message || String(e.reason), e.reason && e.reason.stack));
-    try { g.renderer.canvas.addEventListener('webglcontextlost', () => this.event('contextlost', {})); } catch (e) { }
+    try { g.renderer.canvas.addEventListener('webglcontextlost', () => { this.event('contextlost', {}); Crumbs.mark('ctx'); }); } catch (e) { }
     this.install(); if (this._fresh) this.event('firstrun', {});
+    try { Crumbs.init(g); } catch (e) { }
+    try { Instances.init(g); } catch (e) { }
+    try { SensorProbe.init(); } catch (e) { }
     // (the title screen was already up when this started: the time it took from opening the page)
     if (g.state === 'title' && !this.titleAt) { this.titleAt = performance.now(); this.event('title', { ms: Math.round(this.titleAt) }); }
   },
@@ -177,7 +181,7 @@ const Telemetry = {
   const _err = Game.prototype.reportError;
   Game.prototype.reportError = function (where, e, quiet) { Telemetry.error(where, e && e.message || e, e && e.stack); return _err.call(this, where, e, quiet); };
   const _open = UI.prototype.open;
-  UI.prototype.open = function (screen) { if (screen && screen.constructor) Telemetry.count('screen:' + screen.constructor.name); return _open.call(this, screen); };
+  UI.prototype.open = function (screen) { if (screen && screen.constructor) { Telemetry.count('screen:' + screen.constructor.name); Crumbs.mark('o:' + screen.constructor.name.replace(/Screen$/, '')); } return _open.call(this, screen); };
   const _death = Game.prototype.onPlayerDeath;
   Game.prototype.onPlayerDeath = function (src) { Telemetry.count('death:' + (src && src.type || 'other')); return _death.call(this, src); };
   const _load = Game.prototype.loadWorld;
@@ -200,7 +204,205 @@ const Telemetry = {
     const _fail = NetClient.prototype.fail;
     NetClient.prototype.fail = function (reason) { Telemetry.count('net:fail'); Telemetry.event('netfail', { why: String(reason || '').slice(0, 80) }); return _fail.call(this, reason); };
   }
+  // (the last things done, for Crumbs: the window's size, the on-screen keyboard's field, errors)
+  const _rs = Game.prototype.resize;
+  Game.prototype.resize = function (...a) { try { Crumbs.mark('rs:' + innerWidth + 'x' + innerHeight); } catch (e) { } return _rs.apply(this, a); };
+  const _si = UI.prototype.showInput, _hi = UI.prototype.hideInput;
+  UI.prototype.showInput = function (...a) { try { if (this.input.style.display !== 'block') Crumbs.mark('kb+'); } catch (e) { } return _si.apply(this, a); };
+  UI.prototype.hideInput = function (...a) { try { if (this.input.style.display === 'block') Crumbs.mark('kb-'); } catch (e) { } return _hi.apply(this, a); };
+  const _err2 = Game.prototype.reportError;
+  Game.prototype.reportError = function (where, e, quiet) { try { Crumbs.mark('e:' + String(where || '').slice(0, 14)); } catch (x) { } return _err2.call(this, where, e, quiet); };
 })();
+
+// ---- the last moments of a page that died (11-07: a page killed on Apple devices sends nothing, and the reopened one
+// can't say what it was doing - one in five iPhone sessions in the Bilibili app since the 11-06 version). Every 2 s and
+// at each mark, a few words about this page go into the page's storage (what state and screen, the canvases' sizes,
+// the last 10 things done); leaving the page properly marks it ended. The next page to start sends any that never
+// ended, as a 'died' event: how long it lived, whether it was hidden (killed in the background) or on screen. Nothing
+// about the player - the same kind of facts as the rest of the statistics ----
+const Crumbs = {
+  KEY: 'mcjs-crumbs', marks: [], g: null, lastW: 0,
+  mark(k) {
+    this.marks.push(Math.round((performance.now() - Telemetry.t0) / 1000) + ':' + k);
+    if (this.marks.length > 10) this.marks.shift();
+    if (this.g && performance.now() - this.lastW > 200) this.save();
+  },
+  read() { try { const o = JSON.parse(localStorage.getItem(this.KEY) || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e) { return {}; } },
+  save(end) {
+    const g = this.g; if (!g) return;
+    this.lastW = performance.now();
+    try {
+      const r = g.renderer, u = g.ui, sc = u && u.screen, inp = u && u.input;
+      const rec = {
+        at: Date.now(), up: Math.round((performance.now() - Telemetry.t0) / 1000), v: GAME_BUILD, st: g.state, sc: sc ? sc.constructor.name : '',
+        hid: !!document.hidden, gl: r ? r.canvas.width + 'x' + r.canvas.height : '', ui: u && u.canvas ? u.canvas.width + 'x' + u.canvas.height : '',
+        rs: r ? r.resScale : 0, sec: r && r.sections ? r.sections.size : 0, mb: r && r.arena ? Math.round(r.arena.total / 1048576) : 0,
+        ent: g.entities ? g.entities.length : 0, net: !!g.net, kb: !!(inp && document.activeElement === inp), lost: !!(r && r.lost),
+        old: !!Instances.stale, mk: this.marks.join(' '), end: end ? 1 : 0,
+      };
+      const all = this.read(); all[Telemetry.sid] = rec;
+      const ids = Object.keys(all); if (ids.length > 4) for (const k of ids.sort((a, b) => all[a].at - all[b].at).slice(0, ids.length - 4)) delete all[k];
+      localStorage.setItem(this.KEY, JSON.stringify(all));
+    } catch (e) { }
+  },
+  init(g) {
+    this.g = g;
+    // (the pages before this one that never ended: each sent once, then forgotten. One written in the last 5 s may be
+    // a page still open - a second one: Instances - and is left)
+    const all = this.read(), now = Date.now();
+    for (const [sid, r] of Object.entries(all)) {
+      if (sid === Telemetry.sid || !r || typeof r !== 'object') continue;
+      if (!r.end && now - r.at < 5000) continue;
+      if (!r.end && now - r.at < 6 * 3600e3) Telemetry.event('died', { ago: Math.round((now - r.at) / 1000), up: r.up, v: r.v, st: r.st, sc: r.sc, hid: r.hid, gl: r.gl, ui: r.ui, rs: r.rs, sec: r.sec, mb: r.mb, ent: r.ent, net: r.net, kb: r.kb, lost: r.lost, old: r.old, mk: String(r.mk || '').slice(0, 260) });
+      delete all[sid];
+    }
+    try { localStorage.setItem(this.KEY, JSON.stringify(all)); } catch (e) { }
+    if (Telemetry.events.some((e) => e.type === 'died')) setTimeout(() => Telemetry.flush(false), 4000);
+    setInterval(() => this.save(), 2000);
+    addEventListener('pagehide', () => this.save(true));
+    // (back from the background: not ended after all - a page hidden and shown again fires no pagehide on some phones)
+    document.addEventListener('visibilitychange', () => { this.mark(document.hidden ? 'hid' : 'vis'); });
+    document.addEventListener('fullscreenchange', () => this.mark('fs'));
+    document.addEventListener('webkitfullscreenchange', () => this.mark('fs'));
+    this.save();
+  },
+};
+
+// ---- one game page at a time (11-07). In the Bilibili app 去三连 opens the video's own page, and that page has the
+// game's entry on it: players came back by it and had a second game page open, the first behind it (telemetry: new
+// sessions started while the old one was still sending - and the old one, gone back to, would save its older world over
+// the new page's). A page on screen says so (at start, and each time it comes back on screen); a page that hears of a
+// newer one saves once if it is on screen (two tabs on a computer), then writes nothing more - the saves are refused -
+// pauses, and shows a notice whose button reloads it (and so makes it the newest). A page opened out of sight (a preload)
+// says nothing until it is shown ----
+const Instances = {
+  stale: false, leaving: false, at: 0, ch: null, g: null,
+  key() { return 'mcjs-inst:' + location.pathname; },
+  init(g) {
+    this.g = g;
+    try { this.ch = new BroadcastChannel(this.key()); this.ch.onmessage = (e) => this.heard(e.data); } catch (e) { }
+    addEventListener('storage', (e) => { if (e.key === this.key() && e.newValue) { try { this.heard(JSON.parse(e.newValue)); } catch (x) { } } });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) this.shown(); });
+    // (the saves: refused once stale - wrapped here, after every file has wrapped them its own way: cloudsave.js, p2p.js)
+    if (typeof DB !== 'undefined') for (const k of ['putChunks', 'putWorld']) {
+      const f = DB[k]; if (typeof f !== 'function') continue;
+      DB[k] = function (...a) { return Instances.stale ? Promise.resolve() : f.apply(this, a); };
+    }
+    if (!document.hidden) this.announce();
+  },
+  announce() {
+    this.at = Date.now();
+    const m = { t: 'hello', id: Telemetry.sid, at: this.at };
+    try { localStorage.setItem(this.key(), JSON.stringify(m)); } catch (e) { }
+    try { if (this.ch) this.ch.postMessage(m); } catch (e) { }
+  },
+  // on screen again: a newer page said hello meanwhile (its message may not have reached this one, asleep behind it)
+  shown() {
+    if (this.stale || this.leaving) return;
+    let m = null; try { m = JSON.parse(localStorage.getItem(this.key()) || 'null'); } catch (e) { }
+    if (m && m.id !== Telemetry.sid && m.at > this.at && this.at) { this.goStale(); return; }
+    this.announce();
+  },
+  heard(m) {
+    if (!m || m.t !== 'hello' || m.id === Telemetry.sid || this.stale || this.leaving) return;
+    if (this.at && (m.at > this.at || (m.at === this.at && m.id > Telemetry.sid))) this.goStale();
+  },
+  async goStale() {
+    if (this.stale || this.leaving) return;
+    this.leaving = true;
+    const g = this.g;
+    try { Crumbs.mark('old'); Telemetry.count('inst_old'); Telemetry.event('inst_old', { st: g.state, hid: !!document.hidden }); } catch (e) { }
+    // (on screen - two tabs: what it has is the newest, saved; out of sight it was saved when it was hidden: main.js)
+    try { if (g.state === 'play' && !g.net && !document.hidden && g.saveWorld) await Promise.race([g.saveWorld(true), new Promise((r) => setTimeout(r, 3000))]); } catch (e) { }
+    this.stale = true;
+    try { if (g.state === 'play' && !g.net && g.ui && !(g.ui.screen && g.ui.screen.pauses) && typeof PauseScreen !== 'undefined') g.ui.open(new PauseScreen(g)); } catch (e) { }
+    try { if (g.net && g.net.close) g.net.close(); } catch (e) { }
+    try { if (g.releasePointer) g.releasePointer(); } catch (e) { }
+    try { if (Sound.sleep) Sound.sleep('old'); } catch (e) { }
+    try { this.notice(); } catch (e) { }
+  },
+  notice() {
+    if (this.el || typeof document === 'undefined') return;
+    const d = this.el = document.createElement('div');
+    d.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;z-index:60;box-sizing:border-box;padding:24px;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,0.9);color:#fff;font:15px "Microsoft YaHei",sans-serif;text-align:center';
+    const line = (text, css) => { const e = document.createElement('div'); e.textContent = text; if (css) e.style.cssText = css; d.appendChild(e); return e; };
+    line('游戏在另一个页面里打开了', 'font-size:22px;font-weight:bold;margin-bottom:6px');
+    line('这个页面已经停下，不会再存档，免得覆盖另一个页面的进度');
+    const btn = line('点这里在这个页面继续（会重新载入）', 'margin-top:14px;padding:10px 28px;border:2px solid #fff;background:rgba(255,255,255,0.12)');
+    let going = false;
+    d.addEventListener('pointerup', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (going) return; going = true; btn.textContent = '正在重新载入…';
+      try { Telemetry.count('inst_reload'); Telemetry.flush(false); } catch (x) { }
+      // (not 'play': the page's "leave?" prompt asks only then - nothing here is left to save)
+      try { this.g.state = 'boot'; } catch (x) { }
+      location.reload();
+    });
+    for (const k of ['touchstart', 'touchmove', 'touchend', 'pointerdown', 'mousedown', 'wheel', 'keydown']) d.addEventListener(k, (e) => e.stopPropagation(), { passive: true });
+    (document.getElementById('stage') || document.body).appendChild(d);
+  },
+};
+
+// ---- #A1 陀螺仪, step one: can this device's page hear the gyroscope at all? Out of sight, once per install and build:
+// listens 3 s for deviceorientation / devicemotion, reads the frame's permissions policy, and asks iOS's requestPermission
+// with no tap behind it - WebKit then answers without a prompt: 'denied' when the frame may not have them, a
+// NotAllowedError when only a tap is missing. (The game runs in a cross-origin iframe whose allow= names only pointer-lock:
+// bilibili.com's Toy shell, 11-10; voxpool asks the same way, and gives up after 2 s without an event) ----
+const SensorProbe = {
+  key: 'mcjs-sensor', lastInput: 0, tries: 0,
+  init() {
+    try { if (localStorage.getItem(this.key) === GAME_BUILD) return; } catch (e) { }
+    for (const k of ['pointerdown', 'touchstart', 'mousedown', 'keydown']) addEventListener(k, () => { this.lastInput = performance.now(); }, { capture: true, passive: true });
+    setTimeout(() => this.attempt(), 8000);
+  },
+  // never near a tap: a requestPermission with one behind it puts up iOS's prompt. (Each wait here is over a second, so
+  // WebKit carries no tap into it, and 6 s is longer than a tap's activation lasts)
+  attempt() {
+    if (this.done) return;
+    const quiet = performance.now() - this.lastInput > 6000 && !(navigator.userActivation && navigator.userActivation.isActive);
+    if (!quiet || document.hidden || !Telemetry.on()) { if (++this.tries < 45) setTimeout(() => this.attempt(), 4000); return; }
+    this.run().then((r) => Telemetry.event('sensor', r), () => { });
+  },
+  async run(ms = 3000) {
+    this.done = true;
+    try { localStorage.setItem(this.key, GAME_BUILD); } catch (e) { }
+    const W = window, DOE = W.DeviceOrientationEvent, DME = W.DeviceMotionEvent;
+    const wait = (t) => new Promise((res) => setTimeout(res, t));
+    const r = { fr: W.top !== W.self ? 1 : 0, sec: W.isSecureContext ? 1 : 0, api: '' };
+    [['o', !!DOE], ['m', !!DME], ['r', DOE && typeof DOE.requestPermission === 'function'], ['R', DME && typeof DME.requestPermission === 'function'],
+      ['a', 'ondeviceorientationabsolute' in W], ['s', typeof W.Gyroscope === 'function']].forEach(([k, c]) => { if (c) r.api += k; });
+    const pol = document.permissionsPolicy || document.featurePolicy;
+    if (pol && typeof pol.allowsFeature === 'function') r.fp = ['gyroscope', 'accelerometer', 'magnetometer'].map((f) => { try { return pol.allowsFeature(f) ? 1 : 0; } catch (e) { return 'x'; } }).join('');
+    // the events: when the first came (ms, -1 none), how many, and whether they carried numbers (null: no sensor)
+    const t0 = performance.now(); let hid = !!document.hidden;
+    const o = { at: -1, n: 0, v: 0 }, m = { at: -1, n: 0, v: 0, iv: 0 };
+    const onO = (e) => { if (o.at < 0) o.at = Math.round(performance.now() - t0); o.n++; if (e.alpha != null || e.beta != null || e.gamma != null) o.v = 1; };
+    const onM = (e) => {
+      if (m.at < 0) { m.at = Math.round(performance.now() - t0); m.iv = Math.round(+e.interval || 0); }
+      m.n++; const a = e.accelerationIncludingGravity, rr = e.rotationRate; if ((a && a.x != null) || (rr && rr.alpha != null)) m.v = 1;
+    };
+    const onV = () => { if (document.hidden) hid = true; };
+    addEventListener('deviceorientation', onO, { passive: true }); addEventListener('devicemotion', onM, { passive: true });
+    document.addEventListener('visibilitychange', onV);
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const q = async (name) => { try { const s = await Promise.race([navigator.permissions.query({ name }), wait(1500)]); return s ? s.state : 'slow'; } catch (e) { return 'x'; } };
+        r.pq = (await q('gyroscope')) + '/' + (await q('accelerometer'));
+      }
+      const ask = async (C) => {
+        if (!C || typeof C.requestPermission !== 'function') return undefined;
+        try { return String(await Promise.race([C.requestPermission(), wait(3000).then(() => 'slow')])); }
+        catch (e) { return 'err:' + (e && e.name || '') + ':' + String(e && e.message || '').slice(0, 100); }
+      };
+      r.rp = await ask(DOE); r.rpm = await ask(DME);
+      await wait(Math.max(ms - (performance.now() - t0), r.rp === 'granted' || r.rpm === 'granted' ? 1500 : 0));
+    } finally {
+      removeEventListener('deviceorientation', onO); removeEventListener('devicemotion', onM);
+      document.removeEventListener('visibilitychange', onV);
+    }
+    return Object.assign(r, { oe: o.at, on: o.n, ov: o.v, me: m.at, mn: m.n, mv: m.v, mi: m.iv, hid: hid ? 1 : 0 });
+  },
+};
 
 // ---- feedback (Options -> 遥测数据 -> 反馈问题, the pause menu, the title screen) ----
 const FEEDBACK_KINDS = [['bug', '错误（bug）'], ['lag', '卡顿 / 性能'], ['idea', '建议'], ['other', '其他']];
@@ -217,9 +419,9 @@ async function postFeedback(g, kind, text, shot) {
   };
   try {
     const res = await fetch(Telemetry.base() + '/api/feedback', { method: 'POST', body: JSON.stringify({ v: 1, kind, text, shot, ctx }) });
-    const r = await res.json().catch(() => ({ error: '服务器没有回应' }));
+    const r = await res.json().catch(() => ({ error: '游戏正在更新中…请稍后' }));
     return !res.ok || r.error ? r.error || 'HTTP ' + res.status : null;
-  } catch (e) { return '连不上服务器'; }
+  } catch (e) { return '游戏正在更新中…请稍后'; }
 }
 class FeedbackScreen extends FormScreen {
   constructor(game, parent, shot) {

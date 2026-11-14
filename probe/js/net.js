@@ -53,7 +53,8 @@ class NetPlayer extends Mob {
     const swing = lerp(this.limbSwing - this.limbAmt, this.limbSwing, a) * 0.6662, amt = this.limbAmt;
     const l = Math.cos(swing) * 1.4 * amt, r = -l;
     const t = this.swingT > 0 ? clamp((6 - this.swingT + a) / 6, 0, 1) : 0, sw = Math.sin(t * Math.PI);
-    const P = { head: { ry: this.headYaw, rx: this.pitch }, rarm: { rx: r * 0.7 + sw * 1.5 }, larm: { rx: l * 0.7 }, rleg: { rx: l }, lleg: { rx: r } };
+    const off = this.swingHand === 'off'; // (the off hand's swing: animation 3)
+    const P = { head: { ry: this.headYaw, rx: this.pitch }, rarm: { rx: r * 0.7 + (off ? 0 : sw * 1.5) }, larm: { rx: l * 0.7 + (off ? sw * 1.5 : 0) }, rleg: { rx: l }, lleg: { rx: r } };
     if (this.sneaking) { P.body = { rx: -0.5, t: [0, -1.73 / 16, 5.75 / 16] }; P.head.t = [0, -4.2 / 16, 0]; }
     if (this.vehicleRef) { P.rleg = { rx: 1.4137167, ry: -0.31415927 }; P.lleg = { rx: 1.4137167, ry: 0.31415927 }; } // sitting in a boat or minecart
     else if (this.netSwim) return swimLimbs(P, lerp(this.limbSwing - this.limbAmt, this.limbSwing, a), this.swimming);
@@ -91,6 +92,8 @@ function netVehicleTick() {
   if (this.lerpN > 0) { const k = 1 / this.lerpN; for (let i = 0; i < 3; i++) this.pos[i] += (this.netPos[i] - this.pos[i]) * k; this.lerpN--; }
   if (this.netYaw !== undefined) this.yaw += angDiff(this.netYaw + (this.netYawOff || 0), this.yaw) * 0.5;
   if (this.hurtT > 0) this.hurtT--;
+  // (Boat.tick sets this for a boat steered here only: a sunk one would still draw its water patch)
+  if (this instanceof Boat) { const ws = this.waterState(); this.status = ws.under ? 'under' : ws.top !== null ? 'water' : 'air'; }
   if (this.rider) { if (this.rider === p) p.followVehicle(this); else { const s = this.seat(); this.rider.pos = s; this.rider.netPos = s.slice(); this.rider.lerpN = 0; } }
 }
 function netItemTick() {
@@ -138,8 +141,8 @@ class NetClient {
     // the local test server, now 265 and 16 MB, 11-03)
     ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', name, version: 1, proto: 1, room: opts.room, key: opts.key, token: (opts.room && typeof Account !== 'undefined' && Account.token) || undefined, rd: netRd(game) }));
     ws.onmessage = (e) => { this.stats.msgs++; try { if (typeof e.data === 'string') this.onMessage(JSON.parse(e.data)); else this.onBinary(e.data); } catch (err) { console.error('net', err); } };
-    ws.onerror = () => { if (!this.closed) this.fail(opts.room ? '连不上联机服务器，请稍后再试' : '无法连接到联机中转 ' + url + '（中转程序没有启动？）'); };
-    ws.onclose = () => { if (!this.closed) this.fail('与服务器的连接已断开'); };
+    ws.onerror = () => { if (!this.closed) this.fail(opts.room ? '游戏正在更新中…请稍后' : '无法连接到联机中转 ' + url + '（中转程序没有启动？）'); };
+    ws.onclose = () => { if (!this.closed) this.fail('游戏正在更新中…请稍后'); };
   }
   send(o) { if (this.ws.readyState === 1) this.ws.send(JSON.stringify(o)); }
   // the render distance for the server (session.js writes it as the client information): when it changed, a second
@@ -152,7 +155,7 @@ class NetClient {
     this.closed = true;
     const g = this.g;
     g.leaveServer();
-    g.ui.open(new ConfirmScreen(g, '连接已断开', reason, '返回标题画面', () => g.ui.open(new TitleScreen(g))));
+    g.ui.open(new ConfirmScreen(g, reason === '游戏正在更新中…请稍后' ? '游戏正在更新中' : '连接已断开', reason === '游戏正在更新中…请稍后' ? '请稍后再试' : reason, '返回标题画面', () => g.ui.open(new TitleScreen(g))));
   }
 
   // ---- JSON messages ----
@@ -223,7 +226,7 @@ class NetClient {
       }
       case 'vmove': { const v = p.vehicle; if (v) { v.pos = [m.x, m.y - this.minY, m.z]; v.yaw = toYaw(m.yaw); v.vel = [0, 0, 0]; } break; }
       case 'remove': for (const id of m.ids) { const e = this.ents.get(id); if (e) { e.dead = true; this.ents.delete(id); } this.pendingItems.delete(id); } break;
-      case 'anim': { const e = this.ents.get(m.id); if (e && m.a === 0) e.swingT = 6; break; }
+      case 'anim': { const e = this.ents.get(m.id); if (e && (m.a === 0 || m.a === 3)) { e.swingT = 6; e.swingHand = m.a === 3 ? 'off' : 'main'; } break; }
       case 'hurt': {
         if (m.id === this.eid) { p.hurtTime = 10; Sound.ev('entity.player.hurt', p.pos, 1, 1); break; }
         const e = this.ents.get(m.id); if (e) e.hurtTime = 10; break;
@@ -278,7 +281,8 @@ class NetClient {
       case 'xp': p.xp = g.xpTotalFor(m.level) + Math.round(m.bar * g.xpNeeded(m.level)); break;
       case 'death': this.deathMsg = m.msg; g.ui.message(m.msg); break;
       // ---- what entities hold and look like ----
-      case 'equip': { const e = this.ents.get(m.id); if (e) { const s = this.stackIn(m.item); e.heldId = s && !s.unk ? s.id : null; } break; }
+      // (only the slots that changed come: no main hand in it leaves what it holds alone)
+      case 'equip': { const e = this.ents.get(m.id); if (e && m.item !== undefined) { const s = this.stackIn(m.item); e.heldId = s && !s.unk ? s.id : null; } break; }
       case 'meta': {
         const e = this.ents.get(m.id) || this.pendingItems.get(m.id);
         if (!e) break;
@@ -286,12 +290,14 @@ class NetClient {
         if (m.item !== undefined && e instanceof ItemEntity) {
           const s = this.stackIn(m.item);
           if (s && !s.unk) { e.stack = s; if (this.pendingItems.delete(m.id)) { g.entities.push(e); this.ents.set(m.id, e); } }
-        }
+        } else if (m.item && e.netPotion) { const s = this.stackIn(m.item); if (s) e.netPot = s.pot; }
         break;
       }
       case 'collect': { const e = this.ents.get(m.id); if (e) { e.dead = true; this.ents.delete(m.id); if (m.by === this.eid) Sound.pop && Sound.pop(p.pos); } break; }
       case 'status': { const e = this.ents.get(m.id); if (e && m.s === 3) e.deathTime = 1; break; }
       case 'kick': this.fail(m.reason || '被服务器断开'); break;
+      // the admin panel changed a live setting (js/live.js): read them again now
+      case 'live': if (typeof Live !== 'undefined') Live.fetch(m.v); break;
       // the room service: waiting for the room's server, then which room this is
       case 'notice': if (g.ui.screen instanceof LoadingScreen) { g.ui.screen.text = m.text; g.ui.screen.setQueue(null); } else g.ui.message(m.text, '#AAAAAA'); break;
       // the server's rooms are full: this room waits its turn (rooms.js queue)
@@ -338,10 +344,12 @@ class NetClient {
     const w = this.g.world; if (!w) return;
     const v = this.stateMap[s] || 0, yy = y - this.minY;
     // the cell's water comes with the server's state (taken off first: world.setBlock would leave it as water)
-    const ch = w.getChunk(x >> 4, z >> 4), i = (yy << 8) | ((z & 15) << 4) | (x & 15), was = !!(ch && ch.wl && ch.wl.delete(i));
+    const ch = w.getChunk(x >> 4, z >> 4), i = (yy << 8) | ((z & 15) << 4) | (x & 15), old = ch ? ch.getB(i) : 0, was = !!(ch && ch.wl && ch.wl.delete(i));
     w.setBlock(x, yy, z, v >> 8, v & 255, 0);
     if (ch && this.wlStates[s]) (ch.wl || (ch.wl = new Set())).add(i);
     if (ch && was !== !!this.wlStates[s]) w.markBlock(ch, x & 15, yy, z & 15);
+    // (a sea pickle's light comes with its water, set after world.setBlock looked)
+    if (ch && (was || this.wlStates[s]) && (WET_EMIT[old] || WET_EMIT[v >> 8])) w.relight(x, yy, z);
     const k = x + ',' + yy + ',' + z;
     if (this.bookStates.has(s)) this.lecternBooks.add(k); else this.lecternBooks.delete(k);
   }
@@ -473,6 +481,7 @@ class NetClient {
     if (id === undefined) { this.unknownItems.add(o.n); s.id = ITEM_KEY.stone; s.unk = o.n; }
     if (o.x) s.x = o.x;
     if (o.name) s.name = o.name;
+    if (o.lore) s.lore = o.lore;
     if (o.e) s.e = o.e;
     if (o.pot) s.pot = o.pot;
     if (o.g !== undefined) s.g = o.g;
@@ -862,10 +871,12 @@ const NET_SCREEN = {
     if (list.length === 1) this.net.click(this, list[0].v, b, 0); else if (ui.cursor) this.net.drag(this, list, b);
   },
   key(ui, ev) {
-    const k = ev.key, s = this.slotAt(ui.mouse.x, ui.mouse.y), n = this.net;
-    if (k >= '1' && k <= '9') { if (s && !ui.cursor) n.click(this, s.v, +k - 1, 2); return true; }
-    if (k === 'f' || k === 'F') { if (s && !ui.cursor) n.click(this, s.v, 40, 2); return true; }
-    if (k === 'q' || k === 'Q') { if (s && !ui.cursor && s.get()) n.click(this, s.v, ev.ctrlKey ? 1 : 0, 4); return true; }
+    // (the keys as bound - ContainerScreen.key)
+    const acts = bindingsFor(this.game, ev.code), s = this.slotAt(ui.mouse.x, ui.mouse.y), n = this.net, hb = acts.find((a) => a.startsWith('hotbar.'));
+    if (acts.includes('inventory')) return false;
+    if (hb) { if (s && !ui.cursor) n.click(this, s.v, +hb.slice(7) - 1, 2); return true; }
+    if (acts.includes('swapOffhand')) { if (s && !ui.cursor) n.click(this, s.v, 40, 2); return true; }
+    if (acts.includes('drop')) { if (s && !ui.cursor && s.get()) n.click(this, s.v, ev.ctrlKey ? 1 : 0, 4); return true; }
     return false;
   },
   // closing: the server puts the cursor's and the crafting grid's items back (and says so)
@@ -911,6 +922,8 @@ function netItemLines(stack, lines) {
     lines.splice(1, 0, ...stack.e.map(([k, l]) => ({ text: (NET_ENCH_CN[k] || k) + (NET_ENCH_ONE.has(k) && l === 1 ? '' : ' ' + romanNum(l)), color: /curse/.test(k) ? '#FF5555' : '#AAAAAA' })));
   }
   if (stack.name) lines[0].text = stack.name;
+  // the lines under the name (a minigame shop's prices: minigame.js Legacy), in their first colour; vanilla's purple
+  if (stack.lore && typeof Legacy !== 'undefined') for (const l of stack.lore) lines.push({ text: Legacy.strip(l) || ' ', color: Legacy.first(l, '#AA00AA') });
   return lines;
 }
 
@@ -934,12 +947,17 @@ Game.prototype.netInteraction = function () {
       if (def.food && p.useT >= 52) { p.usingItem = null; p.useT = 0; }
     }
   }
-  if (this.mouseBtn[0]) {
+  // (no attacking or mining while an item is in use, and a spear mines nothing: vanilla's client, as handleInteraction)
+  const spear = typeof isSpear === 'function' && p.inv.held && ITEMS[p.inv.held.id] && isSpear(ITEMS[p.inv.held.id].key);
+  // (a spear's click does nothing before a full charge: vanilla minimum_attack_charge 1, as spearJab)
+  const spearWait = spear && this.attackStrength(0.1) < 1;
+  if ((this.mouseBtn[0] || this.mouseClicked0) && !p.usingItem) { // (a click let go within the tick counts too: handleInteraction)
     if (this.targetEntity) {
       const e = this.targetEntity;
-      if (this.mouseClicked0 && this.attackCd <= 0 && e.netId != null) { n.send({ t: 'attack', id: e.netId }); n.send({ t: 'swing' }); p.swing(); p.attackT = 0; this.attackCd = 4; }
+      if (this.mouseClicked0 && this.attackCd <= 0 && e.netId != null && !spearWait) { n.send({ t: 'attack', id: e.netId }); n.send({ t: 'swing' }); p.swing(); p.attackT = 0; this.attackCd = 4; }
       this.breaking = null;
-    } else if (this.target) {
+    } else if (this.target && spear) { this.breaking = null; if (this.mouseClicked0 && !spearWait) { p.swing(); n.send({ t: 'swing' }); p.attackT = 0; } }
+    else if (this.target) {
       const t = this.target, key = t.pos.join(','), b = BLOCKS[t.id];
       if (this.mode === 'creative') {
         if (this.attackCd <= 0) {
@@ -956,12 +974,13 @@ Game.prototype.netInteraction = function () {
           if (this.breaking.progress >= 1) { n.dig(2, t); this.netBreak(t.pos); this.breaking = null; this.attackCd = 5; }
         }
       }
-    } else { this.breaking = null; if (this.mouseClicked0) { p.swing(); n.send({ t: 'swing' }); } }
+    } else { this.breaking = null; if (this.mouseClicked0 && !spearWait) { p.swing(); n.send({ t: 'swing' }); if (spear) p.attackT = 0; } }
   } else this.breaking = null;
   // a block given up half-mined
   if (n.digging && (!this.breaking || this.breaking.key !== n.digging.key)) { n.dig(1, n.digging.t); n.digging = null; }
   this.mouseClicked0 = false;
-  if (this.mouseBtn[2] && this.useCd <= 0 && !p.usingItem) this.netUse();
+  if ((this.mouseBtn[2] || this.useClicked) && this.useCd <= 0 && !p.usingItem) this.netUse();
+  this.useClicked = false;
 };
 // items with no use on a block (Item.useOn passes), so a right click at a block uses them in the air too
 const NET_USE_ON_PASS = /^(snowball|egg|blue_egg|brown_egg|ender_pearl|splash_potion|lingering_potion|experience_bottle|ender_eye|wind_charge|fishing_rod|bucket|water_bucket|lava_bucket|(cod|salmon|pufferfish|tropical_fish|axolotl|tadpole)_bucket|map|bundle|\w+_bundle|elytra|crossbow|knowledge_book|turtle_helmet|\w+_(helmet|chestplate|leggings|boots))$/;
@@ -969,28 +988,54 @@ const NET_USE_ON_PASS = /^(snowball|egg|blue_egg|brown_egg|ender_pearl|splash_po
 Game.prototype.netUse = function () {
   const p = this.player, n = this.net, held = p.inv.held, def = held && ITEMS[held.id], t = this.target;
   this.useCd = 4;
-  if (this.targetEntity && this.targetEntity.netId != null) {
-    n.send({ t: 'interact', id: this.targetEntity.netId, x: 0, y: this.targetEntity.h / 2, z: 0, sneak: p.sneaking });
-    p.swing(); n.send({ t: 'swing' }); return;
-  }
   // held to use (the server times it; letting go says so): food, drinks, bows, crossbows, shields, tridents, spears
-  const usable = !!def && !!(def.food || /^(bow|potion|milk_bucket|honey_bottle|shield|trident|crossbow|spyglass|goat_horn|brush)$|_spear$/.test(def.key)) && !(def.key === 'crossbow' && held.charged);
+  const heldUse = (st, d) => !!d && !!(d.food || /^(bow|potion|milk_bucket|honey_bottle|shield|trident|crossbow|spyglass|goat_horn|brush)$|_spear$/.test(d.key)) && !(d.key === 'crossbow' && st.charged);
+  const usable = heldUse(held, def);
+  // the other hand's turn (vanilla's client tries it when the main hand passes): the main hand has no use of its own
+  // and no tool that works on the aimed block, the other hand's item has one - only its shield and blocks were ever
+  // tried, so its food, bow, crossbow, spear, wind charge, firework or potion did nothing ("副手的东西不能用")
+  const off = p.inv.slots[40], od = off && ITEMS[off.id], offHeld = heldUse(off, od);
+  const tb = t && !this.targetEntity && BLOCKS[t.id], blockUse = !!(tb && (tb.onUse || tb.door || tb.trapdoor || tb.gate || tb.bed));
+  // what an axe, shovel or hoe does to the aimed block (vanilla useOn; anywhere else, or at the air or a mob, it
+  // passes): an axe strips, scrapes or takes wax off (not with a shield in the other hand unless sneaking), a shovel
+  // makes a path or puts a campfire out, a hoe tills
+  const toolOn = () => {
+    const tt = def.tool.type, tk = tb.key, [x, y, z] = t.pos, w = this.world, airUp = !w.getBlock(x, y + 1, z);
+    if (tt === 'axe') {
+      const cu = copperInfo(tk);
+      return !(od && od.key === 'shield' && !p.sneaking) && ((STRIP.test(tk) && !tk.startsWith('stripped_') && BID['stripped_' + tk] !== undefined) || !!(cu && (cu.waxed || cu.stage > 0)));
+    }
+    if (tt === 'shovel') return t.face !== 2 && ((PATHABLE.has(tk) && airUp) || (/campfire$/.test(tk) && Features.propOf(t.id, w.getMeta(x, y, z), 'lit') === 'true'));
+    if (tt === 'hoe') return tk === 'rooted_dirt' || (/^(grass_block|dirt|dirt_path|coarse_dirt)$/.test(tk) && t.face !== 2 && airUp);
+    return false;
+  };
+  const idle = !usable && !(def && (NET_USE_ON_PASS.test(def.key) || /_(boat|raft)$/.test(def.key))) && !this.mainHandBusy(held, def) && !(def && def.tool && tb && toolOn());
+  const offTurn = !!od && idle && (offHeld || NET_USE_ON_PASS.test(od.key) || od.key === 'firework_rocket') && !(blockUse && !p.sneaking);
+  if (this.targetEntity && this.targetEntity.netId != null) {
+    const e = this.targetEntity;
+    n.send({ t: 'interact', id: e.netId, x: 0, y: e.h / 2, z: 0, sneak: p.sneaking });
+    // most mobs have nothing to do with an empty hand or a weapon (PASS): on to the other hand - its shield goes up
+    // with the crosshair on a mob ("准星对着生物时右键不能举盾"); not at one that trades, carries a rider, sits down
+    // or hands an item back (vanilla mobInteract SUCCESS)
+    const takes = /^(villager|wandering_trader|horse|donkey|mule|llama|trader_llama|camel|camel_husk|zombie_horse|skeleton_horse)$/.test(e.type) ? !e.baby
+      : /^(pig|strider)$/.test(e.type) ? !!e.saddled && !e.baby : /^(wolf|cat|parrot|nautilus|zombie_nautilus)$/.test(e.type) ? !!e.owner
+      : e.type === 'happy_ghast' ? !!e.harness : e.type === 'allay' ? !!e.hand : e.type === 'copper_golem' && !!(def && def.tool && def.tool.type === 'axe');
+    if (!(offTurn && (!def || def.tool || def.attack) && e instanceof Mob && !takes)) { p.swing(); n.send({ t: 'swing' }); return; }
+  }
   // books open their screen here (like vanilla's client); the pages go back with edit_book
   if (def && /^(writable_book|written_book)$/.test(def.key) && !(t && BLOCKS[t.id].key === 'lectern')) { this.ui.open(new BookScreen(this, held, def.key === 'writable_book')); return; }
   // boats are put down by using the item (on water too), not on a block
   const itemUse = !!def && /_(boat|raft)$/.test(def.key);
-  // an offhand shield goes up when the main hand has nothing to do
-  const off = p.inv.slots[40];
   // (not at a block with a use of its own - doors, trapdoors, gates and beds too: the shield went up and the door
-  // stayed shut, 10-31 feedback)
-  const tb = t && BLOCKS[t.id], blockUse = !!(tb && (tb.onUse || tb.door || tb.trapdoor || tb.gate || tb.bed));
-  if (off && ITEMS[off.id].key === 'shield' && !this.mainHandBusy(held, def) && !(blockUse && !p.sneaking)) {
+  // stayed shut, 10-31 feedback; a firework at a block is launched from it, below)
+  if (offTurn && !(od.key === 'firework_rocket' && t && !this.targetEntity && !p.gliding)) {
     n.send({ t: 'use', hand: 'off', yaw: fromYaw(p.yaw), pitch: -p.pitch * R2D });
-    p.usingItem = off.id; p.useHand = 'off'; p.useT = 0; return;
+    if (offHeld && (!od.food || p.food < 20 || this.mode === 'creative' || od.key === 'golden_apple')) { p.usingItem = off.id; p.useHand = 'off'; p.useT = 0; }
+    return;
   }
   if (t && !itemUse && (!usable || (BLOCKS[t.id].onUse && !p.sneaking))) {
     const pt = t.point || [t.pos[0] + 0.5, t.pos[1] + 0.5, t.pos[2] + 0.5];
-    n.send({ t: 'place', item: def ? def.key : null, x: t.pos[0], y: t.pos[1] + n.minY, z: t.pos[2], face: NET_FACE[t.face] ?? 1,
+    n.send({ t: 'place', x: t.pos[0], y: t.pos[1] + n.minY, z: t.pos[2], face: NET_FACE[t.face] ?? 1,
       cx: clamp(pt[0] - t.pos[0], 0, 1), cy: clamp(pt[1] - t.pos[1], 0, 1), cz: clamp(pt[2] - t.pos[2], 0, 1) });
     // like vanilla's client: when neither the block nor the item does anything there (PASS), the item is used
     // as well - throwables, buckets, armour, a loaded crossbow, an eye of ender away from a portal frame ...
@@ -998,12 +1043,14 @@ Game.prototype.netUse = function () {
     if (pass) { n.send({ t: 'use', yaw: fromYaw(p.yaw), pitch: -p.pitch * R2D }); p.swing(); n.send({ t: 'swing' }); return; }
     // the other hand's block or torch when the main hand has nothing to do there (vanilla's client tries the other
     // hand after the main one passes; only the main hand went, 10-31 feedback)
-    const od = off && ITEMS[off.id], idle = !this.mainHandBusy(held, def) && (!def || !def.tool || /^(sword|pickaxe)$/.test(def.tool.type));
-    if (od && (od.block !== undefined || od.places) && !od.armor && idle && !(blockUse && !p.sneaking)) {
-      n.send({ t: 'place', hand: 'off', item: od ? od.key : null, x: t.pos[0], y: t.pos[1] + n.minY, z: t.pos[2], face: NET_FACE[t.face] ?? 1,
+    const offPlace = !!(od && (od.block !== undefined || od.places || od.key === 'firework_rocket') && !od.armor && idle && !(blockUse && !p.sneaking));
+    if (offPlace) {
+      n.send({ t: 'place', hand: 'off', x: t.pos[0], y: t.pos[1] + n.minY, z: t.pos[2], face: NET_FACE[t.face] ?? 1,
         cx: clamp(pt[0] - t.pos[0], 0, 1), cy: clamp(pt[1] - t.pos[1], 0, 1), cz: clamp(pt[2] - t.pos[2], 0, 1) });
     }
-    if (held) p.swing(); n.send({ t: 'swing' });
+    // (placing from the other hand swings that hand here)
+    if (offPlace && p.swingOff) p.swingOff(); else if (held) p.swing();
+    n.send(offPlace ? { t: 'swing', hand: 'off' } : { t: 'swing' });
     return;
   }
   if (!def) return;
@@ -1054,13 +1101,8 @@ const RoomService = {
     // a test page on this machine (localhost, *.localhost, *.test) leaves the live service alone unless ?rooms= says
     // otherwise: it refuses those pages anyway, and each refusal counted against the developer's address until it
     // was banned (2026-11-03)
-    const local = /^(localhost|127\.|\[::1\])|\.(localhost|test)$/.test(location.hostname);
-    if (!q && local) return '';
-    let b = String(q || (window.NET_CONFIG && NET_CONFIG.rooms) || '').replace(/\/+$/, '');
-    // 本地页直连线上房间服务会被 Origin 白名单拒（/api/* 403、/ws 502）；
-    // 浏览器改不了 WebSocket 的 Origin，统一走 tools/server.mjs 的本地反代。
-    if (local && /honghemc\.cn/.test(b)) b = location.origin;
-    return b;
+    if (!q && /^(localhost|127\.|\[::1\])|\.(localhost|test)$/.test(location.hostname)) return '';
+    return String(q || (window.NET_CONFIG && NET_CONFIG.rooms) || '').replace(/\/+$/, '');
   },
   ws() { return this.base().replace(/^http/, 'ws') + '/ws'; },
   // this browser's own key: rooms it made and names it took belong to it
@@ -1077,7 +1119,7 @@ const RoomService = {
       x.setRequestHeader('Content-Type', 'text/plain'); // (the bytes as they are; text/plain so no preflight - account.js)
       x.upload.onprogress = (e) => { if (e.lengthComputable && progress) progress(e.loaded / e.total); };
       x.onload = () => { let j = null; try { j = JSON.parse(x.responseText); } catch (e) { } if (x.status === 200 && j && !j.error) resolve(j); else reject(new Error((j && j.error) || 'HTTP ' + x.status)); };
-      x.onerror = () => reject(new Error('连不上联机服务器'));
+      x.onerror = () => reject(new Error('游戏正在更新中…请稍后'));
       x.send(bytes);
     });
   },
@@ -1085,8 +1127,8 @@ const RoomService = {
     let r;
     // (sent as plain text: no preflight - account.js)
     try { r = await fetch(this.base() + path, body ? { method: 'POST', body: JSON.stringify(body) } : {}); }
-    catch (e) { throw new Error('连不上联机服务器'); }
-    const j = await r.json().catch(() => ({ error: '联机服务器没有回应' }));
+    catch (e) { throw new Error('游戏正在更新中…请稍后'); }
+    const j = await r.json().catch(() => ({ error: '游戏正在更新中…请稍后' }));
     if (!r.ok || (j && j.error)) throw new Error((j && j.error) || 'HTTP ' + r.status);
     return j;
   },
@@ -1189,6 +1231,9 @@ class MultiplayerScreen extends FormScreen {
       const mine = typeof Account !== 'undefined' && !!Account.name && String(r.owner || '').toLowerCase() === Account.name.toLowerCase();
       this.widgets.push({ x: cx + 106, y: 84 + i * 24, w: 46, h: 20, label: full && !sup && !mine ? '已满' : '进入', enabled: !full || sup || mine, gold: full && sup && !mine, blue: mine,
         tip: [r.name, `房主 ${r.owner}，${r.players}/${r.max} 人，${GM_CN[r.gamemode] || ''}`].concat(mine ? ['你的房间：满员了也能进'] : full && sup ? ['满员了，管理员可以进'] : []), onClick: () => this.join(r.code) });
+      // (a super administrator: any room's 管理 - its server stopped, the room deleted, a player banned; the user 11-08)
+      if (sup) this.widgets.push({ x: cx + 76, y: 84 + i * 24, w: 28, h: 20, label: '管理', gold: true, tip: ['管理员：关闭这个房间的服务器、删除房间、封禁里面的玩家'],
+        onClick: () => { this.game.ui.hideInput(); this.game.ui.open(new AdminRoomScreen(this.game, this, r.code)); } });
     });
     this.widgets.push(
       { x: cx - 152, y: u.h - 52, w: 98, h: 20, label: '创建房间', onClick: () => this.go(CreateRoomScreen) },
@@ -1196,7 +1241,7 @@ class MultiplayerScreen extends FormScreen {
       { x: cx + 52, y: u.h - 52, w: 100, h: 20, label: this.loading ? '正在刷新…' : '刷新列表', onClick: () => { this.list = null; this.layout(); this.load(); } },
       { x: cx - 152, y: u.h - 28, w: 150, h: 20, label: '返回', onClick: () => this.back() },
     );
-    if (location.protocol === 'http:') this.widgets.push({ x: cx + 2, y: u.h - 28, w: 150, h: 20, label: '自定义服务器', onClick: () => { this.game.ui.hideInput(); this.game.ui.open(new ServerListScreen(this.game, this)); } });
+    if (location.protocol === 'http:') this.widgets.push({ x: cx + 2, y: u.h - 28, w: 150, h: 20, label: '直接连接（局域网）', onClick: () => { this.game.ui.hideInput(); this.game.ui.open(new DirectConnectScreen(this.game, this)); } });
     if (this.field) this.focus(this.field);
   }
   okName() {
@@ -1223,9 +1268,10 @@ class MultiplayerScreen extends FormScreen {
     list.slice(this.page * n, this.page * n + n).forEach((r, i) => {
       const y = 84 + i * 24, run = r.state !== 'stopped';
       c.fillStyle = 'rgba(0,0,0,0.35)'; c.fillRect(cx - 152, y, 254, 20);
-      Font.draw(c, fitText(r.name, 248), cx - 149, y + 2, '#FFFFFF');
+      const tw = typeof Account !== 'undefined' && Account.data && Account.data.super ? 222 : 248; // (room for 管理)
+      Font.draw(c, fitText(r.name, tw), cx - 149, y + 2, '#FFFFFF');
       const st = run ? `${r.players}/${r.max} 人 · ${GM_CN[r.gamemode] || ''} · ${roomAge(r.started)}` : `休息中 · 最多 ${r.max} 人 · ${GM_CN[r.gamemode] || ''}`;
-      Font.draw(c, fitText(`房主 ${r.owner} · ${st}`, 248), cx - 149, y + 11, run ? '#90C890' : '#909090');
+      Font.draw(c, fitText(`房主 ${r.owner} · ${st}`, tw), cx - 149, y + 11, run ? '#90C890' : '#909090');
     });
     if (this.note) Font.center(c, fitText(this.note, ui.w - 8), cx, ui.h - 62, this.noteColor);
   }
@@ -1292,7 +1338,7 @@ class CreateRoomScreen extends FormScreen {
       // (a room whose save didn't arrive is not kept)
       if (code) RoomService.api('/api/rooms/' + code + '/delete', { key: RoomService.key() }).catch(() => { });
       this.busy = false; this.say(e.message, true); this.loadCap(); this.layout();
-      if (e.gate) this.say('服务端拒绝了本地页面的请求（来源白名单）—— 联机请用在线版', true);
+      if (e.gate) this.game.ui.open(Account.loggedIn ? new UnlockScreen(this.game, this, e.message, () => this.game.ui.open(this)) : new LoginScreen(this.game, () => this.game.ui.open(this)));
     }
   }
   drawExtra(ui) {
@@ -1370,166 +1416,6 @@ class MyRoomsScreen extends FormScreen {
     });
     if (this.note) Font.center(c, this.note, cx, ui.h - 52, this.noteColor);
   }
-}
-
-// ---------------------------------------------------------------------------
-// 自定义服务器列表（Java 版多人游戏风格）：保存过的地址列成表，双击 / 点「加入服务器」直接进。
-// 全部画在 canvas 上（这个游戏没有 DOM 界面），没有内联样式这回事。
-const NET_SERVERS_KEY = 'netServers';
-function loadNetServers(g) {
-  const raw = g.settings && g.settings[NET_SERVERS_KEY];
-  const list = Array.isArray(raw) ? raw.filter((s) => s && typeof s.url === 'string' && s.url.trim()) : [];
-  if (!list.length) {
-    const def = { name: '本地中转', url: 'ws://' + (location.hostname || 'localhost') + ':8780', player: '' };
-    g.settings[NET_SERVERS_KEY] = [def];
-    if (g.saveSettings) g.saveSettings();
-    return [def];
-  }
-  return list.slice(0, 64);
-}
-function saveNetServers(g, list) { g.settings[NET_SERVERS_KEY] = list; if (g.saveSettings) g.saveSettings(); }
-
-class ServerListScreen extends MenuScreen {
-  constructor(game, parent) {
-    super(game, '多人游戏 · 自定义服务器'); this.parent = parent; this.titleY = 12;
-    this.list = loadNetServers(game);
-    this.sel = 0; this.page = 0; this.lastClickAt = 0; this.lastSel = -1; this.note = '';
-  }
-  // 与 MultiplayerScreen.rows() 完全一致，视觉才对得上官方房间列表
-  rows() { return Math.max(2, Math.floor((this.game.ui.h - 82 - 62) / 24)); }
-  layout() {
-    const u = this.game.ui, cx = u.w / 2, n = this.rows();
-    const pages = Math.max(1, Math.ceil(this.list.length / n));
-    this.page = Math.max(0, Math.min(this.page, pages - 1));
-    this.listBox = { x: cx - 152, y: 84, w: 254, rowH: 24 };
-    const view = this.list.slice(this.page * n, this.page * n + n);
-    this.widgets = [
-      { x: cx + 106, y: 66, w: 22, h: 14, label: '<', enabled: this.page > 0, onClick: () => { this.page--; this.layout(); } },
-      { x: cx + 130, y: 66, w: 22, h: 14, label: '>', enabled: this.page < pages - 1, onClick: () => { this.page++; this.layout(); } },
-    ];
-    // 官方房间那样：每行右侧一个「进入」，点一下直接进
-    view.forEach((s, i) => {
-      const idx = this.page * n + i;
-      this.widgets.push({ x: cx + 106, y: 84 + i * 24, w: 46, h: 20, label: '进入', blue: idx === this.sel,
-        tip: [String(s.name || s.url), String(s.url), '点一下加入；双击这一行也可以'],
-        onClick: () => { this.sel = idx; this.join(); } });
-    });
-    this.widgets.push(
-      { x: cx - 152, y: u.h - 52, w: 98, h: 20, label: '添加服务器', onClick: () => this.game.ui.open(new ServerEditScreen(this.game, this, -1)) },
-      { x: cx - 50, y: u.h - 52, w: 98, h: 20, label: '编辑', onClick: () => { if (this.list.length) this.game.ui.open(new ServerEditScreen(this.game, this, this.sel)); } },
-      { x: cx + 52, y: u.h - 52, w: 100, h: 20, label: '删除', onClick: () => this.del() },
-      { x: cx - 152, y: u.h - 28, w: 150, h: 20, label: '返回', onClick: () => this.onEsc() },
-      { x: cx + 2, y: u.h - 28, w: 150, h: 20, label: '直接连接（手填）', onClick: () => this.game.ui.open(new DirectConnectScreen(this.game, this)) },
-    );
-  }
-  mouseDown(ui, mx, my, button) {
-    const b = this.listBox, n = this.rows();
-    if (b && mx >= b.x && mx < b.x + b.w && my >= b.y && my < b.y + n * 24) {
-      const idx = this.page * n + Math.floor((my - b.y) / 24);
-      if (idx < this.list.length) {
-        const now = performance.now();
-        const dbl = idx === this.lastSel && now - this.lastClickAt < 400;
-        this.sel = idx; this.lastSel = idx; this.lastClickAt = now;
-        if (dbl) this.join(); else this.layout();
-        return;
-      }
-    }
-    super.mouseDown(ui, mx, my, button);
-  }
-  join() {
-    const s = this.list[this.sel]; if (!s) return;
-    const g = this.game;
-    const name = String(s.player || g.settings.netName || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16)
-      || ('Web' + Math.floor(Math.random() * 9000 + 1000));
-    g.settings.netUrl = s.url; g.settings.netName = name;
-    if (g.saveSettings) g.saveSettings();
-    g.ui.hideInput();
-    g.joinServer(s.url.trim(), name);
-  }
-  del() {
-    if (!this.list.length) return;
-    this.list.splice(this.sel, 1);
-    saveNetServers(this.game, this.list);
-    this.sel = Math.max(0, Math.min(this.sel, this.list.length - 1));
-    this.page = Math.min(this.page, Math.max(0, Math.ceil(this.list.length / this.rows()) - 1));
-    this.layout();
-  }
-  drawExtra(ui) {
-    const c = ui.ctx, cx = ui.w / 2, b = this.listBox, n = this.rows();
-    if (!b) return;
-    Font.draw(c, `自定义服务器（${this.list.length}）`, cx - 152, 69, '#FFFFFF');
-    if (!this.list.length) Font.center(c, '还没有服务器，点「添加服务器」加一个', cx, 100, '#A0A0A0');
-    this.list.slice(this.page * n, this.page * n + n).forEach((s, i) => {
-      const y = 84 + i * 24, idx = this.page * n + i;
-      c.fillStyle = idx === this.sel ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0.35)';
-      c.fillRect(b.x, y, b.w, 20);
-      Font.draw(c, fitText(String(s.name || s.url), 248), b.x + 3, y + 2, '#FFFFFF');
-      Font.draw(c, fitText(String(s.url), 248), b.x + 3, y + 11, '#90C890');
-    });
-    if (this.note) Font.center(c, fitText(this.note, ui.w - 8), cx, ui.h - 62, this.noteColor || '#FFFF80');
-  }
-  onEsc() { this.game.ui.hideInput(); this.game.ui.open(this.parent || new TitleScreen(this.game)); }
-}
-
-class ServerEditScreen extends MenuScreen {
-  constructor(game, parent, index) {
-    super(game, index < 0 ? '添加服务器' : '编辑服务器'); this.parent = parent; this.index = index; this.titleY = 20;
-    const s = index >= 0 ? parent.list[index] : null;
-    this.name = s ? String(s.name || '') : '';
-    this.url = s ? String(s.url || '') : 'ws://' + (location.hostname || 'localhost') + ':8780';
-    this.player = s ? String(s.player || '') : String(game.settings.netName || '');
-    this.field = 'name';
-  }
-  layout() {
-    const u = this.game.ui, cx = u.w / 2;
-    this.boxes = {
-      name: { x: cx - 110, y: 58, w: 220, h: 20 },
-      url: { x: cx - 110, y: 104, w: 220, h: 20 },
-      player: { x: cx - 110, y: 150, w: 220, h: 20 },
-    };
-    this.widgets = [
-      { x: cx - 110, y: 184, w: 105, h: 20, label: '保存', blue: true, onClick: () => this.save() },
-      { x: cx + 5, y: 184, w: 105, h: 20, label: '取消', onClick: () => this.onEsc() },
-      { x: cx - 110, y: u.h - 30, w: 220, h: 20, label: '返回', onClick: () => this.onEsc() },
-    ];
-    this.focus(this.field);
-  }
-  focus(f) {
-    const u = this.game.ui, b = this.boxes[f];
-    this.field = f;
-    u.showInput(b.x + 4, b.y + 6, b.w - 8, 10, this[f], () => this.save(),
-      { onInput: (v) => { this[f] = v; }, onEsc: () => this.onEsc(), max: f === 'name' ? 20 : 120 });
-  }
-  save() {
-    const g = this.game, list = this.parent.list.slice();
-    const rec = { name: this.name.trim() || this.url.trim(), url: this.url.trim(), player: this.player.trim() };
-    if (!/^wss?:\/\//.test(rec.url)) { this.note = '地址要以 ws:// 或 wss:// 开头'; return; }
-    if (this.index < 0) list.push(rec); else list[this.index] = rec;
-    saveNetServers(g, list);
-    this.parent.list = list;
-    this.parent.sel = this.index < 0 ? list.length - 1 : this.index;
-    this.parent.page = Math.floor(this.parent.sel / Math.max(1, this.parent.rows()));
-    g.ui.hideInput(); g.ui.open(this.parent);
-  }
-  mouseDown(ui, mx, my, button) {
-    for (const f of ['name', 'url', 'player']) {
-      const r = this.boxes[f];
-      if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h) { this.focus(f); return; }
-    }
-    super.mouseDown(ui, mx, my, button);
-  }
-  drawExtra(ui) {
-    const c = ui.ctx;
-    const labels = { name: '服务器名称', url: '自定义链接（ws:// 或 wss://）', player: '玩家名（留空则用上次的名字）' };
-    for (const f of ['name', 'url', 'player']) {
-      const r = this.boxes[f];
-      Font.draw(c, labels[f], r.x, r.y - 11, '#A0A0A0');
-      ui.nine(this.field === f ? 'text_field_hl' : 'text_field', r.x, r.y, r.w, r.h, 1);
-      if (this.field !== f) Font.draw(c, this[f], r.x + 4, r.y + 6, '#E0E0E0');
-    }
-    if (this.note) Font.center(c, this.note, ui.w / 2, 214, '#FF8080');
-  }
-  onEsc() { this.game.ui.hideInput(); this.game.ui.open(this.parent); }
 }
 
 // 直接连接: a proxy's address (multiplayer/proxy on this computer, the LAN or Radmin: 开服给朋友.bat), not the room service.
@@ -1645,6 +1531,8 @@ class RoomScreen extends MenuScreen {
       { x: cx + 138, y: 80, w: 22, h: 14, label: '>', enabled: this.page < pages - 1, onClick: () => { this.page++; this.layout(); } },
     );
     if (owner && I && (I.bans || []).length) this.widgets.push({ x: cx - 160, y: u.h - 52, w: 150, h: 20, label: `封禁名单（${I.bans.length}）…`, onClick: () => this.game.ui.open(new BanListScreen(this.game, this)) });
+    if (typeof Account !== 'undefined' && Account.data && Account.data.super) this.widgets.push({ x: cx + 10, y: u.h - 52, w: 150, h: 20, label: '管理员：管理房间…', gold: true,
+      tip: ['关闭这个房间的服务器、删除房间、全服封禁玩家'], onClick: () => this.game.ui.open(new AdminRoomScreen(this.game, this, R.code)) });
     this.widgets.push({ x: cx - 100 + (owner && I && (I.bans || []).length ? 110 : 0), y: u.h - 30, w: 200 - (owner && I && (I.bans || []).length ? 110 : 0), h: 20, label: '完成', onClick: () => this.game.ui.open(this.parent) });
   }
   twice(k, f) { if (this.confirm === k) f(); else { this.confirm = k; this.layout(); } }
@@ -1685,6 +1573,83 @@ class BanListScreen extends MenuScreen {
     bans.slice(0, 8).forEach((b, i) => Font.draw(ui.ctx, b, ui.w / 2 - 100, 49 + i * 22, '#FFFFFF'));
   }
   onEsc() { this.game.ui.open(this.parent); }
+}
+// 管理房间 (a super administrator, from the public list or 房间 - the user 11-08): anyone's room - its server stopped
+// (everyone in it out; whoever goes in again starts it), the room deleted, a player in it banned from the whole
+// service (the account frozen, its address banned: 管理员 → 冻结名单 lifts it)
+class AdminRoomScreen extends MenuScreen {
+  constructor(game, parent, code) {
+    super(game, '管理房间'); this.parent = parent; this.code = code; this.pauses = false; this.titleY = 12;
+    this.info = null; this.gone = false; this.page = 0; this.confirm = null; this.busy = false; this.note = ''; this.noteColor = '#80FF80';
+    this.load();
+  }
+  async load() {
+    try { this.info = await RoomService.api('/api/rooms/' + this.code); } catch (e) { this.info = null; this.say(e.message, true); }
+    if (this.game.ui.screen === this) this.layout();
+  }
+  say(t, bad) { this.note = t; this.noteColor = bad ? '#FF6060' : '#80FF80'; }
+  rows() { return Math.max(2, Math.floor((this.game.ui.h - 96 - 56) / 22)); }
+  twice(k, f) { if (this.confirm === k) { this.confirm = null; f(); } else { this.confirm = k; this.layout(); } }
+  async room(action) {
+    this.busy = true; this.layout();
+    try {
+      const j = await Account.api('/api/account/admin/room', { code: this.code, action });
+      if (action === 'delete') { this.gone = true; this.info = null; this.say('房间已删除'); }
+      else { this.info = j.room; this.say('服务器已关闭，房间里的人都被请出了'); }
+    } catch (e) { this.say(e.message, true); }
+    this.busy = false; this.layout();
+  }
+  async ban(name) {
+    this.busy = true; this.layout();
+    try {
+      const j = await Account.api('/api/account/admin/freeze', { name });
+      this.say(`已封禁 ${j.name}：账号冻结${j.ip ? `，IP 封禁 ${j.hours} 小时` : ''}（冻结名单里可以解除）`);
+      await new Promise((r) => setTimeout(r, 600)); await this.load(); // (out of the room by then)
+    } catch (e) { this.say(e.message, true); }
+    this.busy = false; this.layout();
+  }
+  layout() {
+    const u = this.game.ui, cx = u.w / 2, I = this.info, me = (this.game.net && this.game.net.name) || (typeof Account !== 'undefined' && Account.name) || '';
+    const run = !!I && I.state !== 'stopped';
+    this.widgets = [];
+    if (!this.gone) this.widgets.push(
+      { x: cx - 160, y: 48, w: 100, h: 20, label: () => (this.confirm === 'stop' ? '确定关闭？' : '关闭服务器'), enabled: run && !this.busy,
+        tip: ['保存世界并关掉这个房间的服务器', '房间里的人都会被请出；之后有人进入会重新启动'], onClick: () => this.twice('stop', () => this.room('stop')) },
+      { x: cx - 56, y: 48, w: 100, h: 20, label: () => (this.confirm === 'delete' ? '确定删除？' : '删除房间'), enabled: !!I && !this.busy,
+        tip: ['删除这个房间和它的世界，不能恢复', '房间里的人都会被请出'], onClick: () => this.twice('delete', () => this.room('delete')) },
+    );
+    const players = (I && I.players) || [], n = this.rows(), pages = Math.max(1, Math.ceil(players.length / n));
+    this.page = clamp(this.page, 0, pages - 1);
+    players.slice(this.page * n, this.page * n + n).forEach((p, i) => {
+      if (p === me) return;
+      this.widgets.push({ x: cx + 92, y: 96 + i * 22, w: 68, h: 18, label: () => (this.confirm === 'ban:' + p ? '确定封禁？' : '全服封禁'), enabled: !this.busy,
+        tip: ['冻结这个玩家的账号，并封禁他的 IP', '他会被请出所有房间，以后也登录不了', '管理员 → 冻结名单 里可以解除'], onClick: () => this.twice('ban:' + p, () => this.ban(p)) });
+    });
+    if (pages > 1) this.widgets.push(
+      { x: cx + 114, y: 80, w: 22, h: 14, label: '<', enabled: this.page > 0, onClick: () => { this.page--; this.layout(); } },
+      { x: cx + 138, y: 80, w: 22, h: 14, label: '>', enabled: this.page < pages - 1, onClick: () => { this.page++; this.layout(); } },
+    );
+    this.widgets.push({ x: cx - 100, y: u.h - 30, w: 200, h: 20, label: '完成', onClick: () => this.onEsc() });
+  }
+  drawExtra(ui) {
+    const c = ui.ctx, cx = ui.w / 2, I = this.info, n = this.rows();
+    if (this.gone) Font.center(c, '房间 ' + this.code + ' 已删除', cx, 60, '#A0A0A0');
+    else if (!I) Font.center(c, '正在读取…', cx, 60, '#A0A0A0');
+    else {
+      const st = I.state === 'running' ? '运行中' : I.state === 'starting' ? '正在启动' : '休息中';
+      Font.center(c, fitText(`${I.name}　邀请码 ${I.code}　房主 ${I.owner}　${st}`, ui.w - 8), cx, 30, '#FFFF55');
+      const players = I.players || [];
+      Font.draw(c, `玩家（${players.length}/${I.max}）`, cx - 160, 82, '#FFFFFF');
+      if (!players.length) Font.draw(c, '房间里没有人', cx - 157, 101, '#909090');
+      players.slice(this.page * n, this.page * n + n).forEach((p, i) => {
+        const y = 96 + i * 22;
+        c.fillStyle = 'rgba(0,0,0,0.35)'; c.fillRect(cx - 160, y, 320, 18);
+        Font.draw(c, fitText(p, 240), cx - 157, y + 5, '#FFFFFF');
+      });
+    }
+    if (this.note) Font.center(c, fitText(this.note, ui.w - 8), cx, ui.h - 44, this.noteColor);
+  }
+  onEsc() { const P = this.parent; if (P && P.load) { if (P instanceof MultiplayerScreen) P.list = null; P.load(); } this.game.ui.open(P); }
 }
 // reporting a player: why, a few words; it goes to the service (and to us)
 const REPORT_REASONS = [['cheat', '作弊'], ['abuse', '说脏话 / 刷屏'], ['grief', '破坏别人的建筑'], ['other', '其他']];
@@ -1754,6 +1719,8 @@ function netShotTick() {
       else if (t === 'shulker_bullet') { e = new ShulkerBullet(g, m.x, y, m.z, null, null); }
       else if (t === 'llama_spit') { e = new MobShot(g, m.x, y, m.z, [0, 0, 0], null, { sprite: 'p_generic_2' }); }
       else { e = new Entity(g, m.x, y, m.z, 0.25, 0.25); const k = NET_SPRITE[t]; e.spriteLayer = k && ITEM_KEY[k] !== undefined ? ITEMS[ITEM_KEY[k]].tex : T('p_generic_0'); }
+      // (a potion: its liquid in its colour - the item in its metadata, 'meta' - and the bottle, effects.js)
+      if (/^(splash|lingering)_potion$/.test(NET_SPRITE[t]) && typeof potionSprites === 'function') { const k = NET_SPRITE[t]; e.netPotion = true; e.drawSelf = (gg, ip) => potionSprites(gg, ip, k, e.netPot); }
       e.netGrav = /fireball|wind_charge|wither_skull|shulker|firework/.test(t) ? 0 : 0.03; kind = 'shot';
     } else if (t === 'experience_orb') { e = new ExperienceOrb(g, m.x, y, m.z, 1); e.pickup = 1e9; kind = 'shot'; e.netGrav = 0.03; }
     else if (t === 'tnt') { e = new PrimedTNT(g, m.x, y, m.z, 80); kind = 'shot'; e.netGrav = 0.04; }
@@ -1863,17 +1830,17 @@ function netSelfMeta(net, m) {
   if ('sleeping_pos' in m) net.sleepPos = m.sleeping_pos;
   if ('pose' in m) net.selfPose = m.pose;
   if ('pose' in m || 'sleeping_pos' in m) {
-    const bp = net.sleepPos;
+    const sp = net.sleepPos, bp = sp && [sp[0], sp[1] - net.minY, sp[2]]; // (the server's y: local is y - minY)
     if ((net.selfPose === 'sleeping' || net.selfPose === 2) && bp && !g.sleeping) {
       const meta = g.world ? g.world.getMeta(bp[0], bp[1], bp[2]) : 0;
-      g.sleeping = { x: bp[0] + 0.5, y: bp[1] + 0.5625, z: bp[2] + 0.5, t: 0, rot: meta & 3, net: true };
+      g.sleeping = { x: bp[0] + 0.5, y: bp[1] + 0.5625, z: bp[2] + 0.5, t: 0, rot: meta & 3, bed: [bp[0], bp[1], bp[2]], net: true };
       p.vel = [0, 0, 0];
       g.ui.message('正在睡觉…（' + (touchOn(g) ? '点击潜行按钮' : '按 Shift ') + '起床）', '#AAAAAA');
     } else if (net.selfPose !== 'sleeping' && net.selfPose !== 2 && g.sleeping && g.sleeping.net) {
+      // (where the server's vanilla puts the player too - its teleport came before this and was lost to it; climbing
+      // out of blocks from the bed went through a low ceiling onto the roof)
       const s = g.sleeping; g.sleeping = null;
-      p.pos = [s.x, s.y + 0.5, s.z]; p.prev = [...p.pos];
-      while (p.collides(p.box()) && p.pos[1] < HEIGHT) p.pos[1] += 1;
-      p.prev = [...p.pos];
+      g.standUp(s);
     }
   }
   for (const side of ['shoulder_parrot_left', 'shoulder_parrot_right']) if (side in m) {
@@ -1923,7 +1890,7 @@ function netApplyMeta(net, e, m) {
   if (k === 'horse' && has('type_variant')) { const tv = m.type_variant | 0; e.variant = (tv & 255) + ((tv >> 8) & 255) * 8; }
   if (has('chest')) { e.chest = !!m.chest; if (e.chest && !e.chestInv) e.chestInv = []; }
   if (has('strength')) e.strength = m.strength;
-  if (k === 'camel' || k === 'camel_husk') { if (has('last_pose_change_tick')) { const sit = Number(m.last_pose_change_tick) < 0; if (sit !== !!e.sit) { e.sit = sit; e.sitT = 0; e.anims = {}; } } if (m.dash) e.anims.CAMEL_DASH = e.age; }
+  if (k === 'camel' || k === 'camel_husk') { if (has('last_pose_change_tick')) { const sit = Number(m.last_pose_change_tick) < 0; if (sit !== !!e.sit) { e.sit = sit; e.sitT = 0; e.anims = {}; } } if (m.dash) e.anims.CAMEL_DASH = e.age; else if (has('dash')) delete e.anims.CAMEL_DASH; }
   if (k === 'fox' && has('type')) e.variant = m.type === 1 ? 'snow' : 'red';
   if (k === 'panda') { const G = ['normal', 'lazy', 'worried', 'playful', 'brown', 'weak', 'aggressive']; if (has('main_gene')) e.main = G[m.main_gene | 0] || 'normal'; if (has('hidden_gene')) e.hidden = G[m.hidden_gene | 0] || 'normal'; }
   if (k === 'rabbit' && has('type')) e.variant = { 0: 'brown', 1: 'white', 2: 'black', 3: 'white_splotched', 4: 'gold', 5: 'salt', 99: 'evil' }[m.type] || 'brown';
@@ -2354,7 +2321,7 @@ function netRecipe(o) {
     const sc = this.net && this.state === 'play' && this.ui && this.ui.screen;
     if (!sc || !sc.pauses) return tick.call(this);
     const own = Object.getOwnPropertyDescriptor(sc, 'pauses');
-    this.mouseBtn = [false, false, false]; this.mouseClicked0 = false;
+    this.mouseBtn = [false, false, false]; this.mouseClicked0 = this.useClicked = false;
     Object.defineProperty(sc, 'pauses', { value: false, configurable: true, writable: true });
     try { return tick.call(this); } finally { if (own) Object.defineProperty(sc, 'pauses', own); else delete sc.pauses; }
   };

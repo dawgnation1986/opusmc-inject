@@ -57,9 +57,9 @@ const Minimap = {
     for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
       const wx = px - N / 2 + i, wz = pz - N / 2 + j, o = (j * N + i) * 4;
       if (!w.isLoaded(wx, wz)) { d[o] = d[o + 1] = d[o + 2] = 0; d[o + 3] = 120; prev[i] = 0; continue; }
-      let y = slice ? Math.min(py + 1, HEIGHT - 1) : w.surfaceY(wx, wz) + 1, id = 0, n = 0;
+      let y = slice ? Math.min(py + 1, HEIGHT - 1) : w.surfaceY(wx, wz, true) + 1, id = 0, n = 0; // (water counts: the sea is blue)
       if (slice) { while (y > 0 && n++ < 40 && (id = w.getBlock(wx, y, wz)) !== 0) y--; } // (under a roof: from the player's height down)
-      do { y--; id = w.getBlock(wx, y, wz); } while (y > 0 && (id === 0 || mapColorOf(id, 0) === 0));
+      do { y--; id = w.getBlock(wx, y, wz); if (WLOG[id]) id = WATER; } while (y > 0 && (id === 0 || mapColorOf(id, 0) === 0));
       const col = mapColorOf(id, w.getMeta(wx, y, wz)), dh = j ? y - prev[i] : 0; prev[i] = y;
       const br = id === WATER ? 1 : dh > 0 ? 2 : dh < 0 ? 0 : 1, c = MAP_PAL[col * 4 + br] || [0, 0, 0, 0];
       d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
@@ -215,16 +215,16 @@ Extras.drawNet = function (ui) {
   Font.draw(c, p === undefined ? '…' : p + 'ms', x - Font.width(String(p) + 'ms') - 3, y + 1, bad ? '#FF8080' : '#E0E0E0');
 };
 class ReconnectScreen extends MenuScreen {
-  constructor(game, n, go) { super(game, '连接断开了'); this.n = n; this.go = go; this.pauses = false; this.t0 = performance.now(); this.wait = Math.min(15, 2 * n); this.timer = setTimeout(() => { if (this.game.ui.screen === this) go(); }, this.wait * 1000); }
+  constructor(game, n, go) { super(game, '游戏正在更新中'); this.n = n; this.go = go; this.pauses = false; this.t0 = performance.now(); this.wait = Math.min(15, 2 * n); this.timer = setTimeout(() => { if (this.game.ui.screen === this) go(); }, this.wait * 1000); }
   layout() { const u = this.game.ui; this.widgets = [{ x: u.w / 2 - 100, y: u.h / 2 + 20, w: 200, h: 20, label: '不等了，回标题画面', onClick: () => { clearTimeout(this.timer); this.game.reconnect = null; this.game.ui.open(new TitleScreen(this.game)); } }]; }
-  drawExtra(ui) { const s = Math.max(0, Math.ceil(this.wait - (performance.now() - this.t0) / 1000)); Font.center(ui.ctx, `网络断了一下，${s > 0 ? s + ' 秒后' : '正在'}重新连接（第 ${this.n} 次，最多 5 次）…`, ui.w / 2, ui.h / 2 - 10, '#FFFFFF'); }
+  drawExtra(ui) { const s = Math.max(0, Math.ceil(this.wait - (performance.now() - this.t0) / 1000)); Font.center(ui.ctx, `请稍后，${s > 0 ? s + ' 秒后' : '正在'}自动重新连接（第 ${this.n} 次，最多 5 次）…`, ui.w / 2, ui.h / 2 - 10, '#FFFFFF'); }
   onEsc() { }
 }
 (() => {
   const fail = NetClient.prototype.fail;
   NetClient.prototype.fail = function (reason) {
     const g = this.g, room = this.opts && this.opts.room;
-    if (!this.closed && room && reason === '与服务器的连接已断开' && (this.joined || g.reconnect) && ((g.reconnect && g.reconnect.n) || 0) < 5) {
+    if (!this.closed && room && reason === '游戏正在更新中…请稍后' && (this.joined || g.reconnect) && ((g.reconnect && g.reconnect.n) || 0) < 5) {
       this.closed = true;
       const n = ((g.reconnect && g.reconnect.n) || 0) + 1, name = this.name;
       g.reconnect = { room, n };

@@ -12,14 +12,15 @@ defItem('cooked_cod', '熟鳕鱼', { food: [5, 6] });
 defItem('salmon', '生鲑鱼', { food: [2, 0.4] });
 defItem('cooked_salmon', '熟鲑鱼', { food: [6, 9.6] });
 defItem('glass_bottle', '玻璃瓶');
-smelt('potato', 'baked_potato', 0.35); smelt('cod', 'cooked_cod', 0.35); smelt('salmon', 'cooked_salmon', 0.35);
+// (baked potatoes and cooked cod / salmon come from vanilla's recipes in recipedata.js, cooking time included)
 if (ITEMS[ITEM_KEY.carrot]) ITEMS[ITEM_KEY.carrot].places = 'carrots';
 // crops: vanilla drops by age
 (() => {
   const age = (id, m) => +((BLOCKS[id].states && BLOCKS[id].states[m] && BLOCKS[id].states[m].age) || 0);
-  if (BID.carrots !== undefined) BLOCKS[BID.carrots].drops = (m, r) => age(BID.carrots, m) >= 7 ? [['carrot', 2 + (r() * 3 | 0)]] : [['carrot', 1]];
-  if (BID.potatoes !== undefined) BLOCKS[BID.potatoes].drops = (m, r) => age(BID.potatoes, m) >= 7 ? [['potato', 2 + (r() * 3 | 0)]] : [['potato', 1]];
-  if (BID.beetroots !== undefined) BLOCKS[BID.beetroots].drops = (m, r) => age(BID.beetroots, m) >= 3 ? [['beetroot', 1], ['beetroot_seeds', 1 + (r() * 3 | 0)]] : [['beetroot_seeds', 1]];
+  // (the ripe crop's extra roll goes up with fortune: enchant.js cropBonusCount)
+  if (BID.carrots !== undefined) BLOCKS[BID.carrots].drops = (m, r, tool) => age(BID.carrots, m) >= 7 ? [['carrot', 1 + cropBonusCount(r, tool)]] : [['carrot', 1]];
+  if (BID.potatoes !== undefined) BLOCKS[BID.potatoes].drops = (m, r, tool) => age(BID.potatoes, m) >= 7 ? [['potato', 1 + cropBonusCount(r, tool)]] : [['potato', 1]];
+  if (BID.beetroots !== undefined) BLOCKS[BID.beetroots].drops = (m, r, tool) => age(BID.beetroots, m) >= 3 ? [['beetroot', 1], ['beetroot_seeds', cropBonusCount(r, tool)]] : [['beetroot_seeds', 1]];
 })();
 
 // [cost A, count, cost B, count, result, count, max uses, villager xp]; E = emerald
@@ -144,7 +145,7 @@ Villager.prototype.gainXp = function (xp) {
 };
 // restock at most twice a day (vanilla: at the workstation)
 Villager.prototype.restock = function () {
-  const day = Math.floor((this.game.time || 0) / 12000);
+  const day = Math.floor((this.game.worldTime || 0) / 12000);
   if (this.restockDay === day) return;
   this.restockDay = day;
   for (const t of this.trades || []) t.used = 0;
@@ -166,7 +167,8 @@ class MerchantScreen extends ContainerScreen {
   }
   get title2() { return PROFESSION_CN[this.v.profession] + ' - ' + LEVEL_CN[(this.v.vlevel || 1) - 1]; }
   offer() { return this.v.offers()[this.sel]; }
-  matches(st, k, n) { return st && st.id === ITEM_KEY[k] && st.count >= n; }
+  // (every item of the name: the first wool blocks and the vanilla import's are two items - itemIds)
+  matches(st, k, n) { return st && itemIds(k).includes(st.id) && st.count >= n; }
   update() {
     const o = this.offer();
     this.out = o && o.used < o.uses && this.matches(this.pay[0], o.a, o.an) && (!o.b || this.matches(this.pay[1], o.b, o.bn)) ? makeStack(o.r, o.rn) : null;
@@ -178,14 +180,14 @@ class MerchantScreen extends ContainerScreen {
     for (let k = 0; k < 2; k++) if (this.pay[k]) { this.giveBack(this.pay[k]); this.pay[k] = null; }
     if (o) [[o.a, o.an, 0], [o.b, o.bn, 1]].forEach(([key, n, k]) => {
       if (!key) return;
-      const id = ITEM_KEY[key];
+      const id = ITEM_KEY[key], ids = itemIds(key);
       let want = maxStack(id);
       for (let s = 0; s < 36 && want > 0; s++) {
         const st = inv.slots[s];
-        if (!st || st.id !== id) continue;
+        if (!st || !ids.includes(st.id) || (this.pay[k] && st.id !== this.pay[k].id)) continue;
         const take = Math.min(st.count, want); want -= take; st.count -= take;
         if (!st.count) inv.slots[s] = null;
-        if (this.pay[k]) this.pay[k].count += take; else this.pay[k] = { id, count: take, dmg: 0 };
+        if (this.pay[k]) this.pay[k].count += take; else this.pay[k] = { id: st.id, count: take, dmg: 0 };
       }
     });
     this.update();
