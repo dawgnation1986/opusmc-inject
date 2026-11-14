@@ -18,7 +18,9 @@ PHPMC/*.log
 Thumbs.db
 .DS_Store
 源码备份/
-mods/
+/mods/
+# 内置模组包 102MB，可由 sync_v47685.py 从线上重新抓取
+probe/mods/
 
 # 本地运行产物 / 项目记忆（不入库）
 .tmp-online/
