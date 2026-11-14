@@ -44,11 +44,22 @@ const win = {
 function Game() {}
 Game.prototype.breakBlock = function () {};
 Game.prototype.drawSelection = function () {};
+function UI() {}
+UI.prototype.drawHUD = function () {};
 
 const ctx = {
   window: win, document: doc,
-  Game, BLOCKS, Features, KEYBIND_CATS: [], KEY_DEFAULT: {}, KEY_CN: {},
-  UI: undefined, Font: { center() {} },
+  // 预置内置 veinminer 的绑定（它是 MODS_ALWAYS，实际游戏里会先注册）
+  Game, BLOCKS, Features,
+  KEYBIND_CATS: [['连锁挖矿', [['veinmine', '连锁挖矿（开 / 关）', 'Backquote']]]],
+  KEY_DEFAULT: { veinmine: 'Backquote' },
+  KEY_CN: { veinmine: '连锁挖矿（开 / 关）' },
+  bindDown: (g, name) => {
+    const k = (g.settings && g.settings.keys && g.settings.keys[name]) || ctx.KEY_DEFAULT[name];
+    return !!(k && g.keys && g.keys[k]);
+  },
+  keyLabel: (k) => k === 'Backquote' ? '`' : k,
+  UI, Font: { center() {}, draw() {} },
   game: null, console, Date, Math, Set, Map, Object, Array, Number, String, Boolean,
 };
 ctx.self = ctx; ctx.globalThis = ctx;
@@ -158,11 +169,60 @@ ok(U.state.shapeIndex === 0, '形状循环回绕到第一个');
 
 // ---- 延迟挂载：DOMContentLoaded 之后 breakBlock 才是我们的 ----
 ok(String(Game.prototype.breakBlock).indexOf('FTB_ULTIMINE_BREAK_HOOK') < 0,
-   '加载阶段尚未覆盖 breakBlock（等 DOMContentLoaded）');
+   '加载阶段三个 hook 都还没装（等 DOMContentLoaded）');
+ok(String(Game.prototype.drawSelection).indexOf('outlineEdges') < 0, '预览 hook 也延迟');
+ok(String(UI.prototype.drawHUD).indexOf('infoLines') < 0, 'HUD 面板 hook 也延迟');
 (domListeners.DOMContentLoaded || []).forEach(f => f());
 ok(String(Game.prototype.breakBlock).indexOf('FTB_ULTIMINE_BREAK_HOOK') >= 0,
-   'DOMContentLoaded 后破坏 hook 挂到最外层');
-ok(String(Game.prototype.drawSelection).indexOf('outlineEdges') >= 0, '预览 hook 已挂');
+   'DOMContentLoaded 后破坏 hook 在最外层');
+ok(String(Game.prototype.drawSelection).indexOf('outlineEdges') >= 0, '预览 hook 在最外层');
+ok(String(UI.prototype.drawHUD).indexOf('infoLines') >= 0, 'HUD 面板 hook 在最外层');
+
+// ---- 这次三个症状的根因：按住键到底有没有生效 ----
+function fakeGame(keys, settings) {
+  return {
+    state: 'play', net: null, player: { food: 20, inv: { held: null }, yaw: 0 },
+    keys, settings: settings || { keys: {} }, ui: { screen: null }, mode: 'survival',
+  };
+}
+ok(U.KEY_DEFAULT.ultimineHold === 'Backquote', '默认键是 FTB 原版的反引号（不是 Alt）');
+ok(U.KEY_DEFAULT.ultimineNext === 'ArrowUp' && U.KEY_DEFAULT.ultiminePrev === 'ArrowDown', '形状切换键已进 KEY_DEFAULT');
+ok(U.KEYBIND_CATS.some(c => c[0] === 'FTB连锁破坏'), '按键设置里能看到 FTB连锁破坏 分类');
+ok(U.KEY_DEFAULT.veinmine !== 'Backquote', '内置 veinminer 默认键已让出反引号', U.KEY_DEFAULT.veinmine);
+ok(U.KEYBIND_CATS.some(c => c[1].some(b => b[0] === 'veinmine' && b[2] !== 'Backquote')),
+   '按键设置里内置项也同步改了默认键');
+
+const g1 = fakeGame({});
+ok(U.held(g1) === false, '没按键时 held=false');
+g1.keys.Backquote = true;
+ok(U.held(g1) === true, '按住默认键 -> held=true（用游戏的 bindDown）');
+g1.keys.Backquote = false;
+ok(U.held(g1) === false, '松开 -> held=false');
+// 用户在按键设置里改成 KeyG，也必须生效
+const g2 = fakeGame({ KeyG: true }, { keys: { ultimineHold: 'KeyG' } });
+ok(U.held(g2) === true, '用户改键为 KeyG 后仍生效（读 g.settings.keys）');
+ok(U.held(fakeGame({ Backquote: true }, { keys: { ultimineHold: 'KeyG' } })) === false,
+   '改键后旧键不再生效');
+// 非 play / 有界面 / 联机 时不激活
+ok(U.held(Object.assign(fakeGame({ Backquote: true }), { state: 'title' })) === false, '标题界面不激活');
+ok(U.held(Object.assign(fakeGame({ Backquote: true }), { net: {} })) === false, '联机不激活');
+
+// ---- 左边信息面板 ----
+fill(ID.IRON_ORE);
+const g3 = fakeGame({ Backquote: true });
+U.clearCache();
+U.state.cachedBlocks = [[5, 5, 5], [6, 5, 5], [7, 5, 5]];
+const lines = U.infoLines(g3);
+ok(lines.length >= 4, '信息面板有多行', lines.length);
+ok(lines.some(l => l.s.includes('FTB连锁破坏') && l.s.includes('已激活')), '面板显示已激活');
+ok(lines.some(l => l.s.includes('采掘3方块')), '面板显示方块数');
+ok(lines.some(l => l.s.includes('按住')), '面板显示按键提示');
+ok(lines.some(l => l.c === '#FFFF55' && l.s.includes('▸')), '当前形状黄色高亮');
+ok(lines.filter(l => l.c === '#AAAAAA').length >= 2, '形状菜单上下文灰色项');
+U.state.cachedBlocks = [];
+const idle = U.infoLines(g3);
+ok(idle.some(l => l.s.includes('未激活')), '没有目标时显示未激活');
+ok(idle.some(l => l.s.includes('未指向任何方块')), '未激活时给出原因');
 
 console.log('---');
 console.log(fail === 0 ? `ALL PASS (${pass})` : `${fail} FAILED / ${pass}`);

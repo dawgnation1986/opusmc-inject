@@ -37,6 +37,11 @@
     previewLineAlpha: 45,       // RENDERING.preview_line_alpha (0..255)
     requireKeyForCycling: true, // GENERAL.require_ultimine_key_for_cycling
     shapeFeedback: false,       // GENERAL.shape_feedback_hotbar_message
+    requireSneakForMenu: false, // OVERLAY.require_sneak_for_menu
+    shapeMenuContextLines: 2,   // OVERLAY.shape_menu_context_lines
+    overlayInsetX: 2,           // OVERLAY.overlay_inset_x
+    overlayInsetY: 2,           // OVERLAY.overlay_inset_y
+    overlayScale: 1.0,          // OVERLAY.overlay_scale
     singleCropHarvesting: true, // FEATURES.single_crop_harvesting
   };
 
@@ -59,29 +64,44 @@
   const metaOf = (w, x, y, z) => (w.getMeta ? w.getMeta(x, y, z) : 0);
   const sleepSafe = (n) => Math.max(0, n | 0);
 
-  // ---- 按键：按住 Alt 激活（FTB 的 Ultimine 键），滚轮/↑↓ 切形状 ----
-  // 用 KEYBIND_CATS 登记，和内置 veinminer 的 Backquote 开关互不冲突。
+  // ---- 按键登记 ----
+  // FTB 原版默认 KEY_GRAVE（反引号 ` / ~），这里保持一致。
+  // 重要：controls.js 在顶层只遍历一次 KEYBIND_CATS 去填 KEY_DEFAULT / KEY_CN，
+  // 模组在 mods_code.js 阶段才 push，所以必须自己补上，否则按键设置里不显示、bindDown 也读不到。
+  const BINDINGS = [
+    ['ultimineHold', '按住启用连锁破坏', 'Backquote'],
+    ['ultimineNext', '切换至下一个形状', 'ArrowUp'],
+    ['ultiminePrev', '切换至上一个形状', 'ArrowDown'],
+  ];
   if (typeof KEYBIND_CATS !== 'undefined' && typeof KEY_DEFAULT !== 'undefined' && !KEY_DEFAULT.ultimineHold) {
-    KEYBIND_CATS.push(['连锁破坏（FTB）', [
-      ['ultimineHold', '按住启用连锁破坏', 'AltLeft'],
-      ['ultimineNext', '切换下一个形状', 'ArrowUp'],
-      ['ultiminePrev', '切换上一个形状', 'ArrowDown'],
-    ]]);
-    KEY_DEFAULT.ultimineHold = 'AltLeft';
-    KEY_DEFAULT.ultimineNext = 'ArrowUp';
-    KEY_DEFAULT.ultiminePrev = 'ArrowDown';
-    if (typeof KEY_CN !== 'undefined') {
-      KEY_CN.ultimineHold = '按住启用连锁破坏';
-      KEY_CN.ultimineNext = '切换下一个形状';
-      KEY_CN.ultiminePrev = '切换上一个形状';
+    // 内置 veinminer（MODS_ALWAYS，先加载）也占 Backquote 做开关，会和「按住」抢键。
+    // 把它的默认键挪到 KeyV，让 FTB 还原版独占反引号；用户若手动改过 keys.veinmine 则不动。
+    if (KEY_DEFAULT.veinmine === 'Backquote') {
+      KEY_DEFAULT.veinmine = 'KeyV';
+      for (const [, list] of KEYBIND_CATS) for (const b of list)
+        if (b[0] === 'veinmine' && b[2] === 'Backquote') b[2] = 'KeyV';
+      if (typeof KEY_CN !== 'undefined' && KEY_CN.veinmine)
+        KEY_CN.veinmine = '连锁挖矿（开 / 关，KeyV）';
+    }
+    KEYBIND_CATS.push(['FTB连锁破坏', BINDINGS.map(b => b.slice())]);
+    for (const [n, cn, d] of BINDINGS) {
+      KEY_DEFAULT[n] = d;
+      if (typeof KEY_CN !== 'undefined') KEY_CN[n] = cn;
     }
   }
 
   const bound = (g, id, def) => {
     const k = g.settings && g.settings.keys && g.settings.keys[id];
-    return k !== undefined ? k : def;
+    return k !== undefined ? k : (typeof KEY_DEFAULT !== 'undefined' && KEY_DEFAULT[id] !== undefined ? KEY_DEFAULT[id] : def);
   };
-  const isKeyDown = (e, code) => e.code === code || (code === 'AltLeft' && e.key === 'Alt');
+  // 用游戏自己的按住状态：main.js 维护 g.keys[code]，controls.js 的 bindDown 查它。
+  // 这样用户在「选项 → 按键控制」里改成什么键都自动生效，也不受浏览器 Alt 菜单影响。
+  const held = (g) => {
+    if (!g || g.state !== 'play' || g.net || !g.player || (g.ui && g.ui.screen)) return false;
+    if (typeof bindDown === 'function') return bindDown(g, 'ultimineHold');
+    const k = bound(g, 'ultimineHold', 'Backquote');
+    return !!(k && g.keys && g.keys[k]);
+  };
 
   // ---- 玩家状态（FTBUltiminePlayerData：pressed / shapeIndex / 缓存）----
   const state = {
@@ -418,22 +438,22 @@
     return v;
   }
 
-  // ---- 事件接入（对照 FTBUltimineClient / FTBUltimine 的 tick 与按键）----
-  window.addEventListener('keydown', (e) => {
-    const g = typeof game !== 'undefined' ? game : null;
-    if (!g || g.state !== 'play' || g.ui.screen || g.net) return;
-    if (isKeyDown(e, bound(g, 'ultimineHold', 'AltLeft'))) { state.pressed = true; e.preventDefault && e.preventDefault(); }
-    if (e.repeat) return;
-    if (bound(g, 'ultimineNext', 'ArrowUp') === e.code && (!CFG.requireKeyForCycling || state.pressed)) cycleShape(true, g);
-    if (bound(g, 'ultiminePrev', 'ArrowDown') === e.code && (!CFG.requireKeyForCycling || state.pressed)) cycleShape(false, g);
-  });
-  window.addEventListener('keyup', (e) => {
-    if (isKeyDown(e, 'AltLeft')) { state.pressed = false; clearCache(); }
-  });
-  window.addEventListener('blur', () => { state.pressed = false; clearCache(); });
+  // ---- 事件接入（对照 FTBUltimineClient.onKeyPress / onMouseScrolled）----
+  // held 每帧由 bindDown 读，不需要自己维护 pressed；只在「刚松开」时清缓存。
+  // 形状切换用边沿检测（按下的那一帧才切），避免长按连发。
+  const nextCode = 'ultimineNext', prevCode = 'ultiminePrev';
+  let prevNext = false, prevPrev = false;
+  function pollInput(g) {
+    if (!g) return;
+    const nowNext = !!(g.keys && g.keys[bound(g, nextCode, 'ArrowUp')]);
+    const nowPrev = !!(g.keys && g.keys[bound(g, prevCode, 'ArrowDown')]);
+    if (nowNext && !prevNext && (!CFG.requireKeyForCycling || held(g))) cycleShape(true, g);
+    if (nowPrev && !prevPrev && (!CFG.requireKeyForCycling || held(g))) cycleShape(false, g);
+    prevNext = nowNext; prevPrev = nowPrev;
+  }
   window.addEventListener('wheel', (e) => {
     const g = typeof game !== 'undefined' ? game : null;
-    if (!g || !state.pressed || g.state !== 'play' || g.ui.screen) return;
+    if (!g || !held(g)) return;
     cycleShape(e.deltaY < 0 || e.deltaX < 0, g);
   }, { passive: true });
 
@@ -445,10 +465,8 @@
     Game.prototype.breakBlock = function (x, y, z, natural, silent) {
       // FTB_ULTIMINE_BREAK_HOOK（探针/自检标记，勿删）
       // natural / 已在连锁中：交回原版，避免递归
-      if (natural || this.__ftbUltimining || !state.pressed || !canUltimine(this))
+      if (natural || this.__ftbUltimining || !held(this) || !canUltimine(this))
         return origBreak.apply(this, arguments);
-      // 内置 veinminer 若开着，让位给它，避免两套连锁互相打架
-      if (this.settings && this.settings.veinOn) return origBreak.apply(this, arguments);
       const t = this.target;
       const face = t && t.face !== undefined ? t.face : 4;
       updateBlocks(this, [x, y, z], face);
@@ -459,14 +477,15 @@
       return origBreak.apply(this, arguments);
     };
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installBreakHook);
-  else installBreakHook();
 
   // ---- 预览 hook（FTBUltimineClient.renderInGame）----
-  const origDrawSelection = Game.prototype.drawSelection;
-  Game.prototype.drawSelection = function (env) {
+  // 同样延到 DOMContentLoaded 装，见 installBreakHook 的说明。
+  function installDrawHook() {
+    const origDrawSelection = Game.prototype.drawSelection;
+    Game.prototype.drawSelection = function (env) {
     origDrawSelection.call(this, env);
-    if (!state.pressed || !canUltimine(this) || this.ui.hideHud || this.perspective === 2) return;
+    pollInput(this);
+    if (!held(this) || !canUltimine(this) || this.ui.hideHud || this.perspective === 2) { clearCache(); return; }
     const t = this.target;
     if (!t || !t.pos) return;
     const pos = t.pos.slice(), face = t.face !== undefined ? t.face : 4;
@@ -481,21 +500,81 @@
     if (this.renderer.drawLines)
       this.renderer.drawLines(flatten(hidden), [1, 1, 1, CFG.previewLineAlpha / 255 * 0.6]);
     // 外缘：白色实线
-    if (this.renderer.drawLines) this.renderer.drawLines(flatten(solid), [1, 1, 1, 0.9]);
-  };
+      if (this.renderer.drawLines) this.renderer.drawLines(flatten(solid), [1, 1, 1, 0.9]);
+    };
+  }
 
-  // ---- HUD 提示（FTBUltimineClient.addPressedInfo / shape menu）----
-  if (typeof UI !== 'undefined' && UI.prototype.drawHUD) {
+  // ---- 左上信息面板（逐行对照 FTBUltimineClient.addPressedInfo）----
+  // 状态色：已激活 #A3BE8C / 未激活 #BF616A / 冷却 #BFBF6C / 方块数 #A3BE8C
+  // 形状菜单：当前项黄色，上下文项灰色，缩进 16px；按住 Shift 展开上下文。
+  const KEY_LABEL = (g) => {
+    const k = bound(g, 'ultimineHold', 'Backquote');
+    return typeof keyLabel === 'function' ? keyLabel(k) : k;
+  };
+  function infoLines(g) {
+    const out = [];
+    const ok = canUltimine(g), n = state.cachedBlocks.length;
+    const active = ok && n > 0;
+    out.push({ x: 0, s: 'FTB连锁破坏' + (active ? '已激活' : '未激活'), c: active ? '#A3BE8C' : '#BF616A' });
+    if (!active) {
+      let why = '未指向任何方块';
+      if (CFG.cooldownMs > 0 && Date.now() - state.lastUse < CFG.cooldownMs) why = '冷却中';
+      else if (g.mode !== 'creative' && (g.player.food | 0) <= 0) why = '过于饥饿';
+      else if (CFG.requireTool && !(g.player.inv && g.player.inv.held && g.player.inv.held.id)) why = '无有效工具';
+      out.push({ x: 8, s: why, c: '#BF616A' });
+    }
+    const shift = !!(g.keys && (g.keys.ShiftLeft || g.keys.ShiftRight));
+    const menu = !CFG.requireSneakForMenu || shift;
+    if (!menu) {
+      out.push({ x: 0, s: '按住Shift打开菜单', c: '#AAAAAA' });
+      out.push({ x: 0, s: '', c: '#FFFFFF' });
+    } else {
+      if (active) out.push({ x: 0, s: '', c: '#FFFFFF' });
+      for (let i = -CFG.shapeMenuContextLines; i < 0; i++) {
+        const s = SHAPES[(state.shapeIndex + i + SHAPES.length) % SHAPES.length];
+        out.push({ x: 16, s: s.cn, c: '#AAAAAA' });
+      }
+    }
+    out.push({ x: menu ? 16 : 0, s: '▸ ' + currentShape().cn, c: '#FFFF55' });
+    if (menu) for (let i = 1; i <= CFG.shapeMenuContextLines; i++) {
+      const s = SHAPES[(state.shapeIndex + i) % SHAPES.length];
+      out.push({ x: 16, s: s.cn, c: '#AAAAAA' });
+    }
+    if (active) {
+      out.push({ x: 0, s: '', c: '#FFFFFF' });
+      let s = '采掘' + n + '方块';
+      if (n > CFG.renderOutline) s += '，已渲染' + CFG.renderOutline;
+      out.push({ x: 0, s, c: '#A3BE8C' });
+    }
+    out.push({ x: 0, s: '按住 ' + KEY_LABEL(g) + ' 启用', c: '#888888' });
+    return out;
+  }
+  function installHudHook() {
+    if (typeof UI === 'undefined' || !UI.prototype.drawHUD) return;
     const origHUD = UI.prototype.drawHUD;
     UI.prototype.drawHUD = function () {
       const r = origHUD.apply(this, arguments), g = this.game;
-      if (g && state.pressed && g.state === 'play' && !this.screen && state.cachedBlocks.length > 1) {
-        Font.center(this.ctx, currentShape().cn + ' · ' + state.cachedBlocks.length + ' 个方块',
-          this.w / 2, this.h / 2 + 12, '#FFFFFF');
+      if (g && g.state === 'play' && !this.screen && !this.hideHud && held(g)) {
+        const lines = infoLines(g), x = CFG.overlayInsetX, y0 = CFG.overlayInsetY;
+        const c = this.ctx;
+        c.save();
+        c.fillStyle = 'rgba(0,0,0,0.35)';
+        c.fillRect(x - 2, y0 - 2, 168, lines.length * 11 + 4);
+        c.restore();
+        lines.forEach((l, i) => { if (l.s) Font.draw(c, l.s, x + l.x, y0 + i * 11, l.c, true); });
       }
       return r;
     };
   }
+
+  // ---- 三个 hook 统一在所有脚本加载完后装，避免被 mobile.js / minigame.js 等后续包装盖住 ----
+  function installAllHooks() {
+    installBreakHook();
+    installDrawHook();
+    installHudHook();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installAllHooks);
+  else installAllHooks();
 
   // 算法级单测的出口（verify.js 用；正常游戏里 globalThis.__FTBU_TEST 不存在，无副作用）
   if (typeof globalThis !== 'undefined' && globalThis.__FTBU_TEST === true) {
@@ -506,6 +585,7 @@
       matchByTagsShaped, matchByCrop, ripe, outlineEdges, flatten,
       state, clearCache, currentShape, cycleShape, canUltimine, updateBlocks,
       inMergeGroup, isOre, isBaseStone, keyOf, d2,
+      held, pollInput, infoLines, bound, KEYBIND_CATS, KEY_DEFAULT,
     };
   }
 })();

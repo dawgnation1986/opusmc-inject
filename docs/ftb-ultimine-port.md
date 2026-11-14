@@ -165,7 +165,7 @@ examples/mods/ftbultimine/      源码（可编辑）
 ├── mod.json                    元数据
 ├── data.js                     登记（不新增方块/物品，逻辑全在 code.js）
 ├── code.js                     ~500 行，逐段标注对应的 FTB 源码类
-└── verify.js                   41 项算法断言
+└── verify.js                   64 项算法断言
 probe/mods/ftbultimine/         安装后的副本（install_mod.py 生成 _prelude 前导）
 ```
 
@@ -173,13 +173,14 @@ probe/mods/ftbultimine/         安装后的副本（install_mod.py 生成 _prel
 
 | 项 | FTB | 还原版 |
 |---|---|---|
-| 触发键 | Ultimine 键（默认按住） | `AltLeft` 按住；↑↓ / 滚轮切形状 |
+| 触发键 | Ultimine 键（默认 `KEY_GRAVE` 反引号，按住） | 同为 `Backquote` 按住，走游戏 `bindDown`；↑↓ / 滚轮切形状 |
 | 标签系统 | 原版 `TagKey<Block>` 动态匹配 | key 模式近似（石头/矿石/原木） |
 | 作物邻域 | `CropLikeRegistry` 可扩展 | 内置作物 key 表 + `Features.propOf(id,meta,'age')` |
 | 轮廓 | AABB 合并 | 暴露面直接画，视觉等价 |
 | 右键处理 | `RightClickDispatcher`（剥皮/锄地/耕地/收割） | 只实现作物成熟判定与匹配，**未做右键批量收割** |
 | 联机 | 服务端权威 + 网络包 | 仅单人（`g.net` 时全部跳过） |
 | 权限 | FTB Ranks / 实体属性覆盖 | 无 |
+| 信息面板 | `addPressedInfo()` 左上 overlay | 已还原：激活状态/原因、形状菜单、采掘方块数、按键提示，用 zh_cn 原版文案与配色 |
 
 ### 与 OpusMC 内置 `veinminer` 的关系
 
@@ -187,9 +188,11 @@ probe/mods/ftbultimine/         安装后的副本（install_mod.py 生成 _prel
 同样 26 邻域泛洪、MAX=64、矿石/原木/作物分组、逐块耗工具与饥饿、白线预览，
 但它是「Backquote 开关 + 只挖特定类别」，没有 6 种形状、没有标签合并、没有按住预览。
 
-两者都 hook `Game.prototype.breakBlock`，**会互相干扰**。还原版做了让位：
-检测到 `g.settings.veinOn`（内置开关）为真时直接交回原版，不接管破坏。
-**用还原版时请关掉内置的连锁挖矿开关。**
+**与内置 veinminer 的按键冲突**：内置 `veinminer` 是 `MODS_ALWAYS`（必加载），也占
+`Backquote` 做开关。还原版启动时把它的默认键挪到 `KeyV`（同时改 `KEY_DEFAULT.veinmine`
+和 `KEYBIND_CATS` 里那一项），让 FTB 还原版独占反引号；用户手动改过 `keys.veinmine` 则不动。
+两者都 hook `breakBlock`，但 FTB 版在最外层且不再让位，按住时由它接管。
+
 
 ### 一个真实踩过的坑（hook 顺序）
 
@@ -199,10 +202,41 @@ probe/mods/ftbultimine/         安装后的副本（install_mod.py 生成 _prel
 功能仍生效，但 `String(Game.prototype.breakBlock)` 看不到自己的标记，容易误判「hook 没挂上」，
 也可能被别的整体赋值覆盖。
 
-**解决**：破坏 hook 延到 `DOMContentLoaded` 再装，保证自己在最外层。
-`drawSelection` 的预览 hook 没这个冲突，可以直接挂。
+另外 `js/minigame.js` 在 `mods_code.js` 之后又包了一层 `UI.prototype.drawHUD`，会盖住信息面板 hook。
+
+**解决**：`breakBlock` / `drawSelection` / `drawHUD` 三个 hook 统一延到
+`DOMContentLoaded` 由 `installAllHooks()` 一起装，保证都在最外层。
 
 ---
+
+
+## 3.1 第一版为什么「没框 / 没连锁 / 没面板」（用户实测反馈）
+
+第一版只验了「hook 挂上了」，没验「按住键之后会发生什么」，三个症状全中。
+回头看根因其实是**一个**：自己用 `window.addEventListener` 维护 `state.pressed`，
+而用户是在**游戏按键设置**里改的键，两边对不上 → `pressed` 永远 false。
+
+| # | 症状 | 根因 |
+|---|---|---|
+| 1 | 按住键没白框 | 默认键设成 `AltLeft`（浏览器抢 Alt 菜单）+ 自定义按键监听读不到用户的绑定 |
+| 2 | 连锁没用 | 同上；另外破坏 hook 里写了「内置 veinminer 开着就让位」，用户按过 Backquote 把内置开关打开后，还原版永远不接管 |
+| 3 | 左边没信息 | `addPressedInfo` 面板第一版**根本没做** |
+
+修法（全部对着源码/游戏实现）：
+
+1. **按键改用游戏自己的 `bindDown(g, name)`**：`main.js` 维护 `g.keys[code]`，
+   `controls.js:37` 的 `bindDown` 查它 —— 用户在「选项 → 按键控制」里设什么键都自动生效。
+   删掉整套自定义 keydown 监听。
+2. **默认键改 `Backquote`** 对齐 FTB 原版 `KEY_GRAVE`；内置 veinminer 默认键挪到 `KeyV` 解冲突。
+3. **删掉让位逻辑**，FTB 版在最外层直接接管。
+4. **补左上信息面板**，逐行照 `FTBUltimineClient.addPressedInfo()`，
+   文案取 `assets/ftbultimine/lang/zh_cn.json`，配色 `#A3BE8C / #BF616A / #BFBF6C`。
+5. `controls.js` 顶层只遍历一次 `KEYBIND_CATS` 填 `KEY_DEFAULT`/`KEY_CN`，
+   模组在 `mods_code.js` 阶段才 push，必须自己补，否则按键设置里不显示、`bindDown` 也读不到。
+
+> 教训：验证「hook 存在」和验证「功能可用」是两件事。后来改成在浏览器里
+> 模拟 `g.keys.Backquote = true` + 造一片相连方块，直接量 `drawLines` 调用次数和
+> 批量清空数，才真正把三个症状都覆盖到。
 
 ## 4. 验证结果
 
@@ -211,12 +245,11 @@ probe/mods/ftbultimine/         安装后的副本（install_mod.py 生成 _prel
 | FTB 仓库 clone（21 分支） | 成功，3.8MB |
 | 四分支源码导出 | 成功 |
 | `node --check`（data/code/verify） | 通过 |
-| `verify.js` 算法断言 | **41 项全过** |
-| 真实浏览器 `?modtest=ftbultimine` | 游戏加载完成、模组注册、`OpusMC.errors` 为空 |
-| `Game.prototype.breakBlock` 挂到最外层 | 是（CDP/title 探针实测） |
-| `Game.prototype.drawSelection` 预览 hook | 是 |
-| `Mods.active` | `["ftbultimine"]` |
-| **实际挖掉一片方块 / 白色轮廓出现** | **未验证** —— 无头环境无法模拟按住键与准星，需你在浏览器里看一眼 |
+| `verify.js` 断言 | **64 项全过**（含按键改键、held 状态、信息面板、三 hook 延迟挂载） |
+| 真实浏览器 `?modtest=ftbultimine` | 游戏加载完成、模组注册、`OpusMC.errors` 空、**三个 hook 全在最外层**、`KEY_DEFAULT.ultimineHold = Backquote`、`Mods.active = ["ftbultimine"]` |
+| **按住键 → 白色轮廓** | **已量到**：浏览器里 `g.keys.Backquote=true` 后调 `drawSelection`，`renderer.drawLines` 调用 **3 次**（原版选块 1 + 隐藏边 1 + 外缘实线 1） |
+| **按住键 → 批量破坏** | **已量到**：造 5 格相连方块调 `breakBlock`，一次清掉 **4 格**（剩 1 格是测试桩方块表不完整导致的硬度检查） |
+| 手工看画面 | 仍未做：无头环境看不到屏幕，需你在浏览器里确认视觉效果 |
 
 `verify.js` 覆盖：配置默认值、6 形状、26/作物邻域、三种匹配器、标签合并、
 泛洪连通性与上限、按距离排序、形状几何与中断条件、轮廓合并、状态机循环、延迟挂载。
@@ -230,9 +263,10 @@ launch-offline.bat        # 起 localhost:8777
 打开 `http://localhost:8777/game.html?modtest=ftbultimine`，
 **先按 Backquote 关掉内置连锁挖矿**（若它开着），然后：
 
-- 按住 **左 Alt** + 准星指向矿脉 → 应出现白色外轮廓，HUD 显示形状与方块数
+- 按住 **反引号 ` / ~** + 准星指向矿脉 → 左上出现信息面板、方块出现白色外轮廓
 - 保持按住并左键破坏 → 整片同类方块一起掉
-- 按住 Alt 时滚滚轮或按 ↑↓ → 在 6 种形状间切换
+- 按住时滚滚轮或按 ↑↓ → 在 6 种形状间切换（按 Shift 展开形状菜单上下文）
+- 按键可在「选项 → 按键控制 → FTB连锁破坏」里改，改完自动生效
 
 ---
 
