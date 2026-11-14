@@ -1,0 +1,10 @@
+{
+  "id": "ftbultimine",
+  "name": "连锁破坏（FTB Ultimine 还原）",
+  "en": "FTB Ultimine (OpusMC port)",
+  "brief": "按住键预览并按形状连锁破坏：散挖/小隧道/3x3/大隧道/下斜矿道/上斜逃生梯",
+  "author": "FTBTeam（算法与配置）/ 本地还原",
+  "license": "MIT",
+  "version": "1.0.0",
+  "desc": "按 FTBTeam/FTB-Ultimine 源码（dev, 26.1.2.8）还原：26 邻域泛洪、6 种形状、同类方块与标签合并、max_blocks 64、饥饿/工具/经验消耗、白色外轮廓预览、作物 5x5 平面收割。仅单人。"
+}

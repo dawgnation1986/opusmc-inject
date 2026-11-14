@@ -3,8 +3,8 @@
 游戏从 **v47685** 起内置模组系统。这份指南基于 `probe/js/modapi.js`（官方 SDK）和
 `probe/js/mods.js`（加载器）的真实实现写成，所有 API 名都对着源码核过。
 
-> 想直接看能跑的东西：`examples/mods/helloblock/` 是一个完整示例，
-> `node examples/mods/helloblock/verify.js` 有 20 项自动校验。
+> 想直接看能跑的东西：`examples/mods/ftbultimine/` 是照 FTB Ultimine 源码还原的实战模组，
+> `node examples/mods/ftbultimine/verify.js` 有 41 项算法断言，详见 `ftb-ultimine-port.md`。
 
 ---
 
@@ -63,7 +63,7 @@ if (!m.ids) throw new Error('模组 xxx 没有经过安装（缺少编号）：�
 本项目补了一个等价的 `tools/install_mod.py`：
 
 ```bash
-python tools/install_mod.py examples/mods/helloblock
+python tools/install_mod.py examples/mods/ftbultimine
 ```
 
 它会：
@@ -76,7 +76,7 @@ python tools/install_mod.py examples/mods/helloblock
 ```js
 'use strict';
 // 由 tools/install_mod.py 生成，请勿手改前导
-OpusMC._prelude("helloblock", {"ids":{"blocks":{"helloblock_lamp":4096}, ...}, "textures":[], ...});
+OpusMC._prelude("ftbultimine", {"ids":{"blocks":{},"items":{}}, "textures":[], ...});
 ```
 
 5. 复制文件到 `probe/mods/<id>/`，登记进 `probe/mods/index.json`
@@ -197,7 +197,7 @@ launch-offline.bat       # 起 localhost:8777
 然后打开：
 
 ```
-http://localhost:8777/game.html?modtest=helloblock
+http://localhost:8777/game.html?modtest=ftbultimine
 ```
 
 `?modtest=<id>` 是 SDK 的本地测试入口（`mods.js` 里解析）：
@@ -209,7 +209,7 @@ http://localhost:8777/game.html?modtest=helloblock
 把 id 加进 `probe/game.html` 的：
 
 ```html
-<script>self.MODS_ALWAYS = ["tconstruct", "farmersdelight", ..., "helloblock"];</script>
+<script>self.MODS_ALWAYS = ["tconstruct", "farmersdelight", ..., "ftbultimine"];</script>
 ```
 
 这样不用点下载，每次启动都加载（截图里那 7 个「已内置」就是这么来的）。
@@ -221,45 +221,37 @@ http://localhost:8777/game.html?modtest=helloblock
 
 ---
 
-## 7. 示例模组
+## 7. 实战模组
 
-`examples/mods/helloblock/` 覆盖五条最常用路径：
-
-| 功能 | 演示 |
-|---|---|
-| 自定义发光方块 | `helloblock_lamp`，亮度 15，借原版 `sea_lantern` 贴图 |
-| 自定义物品 | `helloblock_return`，耐久 16、带附魔光 |
-| 配方 | 有序 + 无序各一条 |
-| 命令 | `/hello` 在脚边放灯 |
-| 事件 | `worldLoad` / `blockBroken` / `every(100)` / 右键物品 |
+`examples/mods/ftbultimine/` 是照 [FTB Ultimine](https://github.com/FTBTeam/FTB-Ultimine) 源码
+还原的连锁挖矿模组，覆盖按住键预览、6 种形状、26 邻域泛洪、标签合并、逐块消耗、
+外轮廓线框等完整链路。上游源码归档在 `refs/`，逐段对照见 `docs/ftb-ultimine-port.md`。
 
 安装与验证：
 
 ```bash
-python tools/install_mod.py examples/mods/helloblock
-node examples/mods/helloblock/verify.js      # 20 项全过
+python tools/install_mod.py examples/mods/ftbultimine
+node examples/mods/ftbultimine/verify.js      # 41 项全过
 ```
 
-`verify.js` 用 Node 的最小 SDK stub 跑 `data.js` / `code.js`，
-检查前导、编号、命名约束、配方、事件与命令注册。
-
----
+它不新增方块/物品，所以 `data.js` 只有一行 `OpusMC.data(...)`，逻辑全在 `code.js` ——
+这也是「纯玩法模组」的典型形态：需要 `_prelude` 但没有编号要分配。
 
 ## 8. 验证到什么程度
 
 | 项 | 状态 |
 |---|---|
 | 全部 JS `node --check` | 通过 |
-| 示例 `verify.js` 20 项断言 | **全过** |
+| `ftbultimine/verify.js` 41 项算法断言 | **全过** |
 | 安装器幂等（连装 3 次编号稳定） | 通过 |
-| HTTP 静态服务取 `?modtest` 与模组文件 | 全部 200 |
-| **无头 Chrome 里完整跑进游戏** | **未通过**：页面停在「正在生成标题画面 85%」，无头环境缺 WebGL/渲染上下文，探针脚本没能注入 |
+| HTTP 静态服务取 99 个入口 script + 模组文件 | 全部 200 |
+| **真实浏览器 `?modtest=ftbultimine`** | **通过**：游戏加载完成、模组注册、`OpusMC.errors` 空、`breakBlock` / `drawSelection` 两个 hook 都挂上、`Mods.active = ["ftbultimine"]` |
+| 实际挖掉一片方块 / 白色轮廓出现 | **未验证**：无头环境无法模拟按住键与准星，需你在浏览器里看一眼 |
 
-最后一条如实说明：真实浏览器里点开 `?modtest=helloblock` 后，
-灯、回城石、`/hello` 是否完全按预期工作，**还需要你在有显卡的浏览器里看一眼**。
-注册链路和数据格式已经用源码级校验过，但「画面里真出现那个方块」这件事我没量到。
-
----
+浏览器验证的做法：在 `game.html` 的 `<head>` 里临时插一个探针脚本，把运行时状态
+（`typeof Game`、`String(Game.prototype.breakBlock)`、`OpusMC.errors`、`Mods.active` 等）
+写进 `document.title`，再用 Chrome `--headless --dump-dom` 取回。验完把探针删掉。
+CDP（远程调试端口）在无头 + 虚拟时间预算下页面会提前关闭，反而不如 title 通道稳。
 
 ## 9. 内置模组是怎么写的（想深入时看）
 

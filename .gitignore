@@ -61,3 +61,6 @@ opusmc-v47685-src/
 dev/comet-mod/meteor-client/
 dev/comet-mod/fabric-template/
 dev/comet-mod/preview/shots/
+
+# FTB Ultimine 上游源码（可随时 git clone 重新获取）
+refs/
