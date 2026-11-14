@@ -81,7 +81,9 @@ ok(U.CFG.renderOutline === 256, 'render_outline 默认 256');
 ok(U.CFG.previewLineAlpha === 45, 'preview_line_alpha 默认 45');
 ok(U.CFG.singleCropHarvesting === true, 'single_crop_harvesting 默认 true');
 ok(U.SHAPES.length === 6, '6 种内置形状', U.SHAPES.map(s => s.cn).join('/'));
-ok(U.SHAPES[0].isDefault === true && U.SHAPES[0].indeterminate === true, '散挖是默认且 indeterminate');
+ok(U.SHAPES[0].isDefault === true && U.SHAPES[0].indeterminate === true, '无形状是默认且 indeterminate');
+ok(U.SHAPES[0].cn === '无形状', '首项名称对齐 FTB zh_cn：无形状');
+ok(U.SHAPES[1].cn === '小型通道' && U.SHAPES[5].cn === '逃生通道', '其余形状名也用官方中文');
 ok(U.NEIGHBORS_26.length === 26, '26 邻域（3x3x3 去掉中心）');
 ok(U.NEIGHBORS_PLANT.length === 26, '作物邻域 26 个（5x5 平面 24 + 上下 2）');
 
@@ -140,7 +142,7 @@ const diag = U.diagonalTunnel(ctx2, -1);
 ok(diag[1][1] === diag[0][1] - 1, '下斜矿道每格 Y 递减');
 const esc = U.diagonalTunnel(ctx2, 1);
 ok(esc[1][1] === esc[0][1] + 1, '上斜逃生梯每格 Y 递增');
-ok(U.getBlocks(ctx2, 'shapeless', false).length > 0, 'getBlocks 分派到散挖');
+ok(U.getBlocks(ctx2, 'shapeless', false).length > 0, 'getBlocks 分派到无形状（26 邻域泛洪）');
 ok(U.getBlocks(ctx2, 'small_square', false).length > 0, 'getBlocks 分派到 3x3');
 
 // 形状在遇到不匹配方块时中断（SmallTunnel 的 break）
@@ -160,11 +162,15 @@ ok(U.flatten([[0, 0, 0], [1, 1, 1]]).length === 14, 'flatten 每顶点 7 个 flo
 // ---------- 状态机 ----------
 U.clearCache();
 ok(U.state.cachedBlocks.length === 0 && U.state.cachedPos === null, 'clearCache 清空预览');
-U.state.shapeIndex = 0; U.cycleShape(true, { ui: {} });
+U.state.shapeIndex = 0; U.state.lastToggle = 0; U.cycleShape(true, { ui: {} });
 ok(U.state.shapeIndex === 1, 'cycleShape(next) 前进');
-U.cycleShape(false, { ui: {} });
-ok(U.state.shapeIndex === 0, 'cycleShape(prev) 回退');
-U.state.shapeIndex = 5; U.cycleShape(true, { ui: {} });
+ok(U.CFG.inputDelay === 125, '形状切换有 125ms 节流（FTB INPUT_DELAY）');
+const beforeThrottle = U.state.shapeIndex;
+U.cycleShape(true, { ui: {} });
+ok(U.state.shapeIndex === beforeThrottle, '125ms 内连点被节流，不会一下滚到斜向形状');
+U.state.lastToggle -= 200; U.cycleShape(false, { ui: {} });
+ok(U.state.shapeIndex === 0, '超过节流间隔后可以回退');
+U.state.lastToggle -= 200; U.state.shapeIndex = 5; U.cycleShape(true, { ui: {} });
 ok(U.state.shapeIndex === 0, '形状循环回绕到第一个');
 
 // ---- 延迟挂载：DOMContentLoaded 之后 breakBlock 才是我们的 ----

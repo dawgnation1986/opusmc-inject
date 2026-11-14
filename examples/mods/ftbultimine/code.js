@@ -37,6 +37,7 @@
     previewLineAlpha: 45,       // RENDERING.preview_line_alpha (0..255)
     requireKeyForCycling: true, // GENERAL.require_ultimine_key_for_cycling
     shapeFeedback: false,       // GENERAL.shape_feedback_hotbar_message
+    inputDelay: 125,            // FTBUltimineClient.INPUT_DELAY（形状切换节流，毫秒）
     requireSneakForMenu: false, // OVERLAY.require_sneak_for_menu
     shapeMenuContextLines: 2,   // OVERLAY.shape_menu_context_lines
     overlayInsetX: 2,           // OVERLAY.overlay_inset_x
@@ -46,13 +47,15 @@
   };
 
   // ---- 形状名（ShapeRegistry.registerBuiltinShapes 的注册顺序）----
+  // 名称逐条取自 FTB 的 assets/ftbultimine/lang/zh_cn.json，
+  // 顺序与 FTBUltimine.registerBuiltinShapes 一致（shapeless 是默认）。
   const SHAPES = [
-    { id: 'shapeless',      cn: '散挖',       indeterminate: true,  isDefault: true },
-    { id: 'small_tunnel',   cn: '小隧道',     indeterminate: false },
-    { id: 'small_square',   cn: '3×3 单层',   indeterminate: false },
-    { id: 'large_tunnel',   cn: '3×3 隧道',   indeterminate: false },
-    { id: 'mining_tunnel',  cn: '下斜矿道',   indeterminate: false },
-    { id: 'escape_tunnel',  cn: '上斜逃生梯', indeterminate: false },
+    { id: 'shapeless',      cn: '无形状',           indeterminate: true,  isDefault: true },
+    { id: 'small_tunnel',   cn: '小型通道',         indeterminate: false },
+    { id: 'small_square',   cn: '小型方形（3x3）',  indeterminate: false },
+    { id: 'large_tunnel',   cn: '大型通道（3x3）',  indeterminate: false },
+    { id: 'mining_tunnel',  cn: '采矿通道',         indeterminate: false },
+    { id: 'escape_tunnel',  cn: '逃生通道',         indeterminate: false },
   ];
 
   // ---- 命中面 -> 方向（FACE_NAMES = west,east,down,up,north,south）----
@@ -113,13 +116,17 @@
     pendingXP: 0,
     exhaustion: 0,
     lastUse: 0,
+    lastToggle: 0,
   };
   const clearCache = () => { state.cachedPos = null; state.cachedDir = -1; state.cachedBlocks = []; };
   const currentShape = () => SHAPES[state.shapeIndex] || SHAPES[0];
   const cycleShape = (next, g) => {
+    const now = Date.now();
+    if (now - state.lastToggle < CFG.inputDelay) return;   // INPUT_DELAY 节流，防滚轮连跳
+    state.lastToggle = now;
     state.shapeIndex = (state.shapeIndex + (next ? 1 : -1) + SHAPES.length) % SHAPES.length;
     clearCache();
-    if (CFG.shapeFeedback && g.ui && g.ui.message) g.ui.message('形状：' + currentShape().cn, '#FFFFFF');
+    if (CFG.shapeFeedback && g && g.ui && g.ui.message) g.ui.message('形状：' + currentShape().cn, '#FFFFFF');
   };
 
   // ---- 方块分组 / 标签匹配（BlockMatchers + FTBUltimineTags 的近似）----
@@ -454,6 +461,8 @@
   window.addEventListener('wheel', (e) => {
     const g = typeof game !== 'undefined' ? game : null;
     if (!g || !held(g)) return;
+    // FTB: onMouseScrolled 要求按住 Ultimine 键 + isMenuSneaking()
+    if (CFG.requireSneakForMenu && !(g.keys && (g.keys.ShiftLeft || g.keys.ShiftRight))) return;
     cycleShape(e.deltaY < 0 || e.deltaX < 0, g);
   }, { passive: true });
 
@@ -546,7 +555,7 @@
       if (n > CFG.renderOutline) s += '，已渲染' + CFG.renderOutline;
       out.push({ x: 0, s, c: '#A3BE8C' });
     }
-    out.push({ x: 0, s: '按住 ' + KEY_LABEL(g) + ' 启用', c: '#888888' });
+    out.push({ x: 0, s: '按住 ' + KEY_LABEL(g) + ' 启用 · 滚轮切形状', c: '#888888' });
     return out;
   }
   function installHudHook() {
