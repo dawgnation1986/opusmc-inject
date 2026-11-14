@@ -67,3 +67,7 @@ refs/
 
 # 浏览器验证用的临时 profile（不入库）
 _tmp/
+
+# 一次性补丁脚本 / 恢复前的临时备份（不入库）
+_patch_*.py
+*.before-restore-*
