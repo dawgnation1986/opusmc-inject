@@ -48,7 +48,8 @@ R('screens.js',
     if (Font.width(left) + Font.width(t) + 10 > ui.w) ty = ui.h - 20;
     Font.draw(c, t, ui.w - Font.width(t) - 2, ty, '#FFFFFF');""",
 """    // PEVersion：底部两行署名去掉（离线版不涉及 B站 Toy / 股东）
-    void left;""", 'screens: bottom text', mark='PEVersion：底部两行署名去掉')
+    // 注意：这里不能留 void left; —— left 的 const 声明已被删掉，会抛 TDZ ReferenceError，
+    // 中断 drawExtra 导致按钮一个都不画（用户实测过，node --check 抓不到）。""", 'screens: bottom text', mark='PEVersion：底部两行署名去掉')
 
 # 2) cloudsave.js：底部「登录后可以…」
 R('cloudsave.js',

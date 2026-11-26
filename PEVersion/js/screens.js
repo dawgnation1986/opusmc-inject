@@ -127,9 +127,7 @@ class TitleScreen extends MenuScreen {
       c.globalAlpha = 0.6; c.fillStyle = '#000'; c.fillRect(Math.floor(w / 2 - Font.width(q) / 2 - 4), l - 2, Font.width(q) + 8, 12); c.globalAlpha = 1;
       Font.center(c, q, w / 2, l, '#FFFF55');
     }
-    // (the fan-work line, 11-13: shortened when it would meet the left one on a narrow screen, else a row higher)
     // PEVersion：底部两行署名去掉（离线版不涉及 B站 Toy / 股东）
-    void left;
   }
 }
 
