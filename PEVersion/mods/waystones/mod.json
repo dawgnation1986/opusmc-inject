@@ -1,0 +1,10 @@
+{
+  "id": "waystones",
+  "name": "传送石碑",
+  "en": "Waystones",
+  "brief": "五种双格传送石碑：右键激活，菜单选目标传送；配传送石 / 传送卷轴 / 回程卷轴",
+  "author": "移植：本地",
+  "license": "代码 MIT / 贴图与模型 CC BY-NC-SA 4.0（Waystones, Twelve Iterations）",
+  "version": "1.0.0",
+  "desc": "把 Waystones 搬进网页版：安山岩 / 苔石 / 砂岩 / 黑石 / 深板岩五种石碑（两格高，放下自动补上半），右键第一次激活并登记名字，之后右键打开菜单，点目的地传送；传送石可复用（30 秒冷却），传送卷轴 / 回程卷轴消耗使用。命令 /waystone list。"
+}

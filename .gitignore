@@ -72,3 +72,7 @@ _tmp/
 # 一次性补丁脚本 / 恢复前的临时备份（不入库）
 _patch_*.py
 *.before-restore-*
+
+# 模组开发用的参考仓库/备份，不是游戏运行所需
+PEVersion/mods/*/_ref/
+PEVersion/mods/*/_build/
