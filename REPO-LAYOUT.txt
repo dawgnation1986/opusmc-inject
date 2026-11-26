@@ -33,7 +33,6 @@
   probe/mods/                 102MB 内置模组包    -> tools/sync_v47685.py 从线上重抓
   vanilla-assets/             还原出的资源包目录  -> tools/extract_vanilla_assets.py
   opusmc-vanilla-assets.zip   打好的资源包        -> 同上，加 --with-sounds
-  probe/Logo/                 未引用的单张图
   _tmp/                       浏览器临时 profile / 探针产物
   refs/                       FTB Ultimine 上游源码（随时 git clone）
   **/__pycache__/             Python 缓存
