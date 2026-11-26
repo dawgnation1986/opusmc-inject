@@ -325,6 +325,7 @@ class CloudConflictScreen extends MenuScreen {
     tde.call(this, ui);
     const n = this.game.titleNote;
     if (n) Font.center(ui.ctx, fitText(n.text, ui.w - 8), ui.w / 2, ui.h - 22, n.color);
-    else if (!Account.loggedIn) Font.center(ui.ctx, fitText('登录后可以联机、云存档、换皮肤和披风', ui.w - 8), ui.w / 2, ui.h - 22, '#A0A0A0');
+    // PEVersion：离线版不显示登录提示
+    void n;
   };
 })();

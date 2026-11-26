@@ -188,8 +188,8 @@ const NewsBoard = {
 };
 NewsBoard.load();
 
-// the title screen: refresh when it opens and every 5 minutes, the sign, a tap on it, the important one dropping
-(() => {
+// PEVersion：公告吊牌整段禁用（离线版不读取线上公告）
+if (false) (() => {
   const lay = TitleScreen.prototype.layout, dx = TitleScreen.prototype.drawExtra, md = TitleScreen.prototype.mouseDown;
   TitleScreen.prototype.layout = function (...a) {
     const r = lay.apply(this, a);

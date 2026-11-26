@@ -99,16 +99,10 @@ class TitleScreen extends MenuScreen {
       { x: cx - 100, y: l + 24, w: 200, h: 20, label: '多人游戏', enabled: false, tip: ['此版本为单机离线版，不含联机功能'] },
       { x: cx - 100, y: l + 48, w: 98, h: 20, label: '皮肤和装饰', gold: true, tip: ['换皮肤（也可以用正版玩家的皮肤）、穿上原创披风、帽子和宠物'], onClick: () => g.ui.open(new WardrobeScreen(g, this)) },
       { x: cx + 2, y: l + 48, w: 98, h: 20, label: '反馈问题', tip: ['遇到 bug、卡顿，或者有建议，发给我们'], onClick: () => g.ui.open(new FeedbackScreen(g, this, null)) },
-      { x: cx - 124, y: l + 84, w: 20, h: 20, icon: 'icon_language', tip: ['游戏说明'], onClick: () => g.ui.open(new HelpScreen(g, this)) },
+      // PEVersion：选项/退出保留，左右下角图标与账号/登录去掉
       { x: cx - 100, y: l + 84, w: 98, h: 20, label: '选项…', onClick: () => g.ui.open(new OptionsScreen(g, this)) },
       { x: cx + 2, y: l + 84, w: 98, h: 20, label: '退出游戏', onClick: () => quitGame(g) },
-      // (no 全屏 where the page can't go full screen: iPhones - see toggleFullscreen)
-      fsSupported() ? { x: cx + 104, y: l + 84, w: 20, h: 20, icon: 'icon_accessibility', tip: ['全屏'], onClick: () => toggleFullscreen() } : null,
-    ].filter(Boolean);
-    // the account (top left) and, until everything is unlocked, the way to unlock it (top right)
-    if (Account.loggedIn) this.widgets.push({ x: 4, y: 4, w: Math.min(120, Font.width(Account.name) + 30), h: 18, label: fitText(Account.name, 110), tip: ['账号：游戏名、识别码、退出登录'], onClick: () => g.ui.open(new AccountScreen(g, this)) });
-    else this.widgets.push({ x: 4, y: 4, w: 60, h: 18, gold: true, label: '登录', tip: ['登录后可以联机、云存档、换皮肤和披风'], onClick: () => g.ui.open(new LoginScreen(g, () => g.ui.open(new TitleScreen(g)))) });
-    if (Account.loggedIn && !Account.allUnlocked()) this.widgets.push({ x: u.w - 112, y: 4, w: 108, h: 18, gold: true, label: '解锁披风和联机', onClick: () => g.ui.open(new UnlockScreen(g, this)) });
+    ];
   }
   drawExtra(ui) {
     const c = ui.ctx, w = ui.w, lg = ui.img.logo, ed = ui.img.edition;
@@ -134,13 +128,8 @@ class TitleScreen extends MenuScreen {
       Font.center(c, q, w / 2, l, '#FFFF55');
     }
     // (the fan-work line, 11-13: shortened when it would meet the left one on a narrow screen, else a row higher)
-    const left = 'OpusMC · 仅在 B站 Toy 平台发布';
-    Font.draw(c, left, 2, ui.h - 10, '#FFFFFF');
-    let t = 'Minecraft 粉丝二创 · 非官方 · 永久免费 · 请支持正版', ty = ui.h - 10;
-    if (Font.width(left) + Font.width(t) + 10 > ui.w) t = '粉丝二创 · 非官方 · 永久免费 · 请支持正版';
-    if (Font.width(left) + Font.width(t) + 10 > ui.w) t = '粉丝二创 · 永久免费 · 请支持正版';
-    if (Font.width(left) + Font.width(t) + 10 > ui.w) ty = ui.h - 20;
-    Font.draw(c, t, ui.w - Font.width(t) - 2, ty, '#FFFFFF');
+    // PEVersion：底部两行署名去掉（离线版不涉及 B站 Toy / 股东）
+    void left;
   }
 }
 

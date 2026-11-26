@@ -551,8 +551,8 @@ class CheckinScreen extends MenuScreen {
   }
 }
 
-// ---- the ways in: the title screen (under the news sign) and the pause menu, each with the red dot ----
-(() => {
+// PEVersion：签到按钮禁用
+if (false) (() => {
   const tl = TitleScreen.prototype.layout;
   TitleScreen.prototype.layout = function () {
     tl.call(this);

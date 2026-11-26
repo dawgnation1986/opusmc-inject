@@ -419,8 +419,8 @@ async function openShareholders(g, parent) {
   g.ui.open(new ShareholdersScreen(g, parent));
 }
 
-// the title screen: a gold 股东名单 button under the news sign's (and the sign-in's) - only with a room service
-(() => {
+// PEVersion：股东名单按钮禁用
+if (false) (() => {
   const tl = TitleScreen.prototype.layout;
   TitleScreen.prototype.layout = function () {
     tl.call(this);

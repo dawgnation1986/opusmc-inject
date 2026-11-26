@@ -431,7 +431,8 @@ async function modsGate(g, then, parent) {
   Telemetry.count && Telemetry.count('gate_mods');
   g.ui.open(new UnlockScreen(g, parent, gate.triple && gate.videos && gate.videos.length ? '模组需要关注 UP 主并给新视频三连（老视频的三连不算）' : '模组需要关注 UP 主', () => modsGate(g, then, parent)));
 }
-function openModsScreen(g, parent) { modsGate(g, () => g.ui.open(new ModsScreen(g, parent)), parent); }
+// PEVersion：离线版模组免登录，直接打开
+function openModsScreen(g, parent) { g.ui.open(new ModsScreen(g, parent)); }
 const modNames = (ids) => (ids && ids.length ? ids.map((id) => Mods.nameOf(id)).join('、') : '无');
 
 // the title: a 模组 button under the others
