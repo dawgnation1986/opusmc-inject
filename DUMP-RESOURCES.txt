@@ -1,0 +1,108 @@
+================================================================================
+怎么把 OpusMC 的资源（贴图 / 音效）dump 出来
+================================================================================
+
+仓库里故意不提交体积大的资源目录，它们都能从「编译产物」重新生成。
+下面所有命令都在 opusmc-inject/ 目录下跑，只用 Python 标准库，不用装任何包。
+
+
+--------------------------------------------------------------------------------
+0. 先搞清楚哪些是「编译产物」、哪些是「生成物」
+--------------------------------------------------------------------------------
+
+  probe/js/assets.js       ASSETS = { strip, cols, count, tiles, anims, hi, images }
+  probe/js/etex.js          ETEX = { "entity/...": dataURL }
+  probe/js/font.js          FONT_MC.img（字体图集）
+  probe/js/sound_events.js  音效事件 -> 文件名清单
+  probe/sounds/sfx/*.m4a    4849 个音效（不入库，可重抓）
+
+  这些「编译产物」里的 JS 是入库的（probe/js/ 36MB），
+  所以拿到仓库就能重建出全部贴图。
+
+  生成物（不入库）：
+  vanilla-assets/          还原出的标准 MC 资源包目录
+  opusmc-vanilla-assets.zip 上面全部 + 音效打包
+  opusmc-source/assets/    从 vanilla-assets/ 复制出的独立 PNG（3996 个）
+  opusmc-source/sounds/    音效副本
+  probe/sounds/            音效原件
+
+
+--------------------------------------------------------------------------------
+1. dump 贴图（生成标准 MC 资源包）
+--------------------------------------------------------------------------------
+
+  python tools/extract_vanilla_assets.py
+
+  读 probe/js/assets.js、etex.js、font.js 等里内嵌的 base64 PNG，输出：
+
+    vanilla-assets/assets/minecraft/textures/...   标准 MC 目录结构
+    vanilla-assets/MAPPING.json                    游戏键 <-> 文件路径 <-> 尺寸
+    vanilla-assets/animations.json                 动画帧定义
+    vanilla-assets/COMPAT.md                       兼容字典说明
+    vanilla-assets/REPORT.md                       统计报告
+
+  连音效一起打进 zip（约 45MB）：
+
+    python tools/extract_vanilla_assets.py --with-sounds
+    -> opusmc-vanilla-assets.zip
+
+
+--------------------------------------------------------------------------------
+2. 重新抓音效（probe/sounds/ 丢了就跑这个）
+--------------------------------------------------------------------------------
+
+  python tools/fetch_sounds.py
+
+  清单来自 probe/js/sound_events.js 的 SOUND_EVENTS，
+  输出到 probe/sounds/sfx/，一共 4849 个 .m4a。
+
+  游戏更新后线上资源路径的版本号会变，默认 URL 的 v39426 可能过期。
+  先抓最新的 js/sound_events.js 看清单，再显式传新的基础 URL：
+
+    python tools/fetch_sounds.py https://www.bilibilitoy.com/toy/OpusMC/<新版本路径>
+
+
+--------------------------------------------------------------------------------
+3. 生成「资源正常化」的可运行源码副本 opusmc-source/
+--------------------------------------------------------------------------------
+
+  前置：先跑第 1 步，因为本脚本要读 vanilla-assets/MAPPING.json。
+
+  python tools/build_source_tree.py
+
+  它做三件事，不改动 probe/ 里任何文件：
+    1. 完整复制 probe/ -> opusmc-source/
+    2. 把 vanilla-assets/ 的独立 PNG 放进 opusmc-source/assets/，
+       并把 assets.js / etex.js / font.js 里的 data URL 换成相对路径
+    3. 把 render.js 里 526 个串行 await loadImage 改成并发
+       （data URL 是同步的；换成 HTTP 路径后串行会把启动拖死）
+
+  重复运行会重建 opusmc-source/。
+
+  本地跑副本：launch-source.bat（8778 端口，不影响 8777 的 probe 版）。
+
+
+--------------------------------------------------------------------------------
+4. 只想要某个包里的贴图
+--------------------------------------------------------------------------------
+
+  线上新版全部源码快照在 opusmc-v47685-src/（这个目录是入库的）：
+
+    opusmc-v47685-src/js/assets.js        游戏贴图（strip / tiles / images）
+    opusmc-v47685-src/js/etex.js          实体贴图
+    opusmc-v47685-src/mods/<id>/tiles.png 每个模组的贴图条
+    opusmc-v47685-src/mods/<id>/textures/ 模组自己的贴图
+
+  用第 1 步的 extract_vanilla_assets.py 时把输入路径改成对应目录即可。
+
+
+--------------------------------------------------------------------------------
+5. 常见坑
+--------------------------------------------------------------------------------
+
+  * no-cache 不等于不缓存：Chrome 对没有版本号的静态 JS 会用启发式缓存。
+    probe/game.html 的 99 个 script 都带 ?v=47685r1，
+    tools/server.mjs 对 JS/HTML 返回 no-store，两个一起才保证改完立即生效。
+  * opusmc-source/ 里没有名为 textures/ 的目录，贴图在 assets/ 下（3996 文件）。
+  * 工具脚本都在 tools/，全部入库；临时补丁 / backup / __pycache__ 不入库。
+  * 任何脚本都不要往 C 盘写东西，输出目录全是项目内的相对路径。

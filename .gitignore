@@ -1,8 +1,9 @@
 # 大体积快照与运行时产物不入库（抓取清单见 README）
 back/
 
-# 音效 51MB 二进制，用 tools/fetch_sounds.py 重新抓取
+# 音效 51MB 二进制，不入库；用 tools/fetch_sounds.py 重新抓取（见 DUMP-RESOURCES.txt）
 probe/sounds/
+opusmc-source/sounds/
 
 # PHPMC 运行时/私密/大文件
 PHPMC/certs/*.key
@@ -54,10 +55,10 @@ dev/comet-mod/preview/shots/
 **/__pycache__/
 *.class
 
-# 可再生的资源副本（由 tools/extract_vanilla_assets.py / build_source_tree.py 生成）
-opusmc-source/
+# 资源副本：源码入库，可再生的贴图/音效目录不入库（见 DUMP-RESOURCES.txt）
+# opusmc-source 的 assets/ 就是那批贴图（3996 文件），等同 textures
+opusmc-source/assets/
 vanilla-assets/
-opusmc-v47685-src/
 dev/comet-mod/meteor-client/
 dev/comet-mod/fabric-template/
 dev/comet-mod/preview/shots/

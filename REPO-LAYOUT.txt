@@ -1,0 +1,62 @@
+================================================================================
+仓库里哪些入库、哪些不入库
+================================================================================
+
+规则由 .gitignore 控制。简单说：代码、脚本、文档全部入库；
+可从代码重建的贴图 / 音效二进制不入库。
+
+--------------------------------------------------------------------------------
+入库
+--------------------------------------------------------------------------------
+
+  tools/                      全部 42 个脚本（提取资源、反代、验证、补丁）
+  opusmc-hud.user.js          主脚本（油猴注入 HUD）
+  opusmc-resourcepack.user.js 独立材质包插件
+  examples/mods/              自定义模组（ftbultimine 等）
+  docs/                       文档（移植方案、FTB 还原拆解、mod 开发指南）
+  dev/comet-mod/              Meteor 基座工程（源码与预览页，不含构建缓存）
+
+  probe/                      离线版游戏本体（入口 game.html + js/ 源码）
+    probe/js/*.js             游戏逻辑，入库
+    probe/game.html           入口，99 个 script 带 ?v=47685r1
+  opusmc-source/              资源正常化源码副本（game.html + js/ + 入口）
+  opusmc-v47685-src/          线上 v47685 完整快照，全部入库（36MB）
+
+--------------------------------------------------------------------------------
+不入库（可从上面的代码重建）
+--------------------------------------------------------------------------------
+
+  probe/sounds/               4849 个 .m4a 音效  -> tools/fetch_sounds.py
+  opusmc-source/sounds/       音效副本            -> tools/fetch_sounds.py
+  opusmc-source/assets/       3996 个独立 PNG 贴图 -> tools/extract_vanilla_assets.py
+                              + tools/build_source_tree.py
+  probe/mods/                 102MB 内置模组包    -> tools/sync_v47685.py 从线上重抓
+  vanilla-assets/             还原出的资源包目录  -> tools/extract_vanilla_assets.py
+  opusmc-vanilla-assets.zip   打好的资源包        -> 同上，加 --with-sounds
+  probe/Logo/                 未引用的单张图
+  _tmp/                       浏览器临时 profile / 探针产物
+  refs/                       FTB Ultimine 上游源码（随时 git clone）
+  **/__pycache__/             Python 缓存
+  _patch_*.py                 一次性补丁脚本
+  *.before-restore-*          恢复前的临时备份
+
+  注意：opusmc-source/ 里没有 textures/ 目录，贴图放在 assets/ 下。
+  「不传 textures」实际对应的是 opusmc-source/assets/（已排除）。
+
+--------------------------------------------------------------------------------
+别人拿到仓库后怎么恢复资源
+--------------------------------------------------------------------------------
+
+  看同目录的 DUMP-RESOURCES.txt，四个命令覆盖全部场景：
+    1. python tools/extract_vanilla_assets.py [--with-sounds]   dump 贴图
+    2. python tools/fetch_sounds.py                            重抓音效
+    3. python tools/build_source_tree.py                       生成 opusmc-source
+    4. tools/sync_v47685.py                                    重抓线上模组包
+
+--------------------------------------------------------------------------------
+本地入口
+--------------------------------------------------------------------------------
+
+  launch-offline.bat   probe 离线版，8777
+  launch-play.bat      PHPMC 联机 + 反代，8777
+  launch-source.bat    opusmc-source 副本，8778
