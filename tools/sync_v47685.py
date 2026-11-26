@@ -72,9 +72,17 @@ html = html.replace('<title>OpusMC</title>', '<title>OpusMC 离线版 · 同步�
 html = re.sub(r'(<div id="bootnote">)[^<]*(</div>)',
               r'\g<1>离线同步版 · 源版本 v47685 · 2026-11-13\g<2>', html, count=1)
 
-# 4c) script 版本号：线上带 v=d 之类的短串，离线用不着但保留无害；统一标注来源
+# 4c) 统一标注来源
 html = html.replace('<html lang="zh-CN">',
                     '<html lang="zh-CN"><!-- synced from v47685 by tools/sync_v47685.py -->', 1)
+
+# 4d) 给所有 js/*.js 加版本号做 cache-bust。
+# 线上入口的 script 不带版本，浏览器会用启发式缓存，改了 net.js 页面仍加载旧副本
+# （用户实测「还是只有直接连接」就是这个）。每次同步都换一个版本串。
+import re
+CACHE_VER = '?v=47685r1'
+html = re.sub(r'(<script[^>]*src="js/[^"?]+)(")', lambda m: m.group(1) + CACHE_VER + m.group(2), html)
+assert html.count(CACHE_VER) >= 90, 'cache-bust 未生效: %d' % html.count(CACHE_VER)
 
 open(os.path.join(DST, 'game.html'), 'w', encoding='utf-8', newline='').write(html)
 print('已写入 probe/game.html（离线改造版）')

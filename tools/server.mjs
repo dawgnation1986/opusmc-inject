@@ -107,7 +107,9 @@ const server = http.createServer((req, res) => {
     if (err || !st.isFile()) { res.writeHead(404); res.end('not found: ' + urlPath); return; }
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-      'Content-Length': st.size, 'Cache-Control': 'no-cache',
+      'Content-Length': st.size,
+      // JS 常改，no-cache 在 Chrome 里仍可能走启发式缓存；脚本一律 no-store
+      'Cache-Control': (path.extname(file).toLowerCase() === '.js' || path.extname(file).toLowerCase() === '.html') ? 'no-store' : 'no-cache',
     });
     fs.createReadStream(file).pipe(res);
   });
