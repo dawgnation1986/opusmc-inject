@@ -322,8 +322,8 @@ class ModsScreen extends ModListScreen {
   }
   drawExtra(ui) {
     const c = ui.ctx, cx = ui.w / 2;
-    if (this.guestGift) Font.center(c, fitText('登录后再打开这里，送你一顶厨师帽', ui.w - 16), cx, 22, '#FFD24A');
-    else Font.center(c, fitText('下载后，在「单人游戏」里选中世界，点「模组管理」勾选要装的模组', ui.w - 16), cx, 22, '#A0A0A0');
+    // PEVersion：离线版不提示登录，模组已内置
+    Font.center(c, fitText('内置模组已就绪；在「单人游戏」里选中世界可查看', ui.w - 16), cx, 22, '#A0A0A0');
     this.drawList(ui);
     if (this.list && !this.list.length && !this.note) Font.center(c, '还没有模组', cx, this.area.y + 20, '#A0A0A0');
     if (this.note) Font.center(c, fitText(this.note, ui.w - 16), cx, ui.h - 42, this.noteColor);
@@ -471,7 +471,7 @@ const modNames = (ids) => (ids && ids.length ? ids.map((id) => Mods.nameOf(id)).
     const last = this.widgets.filter((w) => w !== foot && w.label !== '取消').reduce((a, w) => Math.max(a, w.y), 0);
     const y = Math.min(last + 28, u.h - 56);
     this.widgets.push({ x: cx - 105, y, w: 210, h: 20, glowBlue: true, label: () => fitText('模组：' + modNames(this.mods), 200),
-      tip: ['这个世界装的模组（可以装多个）'], onClick: () => { this.game.ui.hideInput(); modsGate(this.game, () => this.game.ui.open(new ModPickScreen(this.game, this, this.mods, (m) => { this.mods = m; })), this); } });
+      tip: ['这个世界装的模组（可以装多个）'], onClick: () => { this.game.ui.hideInput(); this.game.ui.open(new ModPickScreen(this.game, this, this.mods, (m) => { this.mods = m; })); } });
   };
   const cc = CreateWorldScreen.prototype.create;
   CreateWorldScreen.prototype.create = function () {
@@ -499,7 +499,7 @@ const modNames = (ids) => (ids && ids.length ? ids.map((id) => Mods.nameOf(id)).
     el.call(this);
     const u = this.game.ui, cx = u.w / 2;
     this.widgets.push({ x: cx - 100, y: 197, w: 200, h: 20, glowBlue: true, label: () => fitText('模组：' + modNames(this.mods), 190),
-      tip: ['这个世界装的模组（可以装多个）'], onClick: () => { this.game.ui.hideInput(); modsGate(this.game, () => this.game.ui.open(new ModPickScreen(this.game, this, this.mods, (m) => { this.mods = m; }, { existing: true })), this); } });
+      tip: ['这个世界装的模组（可以装多个）'], onClick: () => { this.game.ui.hideInput(); this.game.ui.open(new ModPickScreen(this.game, this, this.mods, (m) => { this.mods = m; }, { existing: true })); } });
   };
   const es = EditWorldScreen.prototype.save;
   EditWorldScreen.prototype.save = async function () { this.world.mods = [...(this.mods || [])]; return es.call(this); };
@@ -533,7 +533,8 @@ const modNames = (ids) => (ids && ids.length ? ids.map((id) => Mods.nameOf(id)).
       tip: ['选中的世界装哪些模组：勾选（可以装多个）'],
       onClick: () => {
         g.ui.hideInput();
-        modsGate(g, () => g.ui.open(new ModPickScreen(g, this, w.mods || [], async (m) => { w.mods = m; try { await DB.putWorld(w); } catch (e) { console.error(e); } }, { existing: true, title: '模组管理', world: w })), this);
+        // PEVersion：离线版模组管理免登录
+        g.ui.open(new ModPickScreen(g, this, w.mods || [], async (m) => { w.mods = m; try { await DB.putWorld(w); } catch (e) { console.error(e); } }, { existing: true, title: '模组管理', world: w }));
       } });
   };
   // the world list: a world's mods under its name

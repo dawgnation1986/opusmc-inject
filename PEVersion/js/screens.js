@@ -105,6 +105,8 @@ class TitleScreen extends MenuScreen {
     ];
   }
   drawExtra(ui) {
+    // PEVersion：file:// 下 panorama/WebGL 未必出图，先铺一层 menu_bg 保证背景不黑
+    if (typeof Panorama === 'undefined' || !Panorama.ready()) ui.tile('menu_bg', 0, 0, ui.w, ui.h);
     const c = ui.ctx, w = ui.w, lg = ui.img.logo, ed = ui.img.edition;
     // LogoRenderer: blit(logo, w/2-128, 30, 0, 0, 256, 44, 256, 64); blit(edition, w/2-64, 67, 0, 0, 128, 14, 128, 16)
     const lx = Math.floor(w / 2 - 128), ly = 30;

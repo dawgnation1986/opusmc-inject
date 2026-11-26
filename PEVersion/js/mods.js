@@ -72,6 +72,9 @@ const Mods = {
   register(id, info) { this.defs[id] = Object.assign({ id }, info); },
   async loadIndex() {
     if (this.index) return this.index;
+    // PEVersion：file:// 下 fetch 本地 json 会被浏览器拦，改用页面内嵌的索引
+    if (location.protocol === 'file:' && typeof window !== 'undefined' && window.__PE_MODS_INDEX)
+      return (this.index = window.__PE_MODS_INDEX);
     const r = await fetch('mods/index.json', { cache: 'no-cache' });
     if (!r.ok) throw new Error('读取模组列表失败（' + r.status + '）');
     return (this.index = await r.json());

@@ -92,4 +92,9 @@ R('onboard.js',
       else if (!s.onboarded || (s.legalV || 0) < LEGAL.v) setTimeout(() => Onboarding.start(this), 50);""",
   'onboard: skip', mark='PEVersion：离线单机版跳过协议')
 
+# 说明：模组索引内嵌见 tools/build_pe_sounds.py 同目录的
+#   PEVersion/js/mods_index_inline.js（由 mods/index.json 生成），
+#   game.html 里在 mods.js 之前加载；mods.js 的 loadIndex 在 file:// 下读它。
+# 背景：screens.js 的 TitleScreen.drawExtra 开头，在 panorama 未就绪时铺 menu_bg。
+
 print('完成')
