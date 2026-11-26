@@ -549,7 +549,9 @@ const Onboarding = {
     if (!this.onboardChecked) {
       this.onboardChecked = true;
       // (an invite link goes straight to the room; the agreement still comes first)
-      if (!s.onboarded || (s.legalV || 0) < LEGAL.v) setTimeout(() => Onboarding.start(this), 50);
+      // PEVersion：离线单机版跳过协议/引导/FPS 测试，打开就到主菜单
+      if (location.protocol === 'file:') { s.onboarded = true; s.legalV = LEGAL.v; s.fpsTestV = FPS_TEST_V; if (this.saveSettings) this.saveSettings(); }
+      else if (!s.onboarded || (s.legalV || 0) < LEGAL.v) setTimeout(() => Onboarding.start(this), 50);
       else {
         // the frame-rate test once (players from before it: FpsTestScreen), then what changed. Not when an invite link
         // opens the join screen (net.js): the next start

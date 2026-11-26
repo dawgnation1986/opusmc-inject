@@ -83,4 +83,12 @@ R('mods_ui.js',
 """// PEVersion：离线版模组免登录，直接打开
 function openModsScreen(g, parent) { g.ui.open(new ModsScreen(g, parent)); }""", 'mods: no gate', mark='PEVersion：离线版模组免登录')
 
+# 7) onboard.js：跳过协议/引导/FPS 测试（否则首次打开停在 AgreementScreen）
+R('onboard.js',
+"""      if (!s.onboarded || (s.legalV || 0) < LEGAL.v) setTimeout(() => Onboarding.start(this), 50);""",
+"""      // PEVersion：离线单机版跳过协议/引导/FPS 测试，打开就到主菜单
+      if (location.protocol === 'file:') { s.onboarded = true; s.legalV = LEGAL.v; s.fpsTestV = FPS_TEST_V; if (this.saveSettings) this.saveSettings(); }
+      else if (!s.onboarded || (s.legalV || 0) < LEGAL.v) setTimeout(() => Onboarding.start(this), 50);""",
+  'onboard: skip', mark='PEVersion：离线单机版跳过协议')
+
 print('完成')
