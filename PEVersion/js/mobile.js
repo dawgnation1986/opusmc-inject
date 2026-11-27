@@ -186,6 +186,8 @@ const touchDescFollows = (st) => {
     L.f3 = { x: L.emote.x - ts - gp, y: top, w: ts, h: ts };
     // PE_CLIENT_BTN：客户端按钮（原生触摸按钮，可在布局编辑器里调位置/大小）
     L.client = { x: L.f3.x - Math.round(ts * 2.2) - gp, y: top, w: Math.round(ts * 2.2), h: ts };
+    // PE_GETAUDIO：音频资源按钮（左侧中部，避开顶栏与摇杆）
+    L.getaudio = { x: m, y: Math.round(H * 0.36), w: Math.min(Font.width('点击获取游戏音频资源') + 10, W - 2 * m), h: Math.max(18, ts) };
     if (g.mode !== 'spectator') {
       L.attack = { x: L.jump.x - B - gp, y: L.jump.y - B - gp, w: B, h: B };
       L.use = { x: L.jump.x, y: L.jump.y - B - gp, w: B, h: B };
@@ -193,7 +195,7 @@ const touchDescFollows = (st) => {
     }
     // kept clear of the safe area (the Toy capsule top right, a notch, the home bar)
     const sf = this.ui.safe();
-    for (const id of ['pause', 'chat', 'view', 'emote', 'f3', 'client']) if (L[id]) { L[id].x -= sf.r; L[id].y += sf.t; }
+    for (const id of ['pause', 'chat', 'view', 'emote', 'f3', 'client', 'getaudio']) if (L[id]) { L[id].x -= sf.r; L[id].y += sf.t; }
     for (const id of ['jump', 'descend', 'sprint', 'attack', 'use', 'interact']) if (L[id]) { L[id].x -= sf.r; L[id].y -= sf.b; }
     if (L.stickHome) { L.stickHome.x += sf.l; L.stickHome.y -= sf.b; L.stickZone.x += sf.l; }
     if (L.sneak) { L.sneak.x += sf.l; L.sneak.y -= sf.b; }
@@ -272,6 +274,7 @@ const touchDescFollows = (st) => {
     if (this.hitL(L.emote, x, y)) { s.kind = 'button'; s.btn = 'emote'; return; }
     if (this.hitL(L.f3, x, y)) { s.kind = 'button'; s.btn = 'f3'; return; }
     if (this.hitL(L.client, x, y)) { s.kind = 'button'; s.btn = 'client'; return; }
+    if (this.hitL(L.getaudio, x, y)) { s.kind = 'button'; s.btn = 'getaudio'; return; }
     if (L.attack && this.hitL(L.attack, x, y)) { s.kind = 'abtn'; s.holdBtn = 0; g.mouseBtn[0] = true; g.mouseClicked0 = true; g.attackCd = Math.min(g.attackCd, 0); if (!g.target && !g.targetEntity) g.player.swing(); s.holding = true; return; }
     if (L.use && this.hitL(L.use, x, y)) { s.kind = 'abtn'; s.holdBtn = 2; g.mouseBtn[2] = true; g.useCd = 0; s.holding = true; return; }
     if (stickOn(g)) {
@@ -321,6 +324,16 @@ const touchDescFollows = (st) => {
     if (s.kind === 'abtn') { g.mouseBtn[s.holdBtn] = false; return; }
     if (s.kind === 'button' && s.btn === 'f3') { if (!cancel && this.hitL(this.L.f3, s.x, s.y)) { g.ui.debug = !g.ui.debug; if (typeof PerfMon !== 'undefined') PerfMon.gpuOn = g.ui.debug; } return; }
     if (s.kind === 'button' && s.btn === 'emote') { if (!cancel && this.hitL(this.L.emote, s.x, s.y)) g.ui.open(new QuickChatScreen(g)); return; }
+    if (s.kind === 'button' && s.btn === 'getaudio') {
+      if (!cancel && this.hitL(this.L.getaudio, s.x, s.y)) {
+        // PE_GETAUDIO：原生 confirm，确定后打开网盘链接
+        try {
+          var ok = window.confirm('下载完成请放入js文件夹');
+          if (ok) window.open('https://1815498758.share.123pan.cn/123pan/dk8iVv-y6XNd', '_blank');
+        } catch (e) { }
+      }
+      return;
+    }
     if (s.kind === 'button' && s.btn === 'client') {
       if (!cancel && this.hitL(this.L.client, s.x, s.y)) {
         try { var H = window.__cometHud; if (H && H.toggleClassic) H.toggleClassic(); else if (H && H.toggleMenu) H.toggleMenu(); } catch (e) { }
@@ -390,6 +403,7 @@ const touchDescFollows = (st) => {
     this.btn(c, L.emote, 'emote', false);
     this.btn(c, L.f3, null, !!ui.debug, 'F3');
     this.btn(c, L.client, null, false, '客户端');
+    this.btn(c, L.getaudio, null, false, '点击获取游戏音频资源');
     if (L.attack) { this.btn(c, L.attack, 'attack', g.mouseBtn[0]); this.btn(c, L.use, 'use', g.mouseBtn[2]); }
     c.restore();
   };
@@ -468,7 +482,7 @@ class TouchLayoutScreen extends MenuScreen {
   }
   save() { this.game.saveSettings(); if (this.done) { const d = this.done; this.done = null; d(); } else this.game.ui.open(this.parent); }
   discard() { const s = this.game.settings; s.touchLayout = JSON.parse(this.was.layout); s.touchScale = JSON.parse(this.was.scale); s.touchDescOwn = this.was.descOwn; this.game.saveSettings(); this.game.ui.open(this.parent); }
-  ids() { return ['stick', 'dpad', 'sneak', 'jump', 'descend', 'sprint', 'attack', 'use', 'interact', 'inv', 'pause', 'chat', 'emote', 'f3', 'client', 'view']; }
+  ids() { return ['stick', 'dpad', 'sneak', 'jump', 'descend', 'sprint', 'attack', 'use', 'interact', 'inv', 'pause', 'chat', 'emote', 'f3', 'client', 'getaudio', 'view']; }
   rects() {
     // (editAll: fly-down, interact and the stick's sneak too, which the game only shows now and then - touch.js layout)
     const tc = this.game.ui.touch, out = {};
