@@ -1,8 +1,10 @@
+/* PE_CLIENT_BTN */
 'use strict';
-// PEVersion 客户端整合：进世界提示 + 手机端「客户端」按钮。
-// PC：Insert 键由 HUD 自己处理（见 comet-hud.js）；这里只负责提示与触屏按钮。
+// PEVersion 客户端整合：进世界提示 + 面板触摸隔离 + 关闭按钮。
+// PC：Insert 键由 HUD 自己处理（见 comet-hud.js）；手机：原生触摸按钮 mobile.js 的 L.client。
+// 由 tools/patch_pe_client_button.py 配套维护。
 (function () {
-  var btn = null, hintAt = 0;
+  var veil = null, closeBtn = null, armed = false;
 
   function isTouch() {
     try {
@@ -14,58 +16,91 @@
     return !!(g && g.state === 'play' && g.player && g.world && !(g.ui && g.ui.screen));
   }
   function hud() { return (typeof window !== 'undefined') ? window.__cometHud : null; }
+  function guiOpen() {
+    try { return document.documentElement.classList.contains('cm-gui-open'); } catch (e) { return false; }
+  }
+  function closeGui() {
+    try {
+      var H = hud();
+      if (H && H.toggleClassic) { H.toggleClassic(false); return; }
+      if (H && H.toggleFloat) { H.toggleFloat(false); return; }
+      if (H && H.toggleMenu) { H.toggleMenu(false); }
+    } catch (e) { }
+  }
 
-  // 进世界时提示一次（游戏自己的 message 走聊天栏，触屏也能看见）
+  // 进世界时提示一次
   function tip(g) {
     if (!inWorld(g) || g.__cometTipShown) return;
     g.__cometTipShown = true;
     var text = isTouch()
-      ? '客户端已载入：点右侧「客户端」按钮打开设置面板'
+      ? '客户端已载入：点顶栏「客户端」按钮打开设置面板'
       : '客户端已载入：按 Insert 键打开设置面板（` 键开悬浮面板）';
     try { if (g.ui && g.ui.message) g.ui.message(text, '#55FF55'); } catch (e) { }
     try { if (hud() && hud().notify) hud().notify(text); } catch (e) { }
   }
 
-  // 触屏按钮：一个独立的 DOM 按钮，不碰游戏 touch 布局
-  function ensureBtn() {
-    if (!isTouch() || btn || !document.body) return;
-    btn = document.createElement('div');
-    btn.textContent = '客户端';
-    btn.setAttribute('data-comet-client-btn', '1');
-    var st = btn.style;
-    st.position = 'fixed';
-    st.right = '8px';
-    st.bottom = '76px';
-    st.zIndex = '2147483000';
-    st.padding = '8px 12px';
-    st.borderRadius = '8px';
-    st.color = '#fff';
-    st.background = 'rgba(30,30,40,0.72)';
-    st.border = '1px solid rgba(255,255,255,0.35)';
-    st.font = 'bold 14px sans-serif';
-    st.userSelect = 'none';
-    st.touchAction = 'manipulation';
-    st.display = 'none';
-    var open = function (e) {
-      if (e) { e.preventDefault(); e.stopPropagation(); }
-      try {
-        var h = hud();
-        if (h && h.toggleClassic) h.toggleClassic();
-        else if (h && h.toggleMenu) h.toggleMenu();
-      } catch (err) { }
+  // 建遮罩 + 关闭按钮（只建一次）
+  function ensure() {
+    if (armed || !document.body) return;
+    armed = true;
+    veil = document.createElement('div');
+    veil.id = '__pe_gui_veil';
+    var vs = veil.style;
+    vs.position = 'fixed'; vs.inset = '0'; vs.display = 'none';
+    vs.zIndex = '2147483640';           // 低于 HUD 面板 2147483647，高于游戏 canvas
+    vs.background = 'rgba(0,0,0,0.01)'; // 几乎透明，只为吃事件
+    vs.touchAction = 'none';
+
+    closeBtn = document.createElement('div');
+    closeBtn.id = '__pe_gui_close';
+    closeBtn.textContent = '×';
+    var cs = closeBtn.style;
+    cs.position = 'fixed'; cs.top = '8px'; cs.right = '8px';
+    cs.zIndex = '2147483646'; cs.width = '40px'; cs.height = '40px';
+    cs.lineHeight = '36px'; cs.textAlign = 'center';
+    cs.fontSize = '28px'; cs.color = '#fff';
+    cs.background = 'rgba(200,50,50,0.85)';
+    cs.border = '2px solid rgba(255,255,255,0.6)';
+    cs.borderRadius = '8px'; cs.userSelect = 'none'; cs.touchAction = 'manipulation';
+    cs.display = 'none';
+
+    document.body.appendChild(veil);
+    document.body.appendChild(closeBtn);
+
+    // capture 阶段拦截：面板打开时，任何不在面板内的指针/触摸都不让游戏拿到
+    var BLOCK = function (e) {
+      if (!guiOpen()) return;
+      var t = e.target;
+      var panel = document.getElementById('__comet_gui');
+      var inside = !!(panel && t && (panel === t || panel.contains(t)))
+        || t === veil || t === closeBtn;   // 遮罩/叉要收到自己的关闭事件
+      if (inside) return;              // 面板内部交给 HUD 自己处理
+      e.preventDefault();
+      e.stopImmediatePropagation();
     };
-    btn.addEventListener('touchstart', open, { passive: false });
-    btn.addEventListener('mousedown', open, false);
-    document.body.appendChild(btn);
+    ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'wheel', 'contextmenu']
+      .forEach(function (ev) {
+        document.addEventListener(ev, BLOCK, { capture: true, passive: false });
+      });
+
+    // 点遮罩 / 点叉 → 关闭
+    var shut = function (e) { if (e) { e.preventDefault(); e.stopImmediatePropagation(); } closeGui(); };
+    veil.addEventListener('pointerdown', shut, { capture: true, passive: false });
+    veil.addEventListener('touchstart', shut, { capture: true, passive: false });
+    closeBtn.addEventListener('pointerdown', shut, { capture: true, passive: false });
+    closeBtn.addEventListener('touchstart', shut, { capture: true, passive: false });
+    closeBtn.addEventListener('mousedown', shut, true);
   }
 
-  // 每帧轻量检查：HUD 是否就绪、是否进世界、按钮显隐
+  // 每帧轻量检查：HUD 就绪、进世界提示、遮罩/叉显隐
   function loop() {
     try {
       var g = (typeof game !== 'undefined') ? game : null;
-      ensureBtn();
       if (hud()) tip(g);
-      if (btn && g) btn.style.display = inWorld(g) ? '' : 'none';
+      ensure();
+      var on = guiOpen();
+      if (veil) veil.style.display = on ? 'block' : 'none';
+      if (closeBtn) closeBtn.style.display = on ? 'block' : 'none';
     } catch (e) { }
     requestAnimationFrame(loop);
   }
