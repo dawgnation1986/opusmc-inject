@@ -187,7 +187,9 @@ const touchDescFollows = (st) => {
     // PE_CLIENT_BTN：客户端按钮（原生触摸按钮，可在布局编辑器里调位置/大小）
     L.client = { x: L.f3.x - Math.round(ts * 2.2) - gp, y: top, w: Math.round(ts * 2.2), h: ts };
     // PE_GETAUDIO：音频资源按钮（左侧中部，避开顶栏与摇杆）
-    L.getaudio = { x: m, y: Math.round(H * 0.36), w: Math.min(Font.width('点击获取游戏音频资源') + 10, W - 2 * m), h: Math.max(18, ts) };
+    // 顶栏下方第二行居中：避开摇杆手势区与顶栏按钮，进世界就能看到
+    var aw = Math.min(Font.width('点击获取游戏音频资源') + 12, W - 2 * m);
+    L.getaudio = { x: Math.round((W - aw) / 2), y: top + ts + gp + 2, w: aw, h: Math.max(18, ts) };
     if (g.mode !== 'spectator') {
       L.attack = { x: L.jump.x - B - gp, y: L.jump.y - B - gp, w: B, h: B };
       L.use = { x: L.jump.x, y: L.jump.y - B - gp, w: B, h: B };
