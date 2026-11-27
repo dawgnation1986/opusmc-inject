@@ -10488,7 +10488,16 @@
           renderModuleList();
           return;
         }
-        toggleModule(m);
+        // PE_TOUCH_SETTINGS：手机上点有配置项的功能 → 右侧直接显示设置，不切换开关
+        // （PC 仍用右键选设置、左键切换）
+        var touch = (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+        if (touch && m.settings && m.settings.length) {
+          if (selectedModule === m) toggleModule(m);   // 再点同一个：开关
+          else {
+            if (floatingOn() && selectedCat !== m.cat) selectCategory(m.cat);
+            selectModule(m);                          // 第一次点：右侧显示设置
+          }
+        } else toggleModule(m);
         return;
       }
       if (ev.button === 2) {
