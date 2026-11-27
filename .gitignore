@@ -76,3 +76,6 @@ _patch_*.py
 # 模组开发用的参考仓库/备份，不是游戏运行所需
 PEVersion/mods/*/_ref/
 PEVersion/mods/*/_build/
+
+# 模组打包文件（可从 mods/ 目录重新生成）
+PEVersion/mods.zip

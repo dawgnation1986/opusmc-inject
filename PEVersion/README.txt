@@ -58,3 +58,13 @@ PEVersion — 双击即玩的单机离线版 OpusMC
     extract_vanilla_assets.py  从编译产物 dump 贴图
 
 ================================================================================
+
+5. 内置客户端 HUD（原油猴脚本 opusmc-hud.user.js v1.32.0）
+   PC 进入世界后按 Insert 打开经典面板，` 键开悬浮面板，M 开大地图。
+   手机 / 触屏进入世界后点右侧「客户端」按钮打开面板。
+   首次进世界会在聊天栏提示一次。
+   由 tools/integrate_hud.py 从 opusmc-hud.user.js 生成：
+   js/comet-hud.js（HUD 本体）+ js/comet-mobile.js（提示与手机按钮）。
+   注意：HUD 脚本 571KB、音效包 57MB，首次加载会慢几秒。
+   网页版没有 Tampermonkey，GM_* 相关功能（来源伪装、跨站账号同步）
+   自动降级，不影响单机玩法。

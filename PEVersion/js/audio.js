@@ -149,9 +149,11 @@ Object.assign(Sound, {
   ext: '.m4a',
   loadPack() {
     if (window.SOUNDS) { this.packReady = true; this.predecode(); return; }
-    const embedded = location.protocol === 'file:';
+    // PEVersion：音效已全部内嵌进 js/sounds.js，原始 m4a 不随包发布，
+    // 所以 http(s)（含 webcatx）也走内嵌包，不能回退到 fetch 路径。
+    const embedded = true;
     const s = document.createElement('script');
-    s.src = embedded ? 'js/sounds.js' : 'js/sound_events.js';
+    s.src = 'js/sounds.js';
     s.onload = () => {
       if (!embedded && window.SOUND_EVENTS) window.SOUNDS = { events: SOUND_EVENTS, files: null };
       this.packReady = !!window.SOUNDS; this.predecode();
