@@ -28,6 +28,16 @@
     } catch (e) { }
   }
 
+  // 供 touch.js 查询：面板打开时，坐标落在面板内就交给 HUD，游戏不处理
+  window.__cometGuiBlocks = function (target) {
+    if (!guiOpen()) return false;
+    if (!target) return false;
+    var panel = document.getElementById('__comet_panel');
+    if (!panel) return false;
+    // 用事件 target 判断，不靠坐标（面板有 scale(2)，rect 会放大到整屏）
+    return !!(target === panel || panel.contains(target) || target === closeBtn);
+  };
+
   // 进世界时提示一次
   function tip(g) {
     if (!inWorld(g) || g.__cometTipShown) return;

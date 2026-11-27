@@ -59,6 +59,12 @@ const TOUCH_ICONS = (() => {
   return I;
 })();
 
+// PE_GUI_TOUCH_GUARD：客户端面板打开时，面板内的触摸交给 HUD，游戏不处理
+const guiBlocks = (target) => {
+  try { return typeof window !== 'undefined' && window.__cometGuiBlocks && window.__cometGuiBlocks(target); }
+  catch (e) { return false; }
+};
+
 class TouchControls {
   constructor(g) {
     this.g = g; this.ui = g.ui; this.t = new Map(); this.pend = []; this.lastSlotTap = null;
@@ -92,6 +98,7 @@ class TouchControls {
   // ---- events -------------------------------------------------------------------------------
   onStart(e) {
     const ui = this.ui;
+    if (guiBlocks(e.target)) return;
     if (e.target === ui.input) return; // the text field takes the tap itself (opens the on-screen keyboard)
     ui.lastTouch = performance.now();
     this.prune(e);
@@ -120,6 +127,7 @@ class TouchControls {
     for (const [id, s] of [...this.t]) if (!live.has(id)) { this.t.delete(id); this.endTouch(s, true); }
   }
   onMove(e) {
+    if (guiBlocks(e.target)) return;
     this.prune(e);
     let mine = false;
     for (const ct of e.changedTouches) {
@@ -135,6 +143,7 @@ class TouchControls {
     if (mine) e.preventDefault();
   }
   onEnd(e, cancel) {
+    if (guiBlocks(e.target)) return;
     let mine = false;
     this.ui.lastTouch = performance.now();
     for (const ct of e.changedTouches) {
