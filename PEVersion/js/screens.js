@@ -89,6 +89,16 @@ class LoadingScreen extends MenuScreen {
 }
 
 // vanilla 26.x title screen (LogoRenderer / SplashRenderer positions); the live world replaces the panorama
+// PE_GETAUDIO_MENU：获取音频资源的菜单按钮（主菜单左下角 / 暂停菜单）
+function getAudioButton(g, x, y, w) {
+  return { x, y, w: w || 150, h: 20, gold: true, label: '点击获取游戏音频资源',
+    tip: ['下载游戏音频资源后，把文件放入 js 文件夹'],
+    onClick: () => {
+      try {
+        if (window.confirm('下载完成请放入js文件夹')) window.open('https://1815498758.share.123pan.cn/123pan/dk8iVv-y6XNd', '_blank');
+      } catch (e) { }
+    } };
+}
 class TitleScreen extends MenuScreen {
   constructor(game) { super(game, null); this.blurBg = false; this.bgDim = 0; this.splash = SPLASHES[(Math.random() * SPLASHES.length) | 0]; }
   layout() {
@@ -102,6 +112,7 @@ class TitleScreen extends MenuScreen {
       // PEVersion：选项/退出保留，左右下角图标与账号/登录去掉
       { x: cx - 100, y: l + 84, w: 98, h: 20, label: '选项…', onClick: () => g.ui.open(new OptionsScreen(g, this)) },
       { x: cx + 2, y: l + 84, w: 98, h: 20, label: '退出游戏', onClick: () => quitGame(g) },
+      getAudioButton(g, 2, u.h - 24, 160),
     ];
   }
   drawExtra(ui) {
@@ -502,6 +513,7 @@ class PauseScreen extends MenuScreen {
       room && !roomMode ? null : { x: roomMode ? cx - 102 : cx + 4, y: roomMode ? y + 96 : y + 72, w: roomMode ? 204 : 98, h: 20, label: () => '模式：' + MODE_NAMES[g.mode], enabled: !!g.cheats || !!g.net, tip: g.cheats || g.net ? ['生存 → 创造 → 旁观（也可按 F3 + F4）'] : ['需要开启“允许命令”'], onClick: () => g.requestMode(MODE_NEXT[g.mode]) },
       { x: cx - 102, y: y + 72, w: 98, h: 20, label: '选项…', onClick: () => g.ui.open(new OptionsScreen(g, this)) },
       g.net && g.net.room ? { x: cx + 4, y: y + 72, w: 98, h: 20, label: '房间…', tip: ['邀请朋友、看在场的玩家；房主可以踢人、封禁、禁言'], onClick: () => g.ui.open(new RoomScreen(g, this)) } : null,
+      getAudioButton(g, cx - 102, y + (roomMode ? 144 : 120), 204),
       { x: cx - 102, y: y + (roomMode ? 120 : 96), w: 204, h: 20, label: '保存并退回到标题屏幕', onClick: () => g.quitToTitle() },
     ].filter(Boolean);
   }
