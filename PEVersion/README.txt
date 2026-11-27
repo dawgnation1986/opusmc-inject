@@ -65,6 +65,9 @@ PEVersion — 双击即玩的单机离线版 OpusMC
    首次进世界会在聊天栏提示一次。
    由 tools/integrate_hud.py 从 opusmc-hud.user.js 生成：
    js/comet-hud.js（HUD 本体）+ js/comet-mobile.js（提示与手机按钮）。
+   材质包用独立插件 opusmc-resourcepack.user.js v1.5.0（js/comet-resourcepack.js），
+   HUD 里那份旧材质包已剥离；游戏菜单「资源包…」或 Alt+R 打开。
+   由 tools/strip_hud_resourcepack.py 生成，改主脚本后重跑这两个脚本。
    注意：HUD 脚本 571KB、音效包 57MB，首次加载会慢几秒。
    网页版没有 Tampermonkey，GM_* 相关功能（来源伪装、跨站账号同步）
    自动降级，不影响单机玩法。
